@@ -1,0 +1,283 @@
+// openCypher subset for sqgraph (LALR(1), contextual lexer).
+// Keywords are case-insensitive; the contextual lexer lets keywords double as
+// identifiers (property keys, labels, aliases) wherever a keyword is not expected.
+
+start: statement
+
+?statement: query
+          | schema_cmd
+
+// ------------------------------------------------------------------ queries
+
+query: single_query (union_op single_query)*
+
+union_op: "UNION"i "ALL"i -> union_all
+        | "UNION"i        -> union_distinct
+
+single_query: clause+
+
+?clause: match_clause
+       | unwind_clause
+       | with_clause
+       | return_clause
+       | create_clause
+       | merge_clause
+       | set_clause
+       | remove_clause
+       | delete_clause
+       | call_clause
+
+match_clause: [OPTIONAL] "MATCH"i pattern_list [where_clause]
+OPTIONAL: "OPTIONAL"i
+
+where_clause: "WHERE"i expression
+
+unwind_clause: "UNWIND"i expression "AS"i name
+
+with_clause: "WITH"i [DISTINCT] projection_items [order_by] [skip_clause] [limit_clause] [where_clause]
+
+return_clause: "RETURN"i [DISTINCT] projection_items [order_by] [skip_clause] [limit_clause]
+
+DISTINCT: "DISTINCT"i
+
+projection_items: STAR ("," projection_item)*   -> star_items
+                | projection_item ("," projection_item)* -> plain_items
+
+projection_item: expression ["AS"i name]
+
+order_by: "ORDER"i "BY"i sort_item ("," sort_item)*
+
+sort_item: expression [SORT_DIR]
+SORT_DIR: /(ASCENDING|ASC|DESCENDING|DESC)(?![A-Za-z0-9_])/i
+
+skip_clause: "SKIP"i expression
+limit_clause: "LIMIT"i expression
+
+create_clause: "CREATE"i pattern_list
+
+merge_clause: "MERGE"i pattern_part merge_action*
+
+merge_action: "ON"i "CREATE"i "SET"i set_items -> on_create
+            | "ON"i "MATCH"i "SET"i set_items  -> on_match
+
+set_clause: "SET"i set_items
+
+set_items: set_item ("," set_item)*
+
+set_item: name "." name "=" expression   -> set_prop
+        | name "=" expression            -> set_replace
+        | name "+=" expression           -> set_merge
+        | name node_labels               -> set_labels
+
+remove_clause: "REMOVE"i remove_item ("," remove_item)*
+
+remove_item: name "." name  -> remove_prop
+           | name node_labels -> remove_labels
+
+delete_clause: [DETACH] "DELETE"i expression ("," expression)*
+DETACH: "DETACH"i
+
+call_clause: "CALL"i proc_name "(" [call_args] ")" [yield_clause]
+
+proc_name: name ("." name)*
+
+call_args: expression ("," expression)*
+
+yield_clause: "YIELD"i yield_item ("," yield_item)* [where_clause]
+
+yield_item: name ["AS"i name]
+
+// ------------------------------------------------------------------ patterns
+
+pattern_list: pattern_part ("," pattern_part)*
+
+pattern_part: [name "="] pattern_chain
+
+pattern_chain: node_pattern (rel_pattern node_pattern)*
+
+node_pattern: "(" [name] [node_labels] [pattern_props] ")"
+
+node_labels: (":" name)+
+
+pattern_props: map_literal
+             | param
+
+rel_pattern: "-" [rel_detail] "-"  -> rel_both
+           | "-" [rel_detail] "->" -> rel_out
+           | "<-" [rel_detail] "-" -> rel_in
+
+rel_detail: "[" [name] [":" rel_types] [rel_range] [pattern_props] "]"
+
+rel_types: name ("|" [":"] name)*
+
+rel_range: STAR                  -> range_any
+         | STAR INT              -> range_exact
+         | STAR INT ".." INT     -> range_both
+         | STAR INT ".."         -> range_min
+         | STAR ".." INT         -> range_max
+         | STAR ".."             -> range_any
+
+// ------------------------------------------------------------------ expressions
+
+expression: or_expr
+
+?or_expr: xor_expr
+        | or_expr "OR"i xor_expr -> or_op
+
+?xor_expr: and_expr
+         | xor_expr "XOR"i and_expr -> xor_op
+
+?and_expr: not_expr
+         | and_expr "AND"i not_expr -> and_op
+
+?not_expr: comparison
+         | "NOT"i not_expr -> not_op
+
+?comparison: add_expr
+           | add_expr (comp_op add_expr)+      -> compare
+           | add_expr "IS"i "NULL"i            -> is_null
+           | add_expr "IS"i "NOT"i "NULL"i     -> is_not_null
+           | add_expr "IN"i add_expr           -> in_op
+           | add_expr "STARTS"i "WITH"i add_expr -> starts_with
+           | add_expr "ENDS"i "WITH"i add_expr   -> ends_with
+           | add_expr "CONTAINS"i add_expr     -> contains
+           | add_expr "=~" add_expr            -> regex_op
+
+comp_op: EQ | NEQ | LE | GE | LT | GT
+
+?add_expr: mul_expr
+         | add_expr "+" mul_expr -> add
+         | add_expr "-" mul_expr -> sub
+
+?mul_expr: unary_expr
+         | mul_expr STAR unary_expr -> mul
+         | mul_expr "/" unary_expr  -> div
+         | mul_expr "%" unary_expr  -> mod
+
+?unary_expr: power_expr
+           | "-" unary_expr -> neg
+           | "+" unary_expr -> pos
+
+?power_expr: postfix_expr
+           | postfix_expr "^" power_expr -> pow
+
+?postfix_expr: atom
+             | postfix_expr "." name                       -> property
+             | postfix_expr "[" expression "]"             -> index
+             | postfix_expr "[" [expression] ".." [expression] "]" -> slice
+             | postfix_expr node_labels                    -> label_check
+             | postfix_expr "{" [map_proj_items] "}"       -> map_projection
+
+?atom: literal
+     | param
+     | name -> variable
+     | function_call
+     | "(" expression ")"
+     | case_expr
+     | list_literal
+     | map_literal
+     | list_comprehension
+     | exists_expr
+
+function_call: NAME "(" ")"                              -> call_noargs
+             | NAME "(" STAR ")"                         -> call_star
+             | NAME "(" [DISTINCT] call_args ")"         -> call_args_fn
+             | NAME "(" name "IN"i expression ["WHERE"i expression] ")" -> quantifier_or_call
+
+case_expr: "CASE"i [expression] case_when+ ["ELSE"i expression] "END"i
+
+case_when: "WHEN"i expression "THEN"i expression
+
+list_literal: "[" [call_args] "]"
+
+list_comprehension: "[" name "IN"i expression ["WHERE"i expression] ["|" expression] "]"
+
+map_literal: "{" [map_item ("," map_item)*] "}"
+
+map_item: name ":" expression
+
+map_proj_items: map_proj_item ("," map_proj_item)*
+
+map_proj_item: "." name          -> pi_prop
+             | "." STAR          -> pi_all
+             | name ":" expression -> pi_kv
+             | name              -> pi_var
+
+exists_expr: "EXISTS"i "{" exists_body "}" -> exists_subquery
+           | "EXISTS"i "(" expression ")"  -> exists_fn
+
+exists_body: ["MATCH"i] pattern_list [where_clause]
+
+?literal: INT     -> int_lit
+        | FLOAT   -> float_lit
+        | STRING  -> string_lit
+        | "TRUE"i  -> true_lit
+        | "FALSE"i -> false_lit
+        | "NULL"i  -> null_lit
+
+param: PARAM
+
+name: NAME
+    | BACKTICK
+
+// ------------------------------------------------------------------ schema commands
+
+?schema_cmd: create_vector_index
+           | create_fulltext_index
+           | create_property_index
+           | drop_index
+           | show_indexes
+
+create_vector_index: "CREATE"i "VECTOR"i "INDEX"i [name] [if_not_exists] "FOR"i index_target "ON"i ("(" index_prop ")" | index_prop) ["OPTIONS"i map_literal]
+
+create_fulltext_index: "CREATE"i "FULLTEXT"i "INDEX"i [name] [if_not_exists] "FOR"i ft_target "ON"i "EACH"i "[" index_props "]" ["OPTIONS"i map_literal]
+
+create_property_index: "CREATE"i [INDEX_KIND] "INDEX"i [name] [if_not_exists] "FOR"i index_target "ON"i ("(" index_props ")" | index_prop)
+INDEX_KIND: "RANGE"i
+
+// what an index is defined on: a node pattern (n:Label) or a relationship pattern ()-[r:TYPE]-() / ()-[r:TYPE]->()
+index_target: "(" name ":" name ")"                          -> node_target
+            | "(" ")" "-" "[" name ":" name "]" rel_end "(" ")" -> rel_target
+
+ft_target: "(" name ":" ft_labels ")"                           -> node_target
+         | "(" ")" "-" "[" name ":" ft_labels "]" rel_end "(" ")" -> rel_target
+
+rel_end: "-" | "->"
+
+ft_labels: name ("|" name)*
+
+index_props: index_prop ("," index_prop)*
+
+index_prop: name "." name
+
+if_not_exists: "IF"i "NOT"i "EXISTS"i
+
+drop_index: "DROP"i "INDEX"i name [if_exists]
+
+if_exists: "IF"i "EXISTS"i
+
+show_indexes: "SHOW"i ("INDEXES"i | "INDEX"i)
+
+// ------------------------------------------------------------------ terminals
+
+STAR: "*"
+EQ: "="
+NEQ: /<>|!=/
+LE: "<="
+GE: ">="
+LT: "<"
+GT: ">"
+
+NAME: /[^\W\d]\w*/
+BACKTICK: /`(?:[^`]|``)*`/
+PARAM: /\$[A-Za-z0-9_]+/
+FLOAT.2: /\d+\.\d+(?:[eE][+-]?\d+)?|\d+[eE][+-]?\d+/
+INT: /0[xX][0-9a-fA-F]+|\d+/
+STRING: /'(?:[^'\\]|\\.)*'|"(?:[^"\\]|\\.)*"/s
+
+WS: /\s+/
+LINE_COMMENT: /\/\/[^\n]*/
+BLOCK_COMMENT: /\/\*[\s\S]*?\*\//
+%ignore WS
+%ignore LINE_COMMENT
+%ignore BLOCK_COMMENT

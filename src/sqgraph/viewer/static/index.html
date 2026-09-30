@@ -1,0 +1,648 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>sqgraph viewer</title>
+<style>
+:root {
+  --bg: #f4f6fa; --panel: #ffffff; --text: #1c2330; --muted: #667085; --border: #d5dbe6;
+  --accent: #2f6fed; --accent-fg: #ffffff; --edge: #98a2b3; --danger: #c62828; --hover: #eef2fa;
+  --c0: #3b82f6; --c1: #f59e0b; --c2: #10b981; --c3: #ef4444; --c4: #8b5cf6; --c5: #06b6d4;
+  --c6: #ec4899; --c7: #84cc16; --c8: #f97316; --c9: #14b8a6; --c10: #6366f1; --c11: #94a3b8;
+  --font: system-ui, -apple-system, "Segoe UI", "Hiragino Sans", "Hiragino Kaku Gothic ProN", "Yu Gothic UI", "Meiryo", "Noto Sans JP", sans-serif;
+  --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, "Noto Sans Mono CJK JP", "MS Gothic", monospace;
+  --lw: 270px; --rw: 320px; --ch: 290px;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #0f131a; --panel: #181d27; --text: #e6e9ef; --muted: #98a2b3; --border: #2b3343;
+    --accent: #6ea0ff; --accent-fg: #0b1220; --edge: #5b6578; --danger: #ff8a80; --hover: #212938;
+    --c0: #60a5fa; --c1: #fbbf24; --c2: #34d399; --c3: #f87171; --c4: #a78bfa; --c5: #22d3ee;
+    --c6: #f472b6; --c7: #a3e635; --c8: #fb923c; --c9: #2dd4bf; --c10: #818cf8; --c11: #94a3b8;
+  }
+}
+* { box-sizing: border-box; }
+html, body { height: 100%; margin: 0; }
+body {
+  background: var(--bg); color: var(--text); font: 13px/1.5 var(--font);
+  display: grid; overflow: hidden;
+  grid-template-columns: var(--lw) minmax(0, 1fr) var(--rw);
+  grid-template-rows: auto minmax(0, 1fr) var(--ch);
+  grid-template-areas: "top top top" "left stage right" "left console right";
+}
+body.no-left { --lw: 0px; } body.no-right { --rw: 0px; } body.no-console { --ch: 34px; }
+body.no-left #left, body.no-right #right { display: none; }
+button, select, input, textarea { font: inherit; color: inherit; }
+button, select, input[type=text], input[type=search] {
+  background: var(--panel); border: 1px solid var(--border); border-radius: 6px; padding: 3px 9px;
+}
+button { cursor: pointer; } button:hover { background: var(--hover); }
+button.primary { background: var(--accent); color: var(--accent-fg); border-color: var(--accent); }
+button:disabled, select:disabled { opacity: .5; cursor: default; }
+button.small { padding: 0 6px; font-size: 12px; line-height: 20px; }
+label.toggle { display: inline-flex; align-items: center; gap: 4px; white-space: nowrap; }
+.muted { color: var(--muted); }
+
+#top { grid-area: top; display: flex; flex-wrap: wrap; align-items: center; gap: 6px 8px; padding: 6px 10px; background: var(--panel); border-bottom: 1px solid var(--border); }
+#top .title { font-weight: 600; margin-right: 6px; }
+#top .sep { flex: 1; }
+
+aside { background: var(--panel); overflow: auto; min-width: 0; }
+#left { grid-area: left; border-right: 1px solid var(--border); padding: 8px 10px; }
+#right { grid-area: right; border-left: 1px solid var(--border); padding: 8px 10px; }
+aside h3 { font-size: 12px; margin: 12px 0 4px; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; }
+aside h3:first-child { margin-top: 2px; }
+.summary { display: grid; grid-template-columns: auto 1fr; gap: 0 10px; }
+.summary b { font-variant-numeric: tabular-nums; text-align: right; }
+.row { display: flex; align-items: center; gap: 6px; padding: 1px 4px; border-radius: 5px; min-height: 24px; }
+.row:hover { background: var(--hover); }
+.row .name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; cursor: pointer; }
+.row .count { color: var(--muted); font-variant-numeric: tabular-nums; }
+.row.off .name { text-decoration: line-through; color: var(--muted); }
+.chip { display: inline-block; width: 14px; height: 14px; border-radius: 4px; flex: none; cursor: pointer; border: 1px solid transparent; }
+.row.off .chip { opacity: .25; }
+.dot { display: inline-block; width: 10px; height: 10px; border-radius: 50%; flex: none; }
+.tag { display: inline-block; padding: 0 7px; border-radius: 9px; border: 1px solid var(--border); font-size: 12px; margin: 0 4px 2px 0; }
+#search { width: 100%; margin-bottom: 4px; }
+#results .row { cursor: pointer; align-items: flex-start; padding: 3px 4px; }
+#results .row .name { white-space: normal; }
+#results small { display: block; color: var(--muted); }
+details > summary { cursor: pointer; color: var(--muted); }
+details.pv > summary { color: var(--text); }
+pre { white-space: pre-wrap; word-break: break-word; margin: 4px 0; font: 12px/1.45 var(--mono); }
+
+#stage { grid-area: stage; position: relative; min-width: 0; min-height: 0; }
+#cy { position: absolute; inset: 0; }
+#status { position: absolute; left: 8px; bottom: 6px; padding: 2px 8px; border-radius: 6px; background: color-mix(in srgb, var(--panel) 85%, transparent); border: 1px solid var(--border); color: var(--muted); pointer-events: none; max-width: calc(100% - 16px); }
+#tip { position: absolute; z-index: 5; pointer-events: none; padding: 2px 8px; border-radius: 6px; background: var(--panel); border: 1px solid var(--border); box-shadow: 0 2px 8px #0003; display: none; max-width: 320px; }
+
+#console { grid-area: console; overflow: hidden; display: flex; flex-direction: column; min-height: 0; background: var(--panel); border-top: 1px solid var(--border); }
+#console .bar { display: flex; flex-wrap: wrap; gap: 6px 8px; align-items: center; padding: 4px 10px; }
+#console .body { flex: 1; min-height: 0; display: grid; grid-template-columns: minmax(200px, 40%) minmax(0, 1fr); gap: 8px; padding: 0 10px 8px; }
+body.no-console #console .body { display: none; }
+#cypher { width: 100%; height: 100%; resize: none; font: 12.5px/1.5 var(--mono); background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 6px 8px; }
+#params { width: 220px; font-family: var(--mono); display: none; }
+#out { min-width: 0; min-height: 0; display: flex; flex-direction: column; }
+#outinfo { padding: 0 2px 3px; color: var(--muted); }
+#outinfo.err { color: var(--danger); white-space: pre-wrap; }
+#table { overflow: auto; flex: 1; border: 1px solid var(--border); border-radius: 6px; }
+#table table { border-collapse: collapse; width: 100%; }
+#table th, #table td { text-align: left; vertical-align: top; padding: 2px 8px; border-bottom: 1px solid var(--border); max-width: 380px; }
+#table th { position: sticky; top: 0; background: var(--panel); z-index: 1; }
+#table td .clamp { display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; word-break: break-word; white-space: pre-wrap; cursor: pointer; }
+#table td .clamp.open { display: block; }
+.nchip { display: inline-flex; align-items: center; gap: 4px; border: 1px solid var(--border); border-radius: 9px; padding: 0 7px; cursor: pointer; margin: 1px 3px 1px 0; }
+.nchip:hover { background: var(--hover); }
+.rchip { color: var(--muted); font-family: var(--mono); font-size: 12px; margin-right: 3px; }
+
+.props { width: 100%; border-collapse: collapse; }
+.props td { vertical-align: top; padding: 2px 4px; border-bottom: 1px solid var(--border); }
+.props td:first-child { color: var(--muted); white-space: nowrap; width: 1%; padding-right: 10px; }
+.btns { display: flex; flex-wrap: wrap; gap: 5px; margin: 6px 0; }
+.link { color: var(--accent); cursor: pointer; }
+.hdr { display: flex; align-items: center; gap: 8px; font-size: 15px; font-weight: 600; word-break: break-word; }
+
+@media (max-width: 900px) {
+  body { grid-template-columns: minmax(0, 1fr); grid-template-rows: auto minmax(0, 1fr) var(--ch); grid-template-areas: "top" "stage" "console"; --ch: 260px; }
+  body.no-console { --ch: 34px; }
+  #left, #right { position: fixed; top: 0; bottom: 0; z-index: 20; width: min(86vw, 340px); box-shadow: 0 0 20px #0005; display: none; }
+  #left { left: 0; } #right { right: 0; }
+  body:not(.no-left) #left, body:not(.no-right) #right { display: block; }
+  #console .body { grid-template-columns: minmax(0, 1fr); grid-template-rows: 90px minmax(0, 1fr); }
+}
+</style>
+</head>
+<body class="no-right">
+<header id="top">
+  <button id="btnLeft" title="サイドバー">☰</button>
+  <span class="title" id="dbname">sqgraph</span>
+  <label class="toggle">表示数
+    <select id="limit"><option>50</option><option>100</option><option selected>200</option><option>500</option><option>1000</option></select>
+  </label>
+  <button id="btnReload" title="次数の高いノードを読み込み直す">初期表示</button>
+  <button id="btnLayout">再レイアウト</button>
+  <button id="btnFit">全体表示</button>
+  <button id="btnClear">クリア</button>
+  <label class="toggle"><input type="checkbox" id="chkEdgeLabels" checked>エッジ名</label>
+  <label class="toggle" id="lblComm"><input type="checkbox" id="chkComm">コミュニティ色</label>
+  <button id="btnPng">PNG</button>
+  <span class="sep"></span>
+  <button id="btnConsole" title="Cypher コンソール">Cypher</button>
+  <button id="btnRight" title="詳細パネル">詳細</button>
+</header>
+
+<aside id="left">
+  <h3>データベース</h3>
+  <div class="summary" id="summary"></div>
+  <h3>検索</h3>
+  <input type="search" id="search" placeholder="name / title / id / text …">
+  <div id="results"></div>
+  <h3>ラベル <span class="muted" style="text-transform:none">(色で表示切替 / ↓で読込)</span></h3>
+  <div id="labels"></div>
+  <div id="commLegendBox" style="display:none"><h3>コミュニティ</h3><div id="commLegend"></div></div>
+  <h3>リレーションタイプ</h3>
+  <div id="types"></div>
+  <h3>プロパティキー</h3>
+  <div id="keys" class="muted"></div>
+  <h3>インデックス</h3>
+  <div id="indexes"></div>
+</aside>
+
+<main id="stage">
+  <div id="cy"></div>
+  <div id="tip"></div>
+  <div id="status">読み込み中…</div>
+</main>
+
+<aside id="right"><div id="detail" class="muted">ノードまたはエッジをクリックすると詳細が表示されます。<br>ダブルクリックで隣接ノードを展開します。</div></aside>
+
+<section id="console">
+  <div class="bar">
+    <strong>Cypher</strong>
+    <select id="examples"></select>
+    <button class="primary" id="btnRun" title="Ctrl+Enter">実行</button>
+    <select id="gmode" title="結果のグラフ描画">
+      <option value="replace">グラフ: 置換</option><option value="merge">グラフ: 追加</option><option value="none">グラフ: 描画しない</option>
+    </select>
+    <button class="small" id="btnParams">params</button>
+    <input type="text" id="params" placeholder='{"name": "…"}'>
+    <span class="muted">Ctrl+Enter で実行 (読み取り専用)</span>
+  </div>
+  <div class="body">
+    <textarea id="cypher" spellcheck="false" placeholder="MATCH (n) RETURN n LIMIT 25"></textarea>
+    <div id="out"><div id="outinfo" class="muted"></div><div id="table"></div></div>
+  </div>
+</section>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/cytoscape/3.30.2/cytoscape.min.js" integrity="sha512-EY3U1MWdgKx0P1dqTE4inlKz2cpXtWpsR1YUyD855Hs6RL/A0cyvrKh60EpE8wDZ814cTe1KgRK+sG0Rn792vQ==" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
+<script>
+"use strict";
+const $ = (s) => document.querySelector(s);
+const el = (tag, props = {}, ...kids) => {
+  const e = document.createElement(tag);
+  for (const [k, v] of Object.entries(props)) {
+    if (k === "style") e.style.cssText = v;
+    else if (k.startsWith("on")) e.addEventListener(k.slice(2), v);
+    else if (v !== false && v != null) e.setAttribute(k, v === true ? "" : v);
+  }
+  e.append(...kids.flat().filter((k) => k != null));
+  return e;
+};
+const css = (n) => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+const FONT = css("--font");
+const dark = matchMedia("(prefers-color-scheme: dark)");
+const fmt = (n) => Number(n).toLocaleString();
+
+async function api(path, body) {
+  const opts = body === undefined ? {} : { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) };
+  const r = await fetch(path, opts);
+  const j = await r.json().catch(() => ({ error: "不正なレスポンス (" + r.status + ")" }));
+  if (!r.ok) throw new Error(j.error || r.statusText);
+  return j;
+}
+
+const state = {
+  overview: null, labelIdx: {}, hiddenLabels: new Set(), hiddenTypes: new Set(),
+  byCommunity: false, edgeLabels: true, communities: {}, nodeCache: new Map(), focus: null,
+};
+const limit = () => +$("#limit").value;
+let cy;
+
+/* ---------- colors & captions ---------- */
+function labelColor(label) {
+  const i = state.labelIdx[label];
+  return css("--c" + ((i === undefined ? 11 : i) % 12));
+}
+function commColor(id) {
+  return `hsl(${(id * 137.508) % 360}, ${dark.matches ? 62 : 58}%, ${dark.matches ? 62 : 46}%)`;
+}
+function capOf(n) {
+  const p = n.properties || {};
+  for (const k of ["name", "title", "id"]) {
+    if (typeof p[k] === "string" && p[k] || typeof p[k] === "number") return String(p[k]).replace(/\s+/g, " ").slice(0, 40);
+  }
+  if (typeof p.text === "string" && p.text) {
+    const t = Array.from(p.text.replace(/\s+/g, " ").trim());
+    return t.slice(0, 20).join("") + (t.length > 20 ? "…" : "");
+  }
+  return (n.labels && n.labels[0]) || String(n.id);
+}
+function nodeColor(d) {
+  if (state.byCommunity) {
+    if (d.labels.includes("Community")) return commColor(d.nid);
+    if (d.community != null) return commColor(d.community);
+  }
+  return labelColor(d.primary);
+}
+function nodeData(n) {
+  return {
+    id: "n" + n.id, nid: n.id, labels: n.labels, primary: n.labels[0] || "", props: n.properties,
+    degree: n.degree, community: n.community, caption: capOf(n),
+    size: Math.round(14 + Math.min(46, Math.sqrt(n.degree) * 6)),
+  };
+}
+
+/* ---------- cytoscape ---------- */
+function styleSheet() {
+  const text = css("--text"), bg = css("--bg"), edge = css("--edge"), acc = css("--accent");
+  return [
+    { selector: "node", style: {
+      "background-color": "data(color)", width: "data(size)", height: "data(size)", label: "data(caption)",
+      "font-size": 13, "font-family": FONT, color: text, "text-valign": "bottom", "text-margin-y": 4,
+      "text-wrap": "ellipsis", "text-max-width": 120, "text-outline-width": 2, "text-outline-color": bg,
+      "border-width": 1.5, "border-color": bg, "min-zoomed-font-size": 4 } },
+    { selector: "node:selected", style: { "border-width": 4, "border-color": acc } },
+    { selector: "edge", style: {
+      width: 1.4, "line-color": edge, "target-arrow-color": edge, "target-arrow-shape": "triangle", "arrow-scale": 0.9,
+      "curve-style": "bezier", label: state.edgeLabels ? "data(type)" : "", "font-size": 9, "font-family": FONT,
+      color: css("--muted"), "text-rotation": "autorotate", "text-background-color": bg, "text-background-opacity": 0.8,
+      "text-background-padding": 2, "min-zoomed-font-size": 7 } },
+    { selector: "edge:selected", style: { "line-color": acc, "target-arrow-color": acc, width: 3 } },
+    { selector: ".faded", style: { opacity: 0.12 } },
+    { selector: ".hidden", style: { display: "none" } },
+  ];
+}
+function recolor() {
+  cy.batch(() => cy.nodes().forEach((n) => n.data("color", nodeColor(n.data()))));
+  renderCommLegend();
+}
+function applyVisibility() {
+  cy.batch(() => {
+    cy.nodes().forEach((n) => {
+      const ls = n.data("labels");
+      n.toggleClass("hidden", ls.length > 0 && ls.every((l) => state.hiddenLabels.has(l)));
+    });
+    cy.edges().forEach((e) => e.toggleClass("hidden", state.hiddenTypes.has(e.data("type"))));
+  });
+  updateStatus();
+}
+function updateStatus(msg) {
+  const n = cy.nodes().not(".hidden").length, e = cy.edges().not(".hidden").filter((x) => !x.source().hasClass("hidden") && !x.target().hasClass("hidden")).length;
+  $("#status").textContent = `ノード ${fmt(n)} / エッジ ${fmt(e)}` + (msg ? " · " + msg : "");
+}
+function runLayout({ randomize = false, fit = false } = {}) {
+  const vn = cy.nodes().not(".hidden");
+  const eles = vn.union(vn.edgesWith(vn).not(".hidden"));
+  const n = vn.length;
+  if (!n) return;
+  eles.layout({
+    name: "cose", animate: n < 300 ? "end" : false, animationDuration: 450, randomize, fit: false, padding: 40,
+    nodeDimensionsIncludeLabels: true, idealEdgeLength: () => 70, nodeRepulsion: () => 12000,
+    edgeElasticity: () => 100, gravity: 0.8, numIter: n > 500 ? 500 : 1000, componentSpacing: 60,
+    stop: () => { if (fit) cy.fit(cy.elements().not(".hidden"), 40); },
+  }).run();
+}
+
+/* Add a payload ({nodes, edges, communities}) to the canvas; returns the newly added node elements. */
+async function integrate(p, { near = null, layout = true, fit = false } = {}) {
+  Object.assign(state.communities, p.communities || {});
+  const ext = cy.extent();
+  const cx = (ext.x1 + ext.x2) / 2, cyy = (ext.y1 + ext.y2) / 2;
+  const fresh = cy.nodes().length === 0;
+  const added = [];
+  cy.batch(() => {
+    for (const n of p.nodes) {
+      if (cy.getElementById("n" + n.id).nonempty()) continue;
+      const base = near ? near.position() : { x: cx, y: cyy };
+      const spread = near ? 60 : 40;
+      const d = nodeData(n);
+      d.color = nodeColor(d);
+      added.push(cy.add({ group: "nodes", data: d, position: { x: base.x + (Math.random() - 0.5) * spread, y: base.y + (Math.random() - 0.5) * spread } }));
+    }
+    addEdges(p.edges);
+  });
+  applyVisibility();
+  renderCommLegend();
+  if (cy.nodes().length <= 3000) {
+    try {
+      const ids = cy.nodes().map((n) => n.data("nid"));
+      addEdges((await api("/api/edges", { ids })).edges);
+      applyVisibility();
+    } catch (e) { /* edges among nodes are optional */ }
+  }
+  if (layout && (added.length || fit)) runLayout({ randomize: fresh, fit: fit || fresh });
+  return added;
+}
+function addEdges(edges) {
+  for (const e of edges) {
+    const id = "e" + e.id;
+    if (cy.getElementById(id).nonempty()) continue;
+    if (cy.getElementById("n" + e.source).empty() || cy.getElementById("n" + e.target).empty()) continue;
+    cy.add({ group: "edges", data: { id, eid: e.id, source: "n" + e.source, target: "n" + e.target, type: e.type, props: e.properties } });
+  }
+}
+
+async function run(label, fn) {
+  updateStatus(label + "…");
+  try { return await fn(); }
+  catch (e) { updateStatus("エラー: " + e.message); throw e; }
+}
+async function expandNode(node, types = "") {
+  const d = await run("展開中", () => api(`/api/expand/${node.data("nid")}?limit=${limit()}` + (types ? "&types=" + encodeURIComponent(types) : "")));
+  const added = await integrate(d, { near: node });
+  updateStatus(`隣接 ${d.nodes.length} ノードを取得 (${fmt(d.total)} 件中${added.length ? "、新規 " + added.length : ""})`);
+  if (state.selected === node.id()) showNode(node);
+}
+async function loadLabel(name) {
+  state.hiddenLabels.delete(name);
+  renderSidebarLists();
+  const d = await run("読み込み中", () => api(`/api/graph?limit=${limit()}&labels=${encodeURIComponent(name)}`));
+  const added = await integrate(d, { fit: true });
+  applyVisibility();
+  updateStatus(`${name}: ${added.length} ノードを追加`);
+}
+async function loadInitial() {
+  cy.elements().remove();
+  showDetail(null);
+  const d = await run("読み込み中", () => api(`/api/graph?limit=${limit()}`));
+  await integrate(d, { fit: true });
+}
+async function focusNodeById(id, { select = true } = {}) {
+  let n = cy.getElementById("n" + id);
+  if (n.empty()) {
+    const d = await api("/api/node/" + id);
+    await integrate({ nodes: [d], edges: [], communities: d.communities }, {});
+    n = cy.getElementById("n" + id);
+  }
+  n.removeClass("hidden");
+  if (select) { cy.elements().unselect(); n.select(); showNode(n); }
+  cy.animate({ center: { eles: n }, zoom: Math.max(cy.zoom(), 1) }, { duration: 300 });
+}
+function focusNeighborhood(node) {
+  const nb = node.closedNeighborhood();
+  cy.elements().addClass("faded");
+  nb.removeClass("faded");
+  state.focus = node.id();
+  cy.animate({ fit: { eles: nb.filter(":visible"), padding: 60 } }, { duration: 300 });
+}
+function clearFocus() { cy.elements().removeClass("faded"); state.focus = null; }
+
+/* ---------- detail panel ---------- */
+function propValue(v) {
+  if (typeof v === "string") {
+    if (v.length <= 160 && !v.includes("\n")) return document.createTextNode(v);
+    return el("details", { class: "pv" }, el("summary", {}, Array.from(v.replace(/\s+/g, " ")).slice(0, 80).join("") + "… (" + fmt(v.length) + "文字)"), el("pre", {}, v));
+  }
+  if (v !== null && typeof v === "object") return el("pre", {}, JSON.stringify(v, null, 2));
+  return document.createTextNode(String(v));
+}
+function propsTable(props) {
+  const keys = Object.keys(props || {});
+  if (!keys.length) return el("div", { class: "muted" }, "(プロパティなし)");
+  return el("table", { class: "props" }, keys.map((k) => el("tr", {}, el("td", {}, k), el("td", {}, propValue(props[k])))));
+}
+function showDetail(content) {
+  const box = $("#detail");
+  box.className = content ? "" : "muted";
+  box.replaceChildren(content || document.createTextNode("ノードまたはエッジをクリックすると詳細が表示されます。ダブルクリックで隣接ノードを展開します。"));
+}
+function openRight() { document.body.classList.remove("no-right"); }
+async function showNode(node) {
+  state.selected = node.id();
+  const d = node.data();
+  openRight();
+  const render = (full) => {
+    const rels = full ? full.relationships : null;
+    const shown = node.connectedEdges(":visible").length;
+    const comm = d.community != null ? (state.communities[d.community] || "#" + d.community) : null;
+    showDetail(el("div", {},
+      el("div", { class: "hdr" }, el("span", { class: "dot", style: `background:${d.color}` }), d.caption),
+      el("div", {}, d.labels.map((l) => el("span", { class: "tag" }, l)), el("span", { class: "muted" }, " id " + d.nid)),
+      el("div", { class: "btns" },
+        el("button", { onclick: () => expandNode(node) }, "展開"),
+        el("button", { onclick: () => focusNeighborhood(node) }, "近傍にフォーカス"),
+        el("button", { onclick: () => { clearFocus(); node.remove(); showDetail(null); updateStatus(); } }, "非表示")),
+      el("div", {}, `次数 ${fmt(d.degree)}`, el("span", { class: "muted" }, ` (表示中のエッジ ${shown})`)),
+      comm ? el("div", {}, "コミュニティ: ", el("span", { class: "link", onclick: () => focusNodeById(d.community) }, comm)) : null,
+      rels && rels.length ? el("div", {}, el("h3", {}, "リレーション"), rels.map((r) => el("div", { class: "row" },
+        el("span", { class: "name" }, (r.direction === "out" ? "→ " : "← ") + r.type),
+        el("span", { class: "count" }, fmt(r.count)),
+        el("button", { class: "small", onclick: () => expandNode(node, r.type) }, "展開")))) : null,
+      el("h3", {}, "プロパティ"),
+      propsTable(full ? full.properties : d.props)));
+  };
+  render(state.nodeCache.get(d.nid));
+  if (!state.nodeCache.has(d.nid)) {
+    try {
+      const full = await api("/api/node/" + d.nid);
+      state.nodeCache.set(d.nid, full);
+      if (state.selected === node.id()) render(full);
+    } catch (e) { /* keep the light data */ }
+  }
+}
+function showEdge(edge) {
+  state.selected = edge.id();
+  const d = edge.data();
+  openRight();
+  const end = (n) => el("div", {}, el("span", { class: "link", onclick: () => focusNodeById(n.data("nid")) }, n.data("caption")), " ", el("span", { class: "muted" }, n.data("labels").join(":")));
+  showDetail(el("div", {},
+    el("div", { class: "hdr" }, el("span", { class: "tag" }, d.type)), el("span", { class: "muted" }, "id " + d.eid),
+    el("h3", {}, "始点"), end(edge.source()), el("h3", {}, "終点"), end(edge.target()),
+    el("h3", {}, "プロパティ"), propsTable(d.props)));
+}
+
+/* ---------- sidebar ---------- */
+function renderSidebarLists() {
+  const o = state.overview;
+  if (!o) return;
+  $("#labels").replaceChildren(...o.labels.map((l) => el("div", { class: "row" + (state.hiddenLabels.has(l.name) ? " off" : "") },
+    el("span", { class: "chip", title: "表示 / 非表示", style: `background:${labelColor(l.name)}`, onclick: () => { toggleSet(state.hiddenLabels, l.name); renderSidebarLists(); applyVisibility(); } }),
+    el("span", { class: "name", title: l.name, onclick: () => loadLabel(l.name) }, l.name),
+    el("span", { class: "count" }, fmt(l.count)),
+    el("button", { class: "small", title: `${l.name} を読み込む`, onclick: () => loadLabel(l.name) }, "↓"))));
+  $("#types").replaceChildren(...o.types.map((t) => el("div", { class: "row" + (state.hiddenTypes.has(t.name) ? " off" : "") },
+    el("span", { class: "name", title: "クリックで表示 / 非表示", onclick: () => { toggleSet(state.hiddenTypes, t.name); renderSidebarLists(); applyVisibility(); } }, t.name),
+    el("span", { class: "count" }, fmt(t.count)))));
+}
+function toggleSet(s, v) { s.has(v) ? s.delete(v) : s.add(v); }
+function renderCommLegend() {
+  const box = $("#commLegendBox");
+  box.style.display = state.byCommunity ? "" : "none";
+  if (!state.byCommunity) return;
+  const ids = [...new Set(cy.nodes().map((n) => n.data("community")).filter((c) => c != null))].sort((a, b) => a - b);
+  $("#commLegend").replaceChildren(...ids.map((id) => el("div", { class: "row" },
+    el("span", { class: "chip", style: `background:${commColor(id)}`, onclick: () => focusNodeById(id) }),
+    el("span", { class: "name", title: state.communities[id] || "", onclick: () => focusNodeById(id) }, state.communities[id] || "#" + id))));
+}
+function renderOverview(o) {
+  $("#dbname").textContent = o.file;
+  document.title = o.file + " - sqgraph viewer";
+  const size = o.size > 1048576 ? (o.size / 1048576).toFixed(1) + " MB" : Math.ceil(o.size / 1024) + " KB";
+  $("#summary").replaceChildren(
+    el("span", { class: "muted" }, "ファイル"), el("span", {}, o.file + " (" + size + ")"),
+    el("span", { class: "muted" }, "ノード"), el("b", {}, fmt(o.nodes)),
+    el("span", { class: "muted" }, "リレーション"), el("b", {}, fmt(o.relationships)));
+  $("#keys").replaceChildren(...o.propertyKeys.map((k) => el("span", { class: "tag" }, k)));
+  $("#indexes").replaceChildren(...(o.indexes.length ? o.indexes.map((i) => el("div", {}, el("span", { class: "tag" }, i.type), i.name,
+    el("div", { class: "muted" }, (i.entityType === "RELATIONSHIP" ? "[:" + i.labelsOrTypes.join("|") + "]" : i.labelsOrTypes.join("|")) + "." + i.properties.join(",")))) : [el("span", { class: "muted" }, "なし")]));
+  $("#lblComm").style.display = o.hasCommunities ? "" : "none";
+  renderSidebarLists();
+}
+
+/* ---------- search ---------- */
+let searchTimer = 0, searchSeq = 0;
+function onSearch() {
+  clearTimeout(searchTimer);
+  const q = $("#search").value.trim();
+  if (!q) { $("#results").replaceChildren(); return; }
+  searchTimer = setTimeout(async () => {
+    const seq = ++searchSeq;
+    try {
+      const d = await api("/api/search?limit=30&q=" + encodeURIComponent(q));
+      if (seq !== searchSeq) return;
+      Object.assign(state.communities, d.communities);
+      $("#results").replaceChildren(...(d.nodes.length ? d.nodes.map((n) => el("div", { class: "row", onclick: async () => {
+        await integrate({ nodes: [n], edges: [], communities: d.communities });
+        focusNodeById(n.id);
+      } }, el("span", { class: "dot", style: `background:${labelColor(n.labels[0] || "")}; margin-top:6px` }),
+        el("span", { class: "name" }, capOf(n), el("small", {}, n.labels.join(":") + " · 次数 " + n.degree)))) : [el("div", { class: "muted" }, "見つかりませんでした")]));
+    } catch (e) { $("#results").replaceChildren(el("div", { class: "muted" }, "エラー: " + e.message)); }
+  }, 250);
+}
+
+/* ---------- console ---------- */
+const EXAMPLES = [
+  ["例クエリを選択…", ""],
+  ["エンティティ間の関係 (グラフ)", "MATCH (e:Entity)-[r:RELATED_TO]->(f:Entity)\nRETURN e, r, f LIMIT 200"],
+  ["コミュニティとメンバー (グラフ)", "MATCH (e:Entity)-[r:IN_COMMUNITY]->(c:Community)\nRETURN e, r, c LIMIT 200"],
+  ["次数上位のエンティティ (表)", "MATCH (e:Entity)-[r:RELATED_TO]-()\nRETURN e.name AS name, count(r) AS degree\nORDER BY degree DESC LIMIT 20"],
+  ["コミュニティごとのメンバー数 (表)", "MATCH (e:Entity)-[:IN_COMMUNITY]->(c:Community)\nRETURN c.title AS community, count(e) AS members\nORDER BY members DESC"],
+  ["文書 → チャンク → エンティティ (パス)", "MATCH p = (d:Document)-[:HAS_CHUNK]->(c:Chunk)-[:MENTIONS]->(e:Entity)\nRETURN p LIMIT 100"],
+  ["言及の多いエンティティ (表)", "MATCH (c:Chunk)-[:MENTIONS]->(e:Entity)\nRETURN e.name AS name, count(c) AS chunks\nORDER BY chunks DESC LIMIT 20"],
+  ["ラベルごとの件数", "MATCH (n)\nRETURN labels(n) AS labels, count(*) AS n\nORDER BY n DESC"],
+  ["リレーションタイプごとの件数", "MATCH ()-[r]->()\nRETURN type(r) AS type, count(*) AS n\nORDER BY n DESC"],
+  ["インデックス一覧", "SHOW INDEXES"],
+];
+function cellNode(n) {
+  return el("span", { class: "nchip", title: n.labels.join(":") + " #" + n.id, onclick: () => focusNodeById(n.id).catch((e) => updateStatus(e.message)) },
+    el("span", { class: "dot", style: `background:${labelColor(n.labels[0] || "")}` }), capOf(n));
+}
+function cell(v) {
+  if (v === null || v === undefined) return el("span", { class: "muted" }, "null");
+  if (typeof v === "object" && !Array.isArray(v) && v.kind === "node") return cellNode(v);
+  if (typeof v === "object" && !Array.isArray(v) && v.kind === "relationship") return el("span", { class: "rchip" }, `[:${v.type}] ${v.source}→${v.target}`);
+  if (typeof v === "object" && !Array.isArray(v) && v.kind === "path") {
+    const out = [];
+    v.nodes.forEach((n, i) => { out.push(cellNode(n)); if (v.relationships[i]) out.push(el("span", { class: "rchip" }, `-[:${v.relationships[i].type}]->`)); });
+    return el("span", {}, out);
+  }
+  if (Array.isArray(v) && v.length && v.every((x) => x && x.kind === "node")) return el("span", {}, v.map(cellNode));
+  const text = typeof v === "string" ? v : typeof v === "object" ? JSON.stringify(v) : String(v);
+  return el("div", { class: "clamp", title: "クリックで展開", onclick: (e) => e.currentTarget.classList.toggle("open") }, text);
+}
+function renderTable(res) {
+  const info = $("#outinfo");
+  info.className = "muted";
+  const g = res.graph;
+  info.textContent = `${fmt(res.rowCount)} 行 · ${res.elapsedMs} ms · グラフ要素: ノード ${g.nodes.length} / エッジ ${g.edges.length}` + (res.truncated ? ` (表は先頭 ${fmt(res.rows.length)} 行のみ)` : "");
+  const rows = res.rows.slice(0, 1000);
+  if (!res.columns.length) { $("#table").replaceChildren(el("div", { class: "muted", style: "padding:6px 8px" }, "結果なし")); return; }
+  $("#table").replaceChildren(el("table", {},
+    el("thead", {}, el("tr", {}, res.columns.map((c) => el("th", {}, c)))),
+    el("tbody", {}, rows.map((r) => el("tr", {}, r.map((v) => el("td", {}, cell(v))))))));
+}
+async function runQuery() {
+  const cypher = $("#cypher").value;
+  if (!cypher.trim()) return;
+  let params;
+  const ptxt = $("#params").value.trim();
+  if (ptxt) {
+    try { params = JSON.parse(ptxt); } catch (e) { return showError("params が正しい JSON ではありません: " + e.message); }
+  }
+  $("#btnRun").disabled = true;
+  $("#outinfo").className = "muted";
+  $("#outinfo").textContent = "実行中…";
+  try {
+    const res = await api("/api/query", { cypher, params });
+    renderTable(res);
+    const mode = $("#gmode").value;
+    if (mode !== "none" && (res.graph.nodes.length || res.graph.edges.length)) {
+      if (mode === "replace") { cy.elements().remove(); clearFocus(); showDetail(null); }
+      await integrate(res.graph, { fit: true });
+      updateStatus(`結果を描画: ノード ${res.graph.nodes.length} / エッジ ${res.graph.edges.length}`);
+    }
+  } catch (e) { showError(e.message); }
+  finally { $("#btnRun").disabled = false; }
+}
+function showError(msg) {
+  const info = $("#outinfo");
+  info.className = "err";
+  info.textContent = "エラー: " + msg;
+  $("#table").replaceChildren();
+}
+
+/* ---------- init ---------- */
+function bind() {
+  $("#btnLeft").onclick = () => document.body.classList.toggle("no-left");
+  $("#btnRight").onclick = () => document.body.classList.toggle("no-right");
+  $("#btnConsole").onclick = () => document.body.classList.toggle("no-console");
+  $("#btnReload").onclick = () => loadInitial();
+  $("#btnLayout").onclick = () => runLayout({ randomize: true, fit: true });
+  $("#btnFit").onclick = () => cy.animate({ fit: { eles: cy.elements().not(".hidden"), padding: 40 } }, { duration: 250 });
+  $("#btnClear").onclick = () => { cy.elements().remove(); clearFocus(); showDetail(null); updateStatus(); };
+  $("#chkEdgeLabels").onchange = (e) => { state.edgeLabels = e.target.checked; cy.style(styleSheet()); };
+  $("#chkComm").onchange = (e) => { state.byCommunity = e.target.checked; recolor(); };
+  $("#btnPng").onclick = () => {
+    if (!cy.elements().length) return;
+    const blob = cy.png({ full: true, scale: 2, bg: css("--bg"), output: "blob" });
+    const a = el("a", { href: URL.createObjectURL(blob), download: (state.overview ? state.overview.file.replace(/\.[^.]+$/, "") : "graph") + ".png" });
+    document.body.append(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+  };
+  $("#search").addEventListener("input", onSearch);
+  $("#btnRun").onclick = runQuery;
+  $("#btnParams").onclick = () => { const p = $("#params"); p.style.display = p.style.display === "block" ? "none" : "block"; };
+  $("#cypher").addEventListener("keydown", (e) => { if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) { e.preventDefault(); runQuery(); } });
+  const ex = $("#examples");
+  EXAMPLES.forEach(([label, q]) => ex.append(el("option", { value: q }, label)));
+  ex.onchange = () => { if (ex.value) $("#cypher").value = ex.value; ex.selectedIndex = 0; };
+  addEventListener("keydown", (e) => {
+    if (/^(INPUT|TEXTAREA|SELECT)$/.test(document.activeElement.tagName)) return;
+    if (e.key === "Escape") { clearFocus(); cy.elements().unselect(); showDetail(null); }
+    if (e.key === "Delete") { cy.$(":selected").remove(); showDetail(null); updateStatus(); }
+  });
+  dark.addEventListener("change", () => { cy.style(styleSheet()); recolor(); renderSidebarLists(); });
+  if (innerWidth <= 900) document.body.classList.add("no-left", "no-console");
+}
+
+function initCy() {
+  cy = cytoscape({ container: $("#cy"), style: styleSheet(), minZoom: 0.05, maxZoom: 4 });
+  new ResizeObserver(() => cy.resize()).observe($("#cy"));
+  let last = { id: null, t: 0 };
+  cy.on("tap", "node", (e) => {
+    const now = Date.now(), n = e.target;
+    if (last.id === n.id() && now - last.t < 350) { last = { id: null, t: 0 }; expandNode(n).catch(() => {}); return; }
+    last = { id: n.id(), t: now };
+    showNode(n);
+  });
+  cy.on("tap", "edge", (e) => showEdge(e.target));
+  cy.on("tap", (e) => { if (e.target === cy) { clearFocus(); showDetail(null); } });
+  const tip = $("#tip");
+  cy.on("mouseover", "node", (e) => {
+    const d = e.target.data(), p = e.renderedPosition;
+    tip.replaceChildren(el("b", {}, d.caption), el("div", { class: "muted" }, d.labels.join(":") + " · 次数 " + d.degree));
+    tip.style.left = Math.min(p.x + 14, $("#cy").clientWidth - 200) + "px";
+    tip.style.top = p.y + 14 + "px";
+    tip.style.display = "block";
+  });
+  cy.on("mouseout", "node", () => { tip.style.display = "none"; });
+  cy.on("drag zoom pan", () => { tip.style.display = "none"; });
+}
+
+(async function main() {
+  initCy();
+  bind();
+  try {
+    const o = await api("/api/overview");
+    state.overview = o;
+    [...o.labels].map((l) => l.name).sort().forEach((n, i) => { state.labelIdx[n] = i; });
+    renderOverview(o);
+    await loadInitial();
+  } catch (e) {
+    updateStatus("エラー: " + e.message);
+  }
+})();
+</script>
+</body>
+</html>
