@@ -387,6 +387,10 @@ claude mcp add sqgraph-memory-backend -- python -m sqgraph.memory.mcp --db /path
 - 抽出品質は LLM 依存です (誤った同一視 / 見落とし)。`get_entity` のタイムラインと出典 (`source_ref`) で確認できます。エンティティの手動マージやファクトの手動失効の API はまだありません。
 - ファクトの全文検索は trigram なので 2 文字以下の語は索引にかかりません (エンティティ名は別経路で一致します)。
 
+## クラウドへのデプロイ
+
+AWS (EC2 / ECS Fargate / Lambda) や Cloudflare (Containers / Tunnel + Access / R2) で動かす構成、書き込み 1 プロセスの制約、Litestream によるバックアップ、読み取り用スナップショットの配布、MCP サーバーの認証は [docs/deployment.md](docs/deployment.md) にまとめています (Dockerfile などは [deploy/](deploy/))。
+
 ## テスト
 
 ```bash

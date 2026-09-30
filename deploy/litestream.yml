@@ -1,0 +1,12 @@
+# deploy/litestream.yml
+access-key-id: ${LITESTREAM_ACCESS_KEY_ID}         # AWS で IAM ロールを使うなら 2 行とも削除
+secret-access-key: ${LITESTREAM_SECRET_ACCESS_KEY}
+
+dbs:
+  - path: ${DB_PATH}
+    replica:
+      url: ${LITESTREAM_REPLICA_URL}               # s3://my-bucket/sqgraph/memory
+      # --- Cloudflare R2 の場合 ---
+      # endpoint: https://<ACCOUNT_ID>.r2.cloudflarestorage.com
+      # region: auto
+      sync-interval: 5s
