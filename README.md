@@ -395,22 +395,53 @@ sqgraph-memory doctor [--online]    # 環境・DB・登録状況の診断 (失�
 
 | コマンド | 内容 |
 |---|---|
-| `init [--api-key-stdin] [--group-id G] [--tz TZ]` | ホーム・設定・`.env` を作る (キーは引数で渡せません) |
+| `init [--api-key-stdin] [--group-id G] [--tz TZ] [--embed-base-url URL] [--embed-model M] [--embed-dimensions N] [--no-probe]` | ホーム・設定・`.env` を作る (キーは引数で渡せません)。`--embed-base-url` で埋め込みを別サーバーにできます (下の「埋め込みを LAN 内のサーバーで動かす」) |
 | `add TEXT\|- [--source claude-code] [--author user] [--channel personal] [--occurred-at T] [--source-ref R]` | 覚える (LLM による抽出で数秒かかる。`-` は stdin) |
 | `search QUERY [--limit N] [--as-of T] [--history] [--center ENTITY]` | ファクト検索 (予定のファクトも含む。`--history` で失効分も) |
 | `entity NAME` / `entities QUERY` / `episodes [--entity E] [--query Q]` / `stats` | プロファイルと履歴 / 名前解決 / 元のメモ / 件数 |
 | `forget (--episode ID \| --source-ref REF [--source S] \| --fact ID \| --entity NAME [--keep-episodes] \| --since/--until/--channel [--source S]) [--dry-run]` | 削除 (対象の種類はちょうど 1 つ) |
 | `purge --yes [--dry-run]` | 設定中の group の全記憶を削除 |
-| `mcp [--transport stdio\|streamable-http] [--read-only]` | MCP サーバー (エージェントが起動する。設定ファイルの DB / group / モデルを自動で渡す) |
-| `setup` / `doctor` | 上記 |
+| `config [--embed-base-url URL\|openai] [--embed-model M] [--embed-dimensions N] [--llm-model M] [--group-id G] [--tz TZ] [--embed-api-key-env NAME] [--no-probe]` | 設定を表示 (秘密は出しません) / 変更。埋め込みの設定を変えるとエンドポイントを確認し、DB の埋め込みと合わないときは `reembed` を促します |
+| `reembed [--yes] [--batch-size N] [--progress]` | すべてのエンティティとファクトの埋め込みを、設定中の埋め込みモデルで作り直す (`--yes` なしは計画の表示だけ) |
+| `mcp [--transport stdio\|streamable-http] [--read-only]` | MCP サーバー (エージェントが起動する。設定ファイルの DB / group / モデル / 埋め込みエンドポイントを自動で渡す) |
+| `setup` / `doctor [--online]` | 上記 (`doctor` は埋め込みの接続先・モデル・次元と、DB に記録された埋め込みとの一致も報告。`--online` で実際に 1 回呼びます) |
 
-`python -m sqgraph.memory` でも同じです。API キーがないときも `search` / `entity` / `episodes` / `stats` / `forget` は動き (ベクトル検索だけ無効になり `warning` が付きます)、LLM が要るのは `add` だけです。
+`python -m sqgraph.memory` でも同じです。API キーがないときも `search` / `entity` / `episodes` / `stats` / `forget` は動き (ベクトル検索だけ無効になり `warning` が付きます)、LLM が要るのは `add` だけです。埋め込みを LAN のサーバーに任せている場合は OpenAI のキーなしでもベクトル検索が動きます。
 
 **全エージェントで 1 ファイルを共有**: 全員が `~/.sqgraph-memory/memory.db` を開き、書き込みは `memory.db.lock` のクロスプロセスのファイルロックで直列化されます (複数のエージェントが同時に `add` しても壊れず、待ち時間は `lock_timeout` まで)。あるエージェントが覚えたことは他のエージェントからも検索できます。MCP サーバーは `--group-id` を設定ファイルの値に固定して起動します。
 
 **忘れる**: `forget` / `purge` / MCP の `forget_memory` は、DB から対象のエピソード・ファクト・孤立したエンティティを消し、残ったエンティティの要約と埋め込みを再計算します (削除されたファクトに失効させられていたファクトは有効に戻ります)。削除後は SQLite の `secure_delete` と WAL チェックポイントで、消した本文が DB ファイルにそのまま残らないようにします。`--dry-run` で何が消えるか確認できます。次のものは対象外です: DB ファイルの外にあるコピー (バックアップ、クラウド同期、Litestream など)、およびエピソードを取り込むときに OpenAI API へ送った内容 (OpenAI のポリシーに従って保持されます)。
 
-**データの場所と権限**: 既定は `~/.sqgraph-memory/` (`SQGRAPH_MEMORY_HOME` で変更)。中身は `memory.db`、`.env` (`OPENAI_API_KEY=...`)、`config.json` (`group_id` 既定 `me`、`tz` 既定 `Asia/Tokyo`、`llm_model`、`embed_model`、`db`) です。POSIX ではディレクトリを 0700、ファイルを 0600 で作ります (Windows ではユーザープロファイルの ACL に任せます)。`SQGRAPH_MEMORY_DB` / `SQGRAPH_MEMORY_GROUP` で DB と group を上書きできます。`setup` 実行時にこれら (と `SQGRAPH_MEMORY_HOME`) が設定されていれば、パスは絶対パスにして各エージェントの登録 (`env`) に引き継ぎます (`--dry-run` の出力にも表示)。API キーの値は出力にもログにも出しません。エージェントは MCP サーバーをシェルの環境変数なしで起動するため、キーは `.env` から読みます。
+**データの場所と権限**: 既定は `~/.sqgraph-memory/` (`SQGRAPH_MEMORY_HOME` で変更)。中身は `memory.db`、`.env` (`OPENAI_API_KEY=...`)、`config.json` (`group_id` 既定 `me`、`tz` 既定 `Asia/Tokyo`、`llm_model`、`embed_model`、`embed_base_url` 既定 null = OpenAI API、`embed_dimensions` 既定 null = OpenAI なら 1536 / カスタムなら自動検出して保存、`embed_api_key_env` 既定 `SQGRAPH_EMBED_API_KEY`、`db`) です。POSIX ではディレクトリを 0700、ファイルを 0600 で作ります (Windows ではユーザープロファイルの ACL に任せます)。`SQGRAPH_MEMORY_DB` / `SQGRAPH_MEMORY_GROUP` で DB と group を上書きできます。`setup` 実行時にこれら (と `SQGRAPH_MEMORY_HOME`) が設定されていれば、パスは絶対パスにして各エージェントの登録 (`env`) に引き継ぎます (`--dry-run` の出力にも表示)。API キーの値は出力にもログにも出しません。エージェントは MCP サーバーをシェルの環境変数なしで起動するため、キーは `.env` から読みます。
+
+#### 埋め込みを LAN 内のサーバーで動かす
+
+抽出用の LLM (`add`) は OpenAI のまま、**埋め込みだけを LAN 内の PC** (OpenAI 互換の `/v1/embeddings` を話すサーバー: Ollama / LM Studio / llama.cpp server / text-embeddings-inference / vLLM / Infinity など) に任せられます。検索 (`search` / `entity` / MCP の読み取りツール) は OpenAI のキーなしで動き、メモの本文が OpenAI に送られるのは `add` の LLM 抽出だけになります。
+
+```bash
+# Ollama (サーバー側で: ollama pull bge-m3  /  OLLAMA_HOST=0.0.0.0 ollama serve)
+sqgraph-memory init --embed-base-url http://192.168.1.20:11434/v1 --embed-model bge-m3
+#   または nomic-embed-text など。URL は http://<host>:11434 でも可 (/v1 を補います)
+
+# LM Studio (Local Server を起動し "Serve on Local Network" を有効に。モデル名は LM Studio に表示される識別子)
+sqgraph-memory init --embed-base-url http://192.168.1.20:1234/v1 --embed-model text-embedding-nomic-embed-text-v1.5
+
+# llama.cpp server  (llama-server -m bge-m3.gguf --embedding --host 0.0.0.0 --port 8080)
+sqgraph-memory init --embed-base-url http://192.168.1.20:8080/v1 --embed-model bge-m3
+# text-embeddings-inference  (--model-id BAAI/bge-m3 --port 8080)
+sqgraph-memory init --embed-base-url http://192.168.1.20:8080/v1 --embed-model BAAI/bge-m3
+
+sqgraph-memory config               # 設定の確認 (秘密は出ません)
+sqgraph-memory doctor --online      # エンドポイントに 1 回問い合わせて次元と DB との一致を確認
+```
+
+`init` / `config` は設定の保存前にエンドポイントへ 1 回だけ埋め込みを依頼し、モデルの次元数 (`embed_dimensions`) を自動検出して `config.json` に保存します (到達できなければエラー。サーバーがまだ起動していないときは `--no-probe` で確認なしに保存し、`--embed-dimensions N` を明示できます)。設定は `setup` で登録した各エージェントの MCP サーバーにも `mcp` が自動で渡します (`--embed-base-url` / `--embed-dimensions` / `--embed-api-key-env`)。
+
+- **サーバーが LAN のインターフェースで待ち受けていること**: 既定は `127.0.0.1` のみのことが多く、Ollama は `OLLAMA_HOST=0.0.0.0`、llama.cpp は `--host 0.0.0.0` が必要です。ファイアウォールでそのポート (Ollama 11434 / LM Studio 1234 など) を LAN からだけ開けてください。
+- **API キー**: 多くのローカルサーバーはキー不要で、その場合ダミー値を送ります (`OPENAI_API_KEY` がこのエンドポイントに送られることはありません)。認証付きのサーバーでは環境変数 `SQGRAPH_EMBED_API_KEY` (名前は `--embed-api-key-env` で変更可) に入れて `init` を実行するか、`~/.sqgraph-memory/.env` に `SQGRAPH_EMBED_API_KEY=...` と書いてください。
+- **モデルを切り替えたら `reembed` が必要**: 次元数が同じでも別モデルのベクトルは比べられません。DB には使った埋め込みモデル・次元・エンドポイントが記録され、設定と合わないまま開こうとするとエラーで `sqgraph-memory reembed` を案内します (`config` / `doctor` も警告します)。`sqgraph-memory reembed` で計画 (件数) を確認し、`--yes` で全エンティティ・全ファクトを現在の設定で作り直します (次元数が変わるときはベクトルインデックスも作り直します。全件の埋め込みに成功してから 1 トランザクションで反映するので、サーバーが落ちても DB は元のままです。実行中は書き込みロックを保持します)。エンドポイントの URL だけを変える (同じモデル・同じ次元) 場合は `reembed` は不要です。
+- **通信は平文の HTTP です**: メモの本文 (エンティティ名・ファクト文・検索クエリ) がそのままそのサーバーに送られます。信頼できる LAN の中だけで使い、インターネットには公開しないでください (リバースプロキシで TLS を付けるなら `https://` の URL も指定できます)。サーバー側のログにメモが残る可能性にも注意してください。
+- サーバーが落ちている間の `search` などは数秒でエラーになります (接続 5 秒 / 全体 30 秒、リトライ 1 回)。`add` のバッチは 32 件ずつ送ります。
 
 ### Discord bot への組み込み (概要)
 

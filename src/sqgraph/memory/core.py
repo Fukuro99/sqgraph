@@ -75,6 +75,12 @@ MEMORY_SCHEMA_VERSION = 1
 META_SCHEMA_KEY = "memory_schema_version"
 _MIGRATIONS: dict[int, Callable[["Memory"], None]] = {}
 
+# Identity of the embedder that produced the stored vectors, kept in ``_meta``. Vectors of different models are not
+# comparable even when their dimensions match, so opening a database with another model is refused (``reembed``).
+META_EMBED_MODEL = "embed_model"
+META_EMBED_DIMS = "embed_dimensions"
+META_EMBED_ENDPOINT = "embed_endpoint"
+
 
 # --------------------------------------------------------------------------- result types
 
@@ -257,6 +263,10 @@ class Memory:
         :class:`TimeoutError`. Every write holds that lock for its whole duration (including LLM calls), so
         several processes (agents) can safely share one database file.
 
+    allow_embedder_change:
+        Skip the embedding identity / dimension check (for :meth:`reembed`, which replaces every vector).
+        Otherwise a database built with another embedding model or dimension is refused (``SqgraphError``).
+
     A database opened here has ``PRAGMA secure_delete=ON``: forgotten data is overwritten, not left in free pages.
     """
 
@@ -273,7 +283,9 @@ class Memory:
         read_only: bool = False,
         clock: Callable[[], datetime] | None = None,
         lock_timeout: float = 300.0,
+        allow_embedder_change: bool = False,
     ) -> None:
+        self._allow_embedder_change = allow_embedder_change
         self._owns_db = not isinstance(db, GraphDB)
         self.db = db if isinstance(db, GraphDB) else GraphDB(db, read_only=read_only, secure_delete=True)
         self.llm = llm
@@ -381,11 +393,68 @@ class Memory:
             db.create_property_index("Memory", "id", name="mem_id")
             db.create_property_index("Memory", "source_ref", name="mem_source_ref")
             self._migrate(stored)
+        if self.embedder is not None and not self._allow_embedder_change:
+            self._check_embedder()
+
+    # ------------------------------------------------------------------ embedding identity
+
+    @staticmethod
+    def embedder_identity(embedder: Embedder) -> dict[str, Any] | None:
+        """``{"model", "dimensions", "endpoint"}`` of an embedder, or ``None`` if it does not name its model
+        (such embedders are only checked for their dimensions)."""
+        model = getattr(embedder, "model", None)
+        if not model:
+            return None
+        return {
+            "model": str(model),
+            "dimensions": int(embedder.dimensions),
+            "endpoint": getattr(embedder, "endpoint", None) or None,
+        }
+
+    def embedding_identity(self) -> dict[str, Any] | None:
+        """The identity recorded in the database (``model`` / ``dimensions`` / ``endpoint``), or ``None`` if none yet."""
+        model = self.db.get_meta(META_EMBED_MODEL)
+        if model is None:
+            return None
+        dims = self.db.get_meta(META_EMBED_DIMS)
+        return {
+            "model": model,
+            "dimensions": int(dims) if dims and dims.isdigit() else None,
+            "endpoint": self.db.get_meta(META_EMBED_ENDPOINT),
+        }
+
+    def _store_embedding_identity(self, ident: dict[str, Any]) -> None:
+        self.db.set_meta(META_EMBED_MODEL, ident["model"])
+        self.db.set_meta(META_EMBED_DIMS, str(ident["dimensions"]))
+        if ident.get("endpoint"):
+            self.db.set_meta(META_EMBED_ENDPOINT, ident["endpoint"])
+
+    def _check_embedder(self) -> None:
+        """Refuse an embedder whose model / dimensions differ from the stored vectors; adopt its identity if none is
+        recorded yet; record a changed endpoint (same model and dimensions). Read-only opens only check."""
+        emb = self.embedder
+        assert emb is not None
+        db = self.db
+        ident = self.embedder_identity(emb)
+        stored = self.embedding_identity()
         ix = next((i for i in db.vector_indexes() if i.name == FACT_INDEX), None)
-        if ix and self.embedder is not None and ix.dimensions != self.embedder.dimensions:
+        hint = "run `sqgraph-memory reembed` to recompute every embedding with the current embedder"
+        if ident is not None and stored is not None:
+            if stored["model"] != ident["model"] or stored["dimensions"] not in (None, ident["dimensions"]):
+                was = f"model {stored['model']!r} ({stored['dimensions']} dimensions, endpoint {stored['endpoint'] or 'unknown'})"
+                now = f"model {ident['model']!r} ({ident['dimensions']} dimensions, endpoint {ident['endpoint'] or 'unknown'})"
+                raise SqgraphError(
+                    f"embedding model mismatch: this database was built with {was}, but the configured embedder is "
+                    f"{now}. Vectors from different models are not comparable, even when the dimensions match: "
+                    f"{hint} (or switch back to the original model)"
+                )
+        if ix and ix.dimensions != emb.dimensions:
             raise SqgraphError(
-                f"embedding dimension mismatch: database has {ix.dimensions}, embedder produces {self.embedder.dimensions}"
+                f"embedding dimension mismatch: database has {ix.dimensions}, embedder produces {emb.dimensions}; {hint}"
             )
+        if ident is not None and not db.read_only and (stored is None or stored["endpoint"] != ident["endpoint"]):
+            with db.transaction():
+                self._store_embedding_identity(ident)
 
     def _migrate(self, stored: int | None) -> None:
         """Bring the stored memory schema version up to date (``None``: no version recorded yet)."""
@@ -2120,6 +2189,104 @@ class Memory:
                     valid.append((eff["valid_at"] or "", f["fact"]))
             body = " / ".join(t for _, t in sorted(valid, reverse=True)[:4])
         return upd, short(f"{name}: {body}", 400)
+
+    # -- re-embedding ----------------------------------------------------------------------------------
+
+    def reembed(
+        self,
+        group_id: str | None = None,
+        *,
+        batch_size: int = 64,
+        progress: Callable[[str, int, int], None] | None = None,
+    ) -> dict[str, Any]:
+        """Recompute every entity and fact embedding with the current embedder and record its identity.
+
+        ``group_id=None`` (default) covers all groups; with a group only that group's vectors are replaced, which is
+        refused when the model / dimensions change while other groups exist (their vectors would be left behind).
+        Texts are the ones ingestion embeds: an entity's ``name: summaries`` (else its currently valid facts), a
+        fact's sentence. Nothing is written until every text has been embedded, then the new vectors (and, when the
+        dimension changed, freshly created ``entity_emb`` / ``fact_emb`` indexes) are applied in one transaction, so
+        a failing embedding server leaves the database untouched. Holds the write lock for the whole run; open the
+        :class:`Memory` with ``allow_embedder_change=True`` when the identity differs. ``progress(kind, done, total)``
+        is called after every batch (``kind``: ``entities`` / ``facts``). Returns the counts and the old / new identity.
+        """
+        emb = self._need_embedder()
+        self._need_writable()
+        if batch_size < 1:
+            raise ValueError("batch_size must be >= 1")
+        ident = self.embedder_identity(emb)
+        with self._write_guard():
+            db = self.db
+            flt = "{group_id:$g}" if group_id else ""
+            params: dict[str, Any] = {"g": group_id} if group_id else {}
+            previous = self.embedding_identity()
+            indexes = {i.name: i for i in db.vector_indexes()}
+            new_dims = int(emb.dimensions)
+            recreate = any(indexes[n].dimensions != new_dims for n in (ENTITY_INDEX, FACT_INDEX) if n in indexes)
+            if group_id:
+                others = db.query("MATCH (e:Entity) WHERE e.group_id <> $g RETURN count(e) AS c", params)[0]["c"]
+                new_model = previous is not None and ident is not None and previous["model"] != ident["model"]
+                if others and (recreate or new_model):
+                    raise SqgraphError(
+                        f"cannot re-embed only group {group_id!r}: the model or dimension changes and {others} entities "
+                        "of other groups would keep vectors of the old model; re-embed all groups (no group_id)"
+                    )
+            entities = [r["e"] for r in db.query(f"MATCH (e:Entity {flt}) RETURN e", params)]
+            facts = [r["f"] for r in db.query(f"MATCH ()-[f:FACT {flt}]->() RETURN f", params)]
+            now = self._now()
+            by_entity: dict[str, list[Relationship]] = defaultdict(list)
+            for f in facts:
+                for x in {f.get("subject_id"), f.get("object_id")} - {None}:
+                    by_entity[x].append(f)
+
+            def batched(kind: str, texts: list[str]) -> list[list[float]]:
+                out: list[list[float]] = []
+                for i in range(0, len(texts), batch_size):
+                    out += emb.embed(texts[i : i + batch_size])
+                    if progress is not None:
+                        progress(kind, len(out), len(texts))
+                for v in out:
+                    if len(v) != new_dims:
+                        raise SqgraphError(f"the embedder returned a {len(v)}-dimensional vector, expected {new_dims}")
+                return out
+
+            e_vecs = batched("entities", [self._reembed_entity_text(n, by_entity.get(n["id"], ()), now) for n in entities])
+            f_vecs = batched("facts", [f["fact"] for f in facts])
+            with db.transaction():
+                if recreate:
+                    for name in (ENTITY_INDEX, FACT_INDEX):
+                        db.drop_index(name, if_exists=True)
+                    db.create_vector_index(ENTITY_INDEX, "Entity", "embedding", dimensions=new_dims)
+                    db.create_relationship_vector_index(FACT_INDEX, FACT_TYPE, "embedding", dimensions=new_dims)
+                for n, v in zip(entities, e_vecs):
+                    db.set_node_vector(n.id, "embedding", v)
+                for f, v in zip(facts, f_vecs):
+                    db.set_edge_vector(f.id, "embedding", v)
+                if ident is not None:
+                    self._store_embedding_identity(ident)
+        return {
+            "group_id": group_id,
+            "entities": len(entities),
+            "facts": len(facts),
+            "model": ident["model"] if ident else None,
+            "dimensions": new_dims,
+            "endpoint": ident["endpoint"] if ident else None,
+            "previous": previous,
+            "indexes_recreated": recreate,
+        }
+
+    def _reembed_entity_text(self, node: Node, facts: Iterable[Relationship], now: str) -> str:
+        """The text an entity's embedding is built from (the same as at ingestion / after forgetting)."""
+        p = node.properties
+        entries = self._entries(p)
+        if entries:
+            body = " / ".join(entries.values())
+        elif p.get("summary"):
+            body = p["summary"]
+        else:  # no summary: the currently valid facts, newest first
+            valid = [(f.get("valid_at") or "", f["fact"]) for f in facts if _fact_status(f.properties, now) == "valid"]
+            body = " / ".join(t for _, t in sorted(valid, reverse=True)[:4])
+        return short(f"{p['name']}: {body}", 400)
 
     # -- misc ----------------------------------------------------------------------------------------
 

@@ -7,7 +7,9 @@ deterministic fake (tests).
 * :class:`LLMProvider` -- ``complete_json`` (schema-constrained JSON) and ``complete_text``.
 * :class:`Embedder` -- ``embed(texts) -> vectors`` with a fixed ``dimensions``.
 * :class:`OpenAILLM` / :class:`OpenAIEmbedder` -- OpenAI implementations with token/cost tracking
-  through a shared :class:`UsageTracker`.
+  through a shared :class:`UsageTracker`. ``OpenAIEmbedder(base_url=...)`` talks to any OpenAI-compatible
+  ``/v1/embeddings`` server (Ollama, LM Studio, llama.cpp, TEI, vLLM, ...), e.g. one on the LAN;
+  :func:`probe_dimensions` finds out how many dimensions such a model produces.
 * :class:`FakeLLM` / :class:`FakeEmbedder` -- offline, deterministic implementations.
 """
 
@@ -21,11 +23,16 @@ import re
 import threading
 from collections import defaultdict
 from pathlib import Path
-from typing import Any, Callable, Protocol, Sequence, runtime_checkable
+from typing import Any, Callable, Mapping, Protocol, Sequence, runtime_checkable
 
 DEFAULT_CHAT_MODEL = "gpt-5.4-mini"
 DEFAULT_EMBED_MODEL = "text-embedding-3-small"
 DEFAULT_EMBED_DIMS = 1536
+PLACEHOLDER_API_KEY = "sqgraph-local"  # the openai client insists on a non-empty key; most local servers ignore it
+CUSTOM_EMBED_TIMEOUT = 30.0  # seconds, for custom (LAN) endpoints
+CUSTOM_EMBED_CONNECT_TIMEOUT = 5.0  # an unreachable LAN host should fail fast
+CUSTOM_EMBED_RETRIES = 1
+CUSTOM_EMBED_BATCH = 32  # e.g. text-embeddings-inference rejects bigger client batches by default
 
 # USD per 1M tokens: (input, cached input, output)
 PRICES: dict[str, tuple[float, float, float]] = {
@@ -237,24 +244,95 @@ class OpenAILLM:
         return (r.choices[0].message.content or "").strip()
 
 
+class EmbedderError(RuntimeError):
+    """An embedding server returned something unusable (wrong count / dimension of vectors)."""
+
+    def __init__(self, message: str, actual: int | None = None) -> None:
+        super().__init__(message)
+        self.actual = actual  # the dimension the server really produced (when that was the problem)
+
+
+def normalize_base_url(url: str) -> str:
+    """``http://host:11434`` -> ``http://host:11434/v1`` (a bare origin gets ``/v1``); trailing slashes dropped."""
+    from urllib.parse import urlsplit
+
+    u = url.strip().rstrip("/")
+    if not u:
+        raise ValueError("empty base URL")
+    parts = urlsplit(u)
+    if parts.scheme not in ("http", "https") or not parts.netloc:
+        raise ValueError(f"invalid base URL {url!r}: expected http(s)://host[:port][/v1]")
+    return u + "/v1" if not parts.path else u
+
+
 class OpenAIEmbedder:
-    """OpenAI embeddings (default ``text-embedding-3-small``, 1536 dimensions)."""
+    """OpenAI embeddings (default ``text-embedding-3-small``, 1536 dimensions) or any OpenAI-compatible server.
+
+    ``base_url`` points the client at another ``/v1/embeddings`` endpoint (Ollama ``http://host:11434/v1``,
+    LM Studio ``http://host:1234/v1``, llama.cpp, TEI, vLLM, ...). For such endpoints:
+
+    * ``dimensions`` is *not* sent unless ``send_dimensions=True`` (many servers reject the parameter), so
+      ``dimensions`` must be what the model produces (see :func:`probe_dimensions`), and ``encoding_format="float"``
+      is requested explicitly;
+    * ``OPENAI_API_KEY`` is never used: ``api_key`` (else a placeholder) is sent instead;
+    * the timeout defaults to 30 s (5 s to connect), retries to 1 and ``batch_size`` to 32.
+
+    Returned vectors are checked: the count must match the inputs and each must have ``dimensions`` floats
+    (:class:`EmbedderError` otherwise). ``dimensions=None`` skips that check and learns the dimension from the first
+    response (used by :func:`probe_dimensions`).
+    """
 
     def __init__(
         self,
         model: str = DEFAULT_EMBED_MODEL,
         *,
-        dimensions: int = DEFAULT_EMBED_DIMS,
+        dimensions: int | None = DEFAULT_EMBED_DIMS,
         tracker: UsageTracker | None = None,
         client: Any = None,
-        batch_size: int = 128,
+        batch_size: int | None = None,
+        base_url: str | None = None,
+        api_key: str | None = None,
+        send_dimensions: bool | None = None,
+        timeout: float | None = None,
+        max_retries: int | None = None,
         **client_kwargs: Any,
     ) -> None:
         self.model = model
-        self.dimensions = dimensions
+        self.dimensions = dimensions  # type: ignore[assignment]
         self.tracker = tracker or UsageTracker()
-        self.batch_size = batch_size
+        self.base_url = normalize_base_url(base_url) if base_url else None
+        self.send_dimensions = send_dimensions
+        self.batch_size = batch_size or (CUSTOM_EMBED_BATCH if self.base_url else 128)
+        if self.base_url:
+            from openai import Timeout  # needs the openai package anyway (the client below)
+
+            t = CUSTOM_EMBED_TIMEOUT if timeout is None else float(timeout)
+            client_kwargs.update(
+                base_url=self.base_url,
+                api_key=api_key or PLACEHOLDER_API_KEY,  # never fall back to OPENAI_API_KEY: it must not reach a LAN host
+                timeout=Timeout(t, connect=min(CUSTOM_EMBED_CONNECT_TIMEOUT, t)),
+                max_retries=CUSTOM_EMBED_RETRIES if max_retries is None else max_retries,
+            )
+        else:
+            if api_key:
+                client_kwargs["api_key"] = api_key
+            if timeout is not None:
+                client_kwargs["timeout"] = timeout
+            if max_retries is not None:
+                client_kwargs["max_retries"] = max_retries
         self._client = _openai_client(client, **client_kwargs)
+
+    @property
+    def endpoint(self) -> str:
+        """Identity of the server: the base URL, or ``"openai"`` for the OpenAI API."""
+        return self.base_url or "openai"
+
+    def _sends_dimensions(self) -> bool:
+        if self.send_dimensions is not None:
+            return self.send_dimensions
+        if self.base_url:
+            return False
+        return self.model != DEFAULT_EMBED_MODEL or self.dimensions != DEFAULT_EMBED_DIMS
 
     def embed(self, texts: Sequence[str]) -> list[list[float]]:
         out: list[list[float]] = []
@@ -262,13 +340,85 @@ class OpenAIEmbedder:
         for i in range(0, len(texts), self.batch_size):
             chunk = list(texts[i : i + self.batch_size])
             kwargs: dict[str, Any] = {}
-            if self.model != DEFAULT_EMBED_MODEL or self.dimensions != DEFAULT_EMBED_DIMS:
+            if self._sends_dimensions() and self.dimensions:
                 kwargs["dimensions"] = self.dimensions
+            if self.base_url:
+                kwargs["encoding_format"] = "float"  # the SDK would ask for base64, which not every server supports
             r = self._client.embeddings.create(model=self.model, input=chunk, **kwargs)
-            if getattr(r, "usage", None):
-                self.tracker.add(self.model, r.usage.total_tokens, 0, 0, "embed")
-            out += [list(d.embedding) for d in r.data]
+            usage = getattr(r, "usage", None)
+            if usage:
+                self.tracker.add(self.model, getattr(usage, "total_tokens", 0) or 0, 0, 0, "embed")
+            data = list(r.data)
+            if len(data) != len(chunk):
+                raise EmbedderError(
+                    f"embedding server {self.endpoint} returned {len(data)} vectors for {len(chunk)} texts "
+                    f"(model {self.model!r})"
+                )
+            if all(isinstance(getattr(d, "index", None), int) for d in data):
+                data.sort(key=lambda d: d.index)
+            vecs = [list(d.embedding) for d in data]
+            if self.dimensions is None and vecs:
+                self.dimensions = len(vecs[0])  # type: ignore[assignment]
+            for v in vecs:
+                if len(v) != self.dimensions:
+                    raise EmbedderError(
+                        f"embedding server {self.endpoint} returned {len(v)}-dimensional vectors for model "
+                        f"{self.model!r}, but {self.dimensions} dimensions are configured: set the dimensions to "
+                        f"{len(v)} (embed_dimensions) or use another model",
+                        actual=len(v),
+                    )
+            out += vecs
         return out
+
+
+def probe_dimensions(embedder_or_params: Any = None, **params: Any) -> int:
+    """Embed one short text and return the length of the vector (the model's dimensions).
+
+    ``embedder_or_params`` is an embedder (anything with ``embed``) or a mapping of :class:`OpenAIEmbedder`
+    arguments (``{"model": ..., "base_url": ..., "api_key": ...}``; keyword arguments work too). A dimension
+    configured on an :class:`OpenAIEmbedder` is not enforced here: the *actual* dimension is returned.
+    """
+    if embedder_or_params is None or isinstance(embedder_or_params, Mapping):
+        args = {**(embedder_or_params or {}), **params}
+        args["dimensions"] = None
+        embedder: Any = OpenAIEmbedder(**args)
+    else:
+        embedder = embedder_or_params
+    try:
+        vecs = embedder.embed(["sqgraph-memory dimension probe"])
+    except EmbedderError as exc:
+        if exc.actual is not None:
+            return exc.actual
+        raise
+    if not vecs or not len(vecs[0]):
+        raise EmbedderError("the embedder returned an empty vector")
+    return len(vecs[0])
+
+
+def build_embedder(
+    model: str = DEFAULT_EMBED_MODEL,
+    *,
+    base_url: str | None = None,
+    dimensions: int | None = None,
+    existing_dims: int | None = None,
+    api_key: str | None = None,
+    tracker: UsageTracker | None = None,
+) -> tuple[OpenAIEmbedder, bool]:
+    """An :class:`OpenAIEmbedder` for the configured endpoint, and whether its dimensions had to be probed.
+
+    Dimensions: ``dimensions`` (configured), else the ``existing_dims`` of the database, else -- for the OpenAI API --
+    1536, or for a custom ``base_url`` a probe of the server (one embedding call; :class:`EmbedderError` /
+    connection errors propagate).
+    """
+    probed = False
+    dims = dimensions or existing_dims
+    if not dims:
+        if base_url:
+            dims = probe_dimensions(model=model, base_url=base_url, api_key=api_key)
+            probed = True
+        else:
+            dims = DEFAULT_EMBED_DIMS
+    return OpenAIEmbedder(model, dimensions=dims, tracker=tracker, base_url=base_url, api_key=api_key), probed
 
 
 # --------------------------------------------------------------------------- fakes (tests / offline)

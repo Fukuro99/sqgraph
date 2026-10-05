@@ -2,7 +2,9 @@
 
 All output is JSON on stdout (UTF-8); errors are ``{"error": ...}`` on stderr with a non-zero exit code.
 
-    sqgraph-memory init [--api-key-stdin] [--group-id G] [--tz TZ]
+    sqgraph-memory init [--api-key-stdin] [--group-id G] [--tz TZ] [--embed-base-url URL] [--embed-model M] [--embed-dimensions N]
+    sqgraph-memory config [--embed-base-url URL|openai] [--embed-model M] [--embed-dimensions N] [--llm-model M] ...
+    sqgraph-memory reembed [--yes]
     sqgraph-memory add TEXT|- [--source claude-code] [--channel personal] ...
     sqgraph-memory search QUERY [--limit 10] [--as-of DATE] [--history] [--center ENTITY]
     sqgraph-memory entity NAME | entities QUERY | episodes | stats
@@ -13,6 +15,8 @@ All output is JSON on stdout (UTF-8); errors are ``{"error": ...}`` on stderr wi
 
 The home directory (``$SQGRAPH_MEMORY_HOME`` or ``~/.sqgraph-memory``) holds ``memory.db`` -- one SQLite file shared
 by every agent on the machine -- plus ``.env`` (OPENAI_API_KEY) and ``config.json``. See :mod:`sqgraph.memory.config`.
+The embeddings can come from any OpenAI-compatible server (``--embed-base-url``, e.g. Ollama on another PC of the
+LAN); the LLM (``add``) stays on OpenAI.
 """
 
 from __future__ import annotations
@@ -22,6 +26,7 @@ import getpass
 import importlib.util
 import json
 import os
+import re
 import shutil
 import sqlite3
 import sys
@@ -31,8 +36,18 @@ from typing import Any, Iterator, NoReturn, Sequence
 
 from . import setup_agents
 from .config import KEY_NAME, MemoryConfig, ensure_private_dir
-from .core import FACT_INDEX, Memory
-from .providers import DEFAULT_EMBED_DIMS, Embedder, LLMProvider, OpenAIEmbedder, OpenAILLM, UsageTracker, load_env
+from .core import FACT_INDEX, META_EMBED_DIMS, META_EMBED_ENDPOINT, META_EMBED_MODEL, Memory
+from .providers import (
+    DEFAULT_EMBED_DIMS,
+    Embedder,
+    LLMProvider,
+    OpenAILLM,
+    UsageTracker,
+    build_embedder,
+    load_env,
+    normalize_base_url,
+    probe_dimensions,
+)
 
 EXTRAS_HINT = 'pip install "sqgraph[mcp]"   (or: uv tool install "sqgraph[mcp]")'
 
@@ -95,41 +110,129 @@ def _existing_dims(path: Path) -> int | None:
     return None
 
 
+def _stored_identity(path: Path) -> dict[str, Any] | None:
+    """Embedding identity recorded in the database (``model`` is ``None`` for databases from before it was recorded)."""
+    if not path.is_file():
+        return None
+    try:
+        from ..db import GraphDB
+
+        with GraphDB(str(path), read_only=True) as db:
+            model, dims, endpoint = (db.get_meta(k) for k in (META_EMBED_MODEL, META_EMBED_DIMS, META_EMBED_ENDPOINT))
+            index_dims = next((ix.dimensions for ix in db.vector_indexes() if ix.name == FACT_INDEX), None)
+    except Exception:
+        return None
+    if model is None and index_dims is None:
+        return None
+    return {"model": model, "dimensions": int(dims) if dims and dims.isdigit() else index_dims, "endpoint": endpoint}
+
+
+def _describe_embedding(model: str | None, dims: int | None, endpoint: str | None) -> str:
+    return f"model {model or 'unknown'!r} ({dims if dims else 'unknown'} dimensions, endpoint {endpoint or 'unknown'})"
+
+
+def _identity_mismatch(cfg: MemoryConfig, stored: dict[str, Any] | None) -> str | None:
+    """Why the database's vectors do not fit the configured embedder (``None`` = they fit / nothing stored)."""
+    if not stored:
+        return None
+    dims = cfg.effective_embed_dimensions()
+    wrong_model = bool(stored["model"]) and stored["model"] != cfg.embed_model
+    wrong_dims = bool(stored["dimensions"]) and bool(dims) and stored["dimensions"] != dims
+    if not (wrong_model or wrong_dims):
+        return None
+    return (
+        f"the database was built with {_describe_embedding(stored['model'], stored['dimensions'], stored['endpoint'])} but "
+        f"the configuration says {_describe_embedding(cfg.embed_model, dims, cfg.embed_base_url or 'openai')}: vectors of "
+        "different models are not comparable, so run `sqgraph-memory reembed` (or switch the configuration back)"
+    )
+
+
+def _embed_key(cfg: MemoryConfig) -> str | None:
+    """The optional API key of the custom embedder endpoint (from the environment / ``.env``; never printed)."""
+    load_env(cfg.env_path)
+    return os.environ.get(cfg.embed_api_key_env) or None
+
+
+def probe_endpoint(cfg: MemoryConfig) -> int:
+    """Embed one text at the configured custom endpoint and return the model's dimensions. Tests monkeypatch this."""
+    if importlib.util.find_spec("openai") is None:
+        raise CliError(f'the "openai" package is missing: {EXTRAS_HINT}')
+    try:
+        return probe_dimensions(model=cfg.embed_model, base_url=cfg.embed_base_url, api_key=_embed_key(cfg))
+    except Exception as exc:
+        raise CliError(
+            f"cannot get an embedding from {cfg.embed_base_url} with model {cfg.embed_model!r} "
+            f"({type(exc).__name__}: {str(exc)[:200]}). Check the URL and model name, that the server is running and "
+            "listens on the LAN interface (e.g. OLLAMA_HOST=0.0.0.0); `--no-probe` saves the settings without checking"
+        ) from exc
+
+
+def _save_probed_dims(cfg: MemoryConfig, dims: int) -> None:
+    """Remember the dimensions found by probing a custom endpoint (best effort)."""
+    cfg.embed_dimensions = dims
+    try:
+        stored = MemoryConfig.load(cfg.home, apply_env=False)
+        if (stored.embed_base_url, stored.embed_model) == (cfg.embed_base_url, cfg.embed_model) and not stored.embed_dimensions:
+            stored.embed_dimensions = dims
+            stored.save()
+    except (OSError, ValueError):
+        pass
+
+
 def make_providers(
     cfg: MemoryConfig, *, need_llm: bool, need_embedder: bool
 ) -> tuple[LLMProvider | None, Embedder | None, list[str]]:
-    """Build the OpenAI providers from ``cfg`` (+ ``<home>/.env``). Tests monkeypatch this with fakes.
+    """Build the providers from ``cfg`` (+ ``<home>/.env``). Tests monkeypatch this with fakes.
 
-    Without an API key the embedder is ``None`` (fulltext + entity search still work) and a warning is returned;
-    ``need_llm`` without a key is an error.
+    The LLM is always OpenAI (``need_llm`` without ``OPENAI_API_KEY`` is an error). The embedder is OpenAI too, or the
+    OpenAI-compatible server at ``cfg.embed_base_url``, which needs no OpenAI key; without any usable embedder it is
+    ``None`` (fulltext + entity search still work) and a warning is returned.
     """
     warnings: list[str] = []
     load_env(cfg.env_path)  # existing environment variables win
-    if not os.environ.get(KEY_NAME):
-        if need_llm:
-            raise CliError(f"{KEY_NAME} is not set: run `sqgraph-memory init` (or set the environment variable)")
-        if need_embedder:
-            warnings.append(f"{KEY_NAME} is not set: semantic (vector) search is disabled; run `sqgraph-memory init`")
+    have_key = bool(os.environ.get(KEY_NAME))
+    if need_llm and not have_key:
+        raise CliError(f"{KEY_NAME} is not set: run `sqgraph-memory init` (or set the environment variable)")
+    want_embedder = (need_llm or need_embedder) and (cfg.custom_embedder or have_key)
+    if need_embedder and not want_embedder:
+        warnings.append(f"{KEY_NAME} is not set: semantic (vector) search is disabled; run `sqgraph-memory init`")
+    if not (need_llm or want_embedder):
         return None, None, warnings
     if importlib.util.find_spec("openai") is None:
         raise CliError(f'the "openai" package is missing: {EXTRAS_HINT}')
     tracker = UsageTracker()
     llm = OpenAILLM(cfg.llm_model, tracker=tracker) if need_llm else None
     embedder = None
-    if need_llm or need_embedder:
-        dims = _existing_dims(cfg.db_path) or DEFAULT_EMBED_DIMS
-        embedder = OpenAIEmbedder(cfg.embed_model, dimensions=dims, tracker=tracker)
+    if want_embedder:
+        try:
+            embedder, probed = build_embedder(
+                cfg.embed_model,
+                base_url=cfg.embed_base_url,
+                dimensions=cfg.embed_dimensions,
+                existing_dims=_existing_dims(cfg.db_path),
+                api_key=_embed_key(cfg),
+                tracker=tracker,
+            )
+        except Exception as exc:
+            raise CliError(
+                f"cannot reach the embedding endpoint {cfg.embed_base_url} to find its dimensions "
+                f"({type(exc).__name__}: {str(exc)[:200]}): start the server or run `sqgraph-memory config --embed-dimensions N`"
+            ) from exc
+        if probed:
+            _save_probed_dims(cfg, embedder.dimensions)
     return llm, embedder, warnings
 
 
 @contextmanager
 def open_memory(
-    cfg: MemoryConfig, *, need_llm: bool = False, need_embedder: bool = False
+    cfg: MemoryConfig, *, need_llm: bool = False, need_embedder: bool = False, allow_embedder_change: bool = False
 ) -> Iterator[tuple[Memory, list[str]]]:
     ensure_private_dir(cfg.home)
     cfg.db_path.parent.mkdir(parents=True, exist_ok=True)
     llm, embedder, warnings = make_providers(cfg, need_llm=need_llm, need_embedder=need_embedder)
-    mem = Memory(cfg.db_path, llm, embedder, default_group_id=cfg.group_id, tz=cfg.tz)
+    mem = Memory(
+        cfg.db_path, llm, embedder, default_group_id=cfg.group_id, tz=cfg.tz, allow_embedder_change=allow_embedder_change
+    )
     try:
         yield mem, warnings
     finally:
@@ -145,10 +248,21 @@ def _with_warning(out: dict[str, Any], warnings: list[str]) -> dict[str, Any]:
 # --------------------------------------------------------------------------- commands
 
 
-def cmd_init(args: argparse.Namespace, cfg: MemoryConfig) -> dict[str, Any]:
-    cfg = MemoryConfig.load(cfg.home, apply_env=False)  # persist stored values, not env overrides
+_ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_OPENAI_ALIASES = ("", "openai", "default", "none")
+
+
+def _apply_settings(cfg: MemoryConfig, args: argparse.Namespace) -> list[str]:
+    """Apply the settings options of ``init`` / ``config`` to ``cfg``; returns the names of the fields that changed."""
+    changed: list[str] = []
+
+    def put(field: str, value: Any) -> None:
+        if getattr(cfg, field) != value:
+            setattr(cfg, field, value)
+            changed.append(field)
+
     if args.group_id:
-        cfg.group_id = args.group_id
+        put("group_id", args.group_id)
     if args.tz:
         try:
             from .util import resolve_tz
@@ -156,7 +270,84 @@ def cmd_init(args: argparse.Namespace, cfg: MemoryConfig) -> dict[str, Any]:
             resolve_tz(args.tz)
         except Exception as exc:
             raise CliError(f"invalid timezone {args.tz!r}: {exc}", 2) from exc
-        cfg.tz = args.tz
+        put("tz", args.tz)
+    if getattr(args, "llm_model", None):
+        put("llm_model", args.llm_model.strip())
+    before = (cfg.embed_base_url, cfg.embed_model)
+    if args.embed_base_url is not None:
+        url = args.embed_base_url.strip()
+        if url.lower() in _OPENAI_ALIASES:
+            put("embed_base_url", None)
+        else:
+            try:
+                put("embed_base_url", normalize_base_url(url))
+            except ValueError as exc:
+                raise CliError(str(exc), 2) from exc
+    if args.embed_model:
+        put("embed_model", args.embed_model.strip())
+    if args.embed_api_key_env:
+        if not _ENV_NAME_RE.match(args.embed_api_key_env):
+            raise CliError(f"invalid environment variable name {args.embed_api_key_env!r}", 2)
+        put("embed_api_key_env", args.embed_api_key_env)
+    if (cfg.embed_base_url, cfg.embed_model) != before:
+        put("embed_dimensions", None)  # the stored dimensions belonged to the old model: probe / ask again
+    if args.embed_dimensions is not None:
+        if args.embed_dimensions < 1:
+            raise CliError("--embed-dimensions must be a positive integer", 2)
+        put("embed_dimensions", args.embed_dimensions)
+    return changed
+
+
+def _probe_embedder(cfg: MemoryConfig, args: argparse.Namespace, changed: list[str]) -> dict[str, Any] | None:
+    """Probe the custom endpoint when embedder options were given (fills ``embed_dimensions``); ``None`` = not probed."""
+    given = any(getattr(args, k) is not None for k in ("embed_base_url", "embed_model", "embed_dimensions"))
+    if not (cfg.custom_embedder and given) or args.no_probe:
+        return None
+    explicit = args.embed_dimensions
+    before_dims = cfg.embed_dimensions
+    dims = probe_endpoint(cfg)
+    if explicit is not None and explicit != dims:
+        raise CliError(
+            f"{cfg.embed_base_url} produces {dims}-dimensional vectors for model {cfg.embed_model!r}, not {explicit}: "
+            "drop --embed-dimensions to use the detected value (or --no-probe to force yours)",
+            2,
+        )
+    if cfg.embed_dimensions != dims:
+        cfg.embed_dimensions = dims
+    if "embed_dimensions" not in changed and dims != before_dims:
+        changed.append("embed_dimensions")
+    return {"dimensions": dims}
+
+
+def _embedder_report(cfg: MemoryConfig) -> dict[str, Any]:
+    """The embedder settings for output (never the key value)."""
+    rep: dict[str, Any] = {
+        "endpoint": cfg.embed_base_url or "openai",
+        "model": cfg.embed_model,
+        "dimensions": cfg.effective_embed_dimensions(),
+    }
+    if cfg.custom_embedder:
+        rep["api_key_env"] = cfg.embed_api_key_env
+        rep["api_key"] = "set" if cfg.has_embed_api_key() else "not set (optional)"
+    return rep
+
+
+def _embedder_warnings(cfg: MemoryConfig, probed: bool = False) -> list[str]:
+    out: list[str] = []
+    mismatch = _identity_mismatch(cfg, _stored_identity(cfg.db_path))
+    if mismatch:
+        out.append(mismatch)
+    if cfg.custom_embedder and cfg.embed_dimensions is None and not probed:
+        out.append("embedding dimensions are not known yet: they are probed on first use (or set --embed-dimensions)")
+    return out
+
+
+def cmd_init(args: argparse.Namespace, cfg: MemoryConfig) -> dict[str, Any]:
+    cfg = MemoryConfig.load(cfg.home, apply_env=False)  # persist stored values, not env overrides
+    env_key = os.environ.get(KEY_NAME)  # before .env is loaded: tells "from the environment" from "already stored"
+    env_embed_key = os.environ.get(cfg.embed_api_key_env)
+    changed = _apply_settings(cfg, args)
+    probe = _probe_embedder(cfg, args, changed)  # fails before anything is saved
     cfg.save()
 
     key_state = "missing"
@@ -166,8 +357,8 @@ def cmd_init(args: argparse.Namespace, cfg: MemoryConfig) -> dict[str, Any]:
         if not key:
             raise CliError("--api-key-stdin: no key received on stdin", 2)
         key_state = "stored"
-    elif os.environ.get(KEY_NAME):
-        key, key_state = os.environ[KEY_NAME].strip(), "stored-from-env"
+    elif env_key:
+        key, key_state = env_key.strip(), "stored-from-env"
     elif MemoryConfig.load(cfg.home).has_api_key():
         key_state = "existing"
     elif sys.stdin is not None and sys.stdin.isatty():
@@ -175,6 +366,8 @@ def cmd_init(args: argparse.Namespace, cfg: MemoryConfig) -> dict[str, Any]:
         key_state = "stored" if key else "missing"
     if key:
         cfg.write_api_key(key)
+    if cfg.custom_embedder and env_embed_key and env_embed_key.strip():
+        cfg.write_api_key(env_embed_key, cfg.embed_api_key_env)  # agents start without the shell environment
 
     db = MemoryConfig.load(cfg.home)  # with env overrides: where the DB really lives
     out: dict[str, Any] = {
@@ -185,14 +378,95 @@ def cmd_init(args: argparse.Namespace, cfg: MemoryConfig) -> dict[str, Any]:
         "group_id": db.group_id,
         "tz": cfg.tz,
         "api_key": key_state,
+        "embedder": _embedder_report(db),
     }
+    if probe:
+        out["probed"] = True
+    warnings: list[str] = []
     if key_state == "missing":
-        out["warning"] = (
+        warnings.append(
             f"no {KEY_NAME} configured: set the env var and re-run `sqgraph-memory init`, or pipe it: "
             "`... | sqgraph-memory init --api-key-stdin`"
         )
+    warnings += _embedder_warnings(db, probed=probe is not None)
+    if warnings:
+        out["warning"] = "; ".join(warnings)
     out["next"] = "sqgraph-memory setup   # register with Claude Code / Codex / Cursor / Claude Desktop"
     return out
+
+
+def cmd_config(args: argparse.Namespace, cfg: MemoryConfig) -> dict[str, Any]:
+    stored = MemoryConfig.load(cfg.home, apply_env=False)
+    changed = _apply_settings(stored, args)
+    probe = _probe_embedder(stored, args, changed)  # fails before anything is saved
+    if changed:
+        stored.save()
+    eff = MemoryConfig.load(cfg.home)  # with env overrides
+    out: dict[str, Any] = {
+        "home": str(eff.home),
+        "config": str(eff.config_path),
+        "db": str(eff.db_path),
+        "group_id": eff.group_id,
+        "tz": eff.tz,
+        "llm_model": eff.llm_model,
+        "embedder": _embedder_report(eff),
+        "openai_api_key": "configured" if eff.has_api_key() else "missing",
+        "db_embedding": _stored_identity(eff.db_path),
+    }
+    if changed:
+        out["changed"] = changed
+    if probe:
+        out["probed"] = True
+    warnings = _embedder_warnings(eff, probed=probe is not None)
+    if warnings:
+        out["warning"] = "; ".join(warnings)
+        if any("reembed" in w for w in warnings):
+            out["reembed_required"] = True
+    return out
+
+
+def cmd_reembed(args: argparse.Namespace, cfg: MemoryConfig) -> dict[str, Any]:
+    if not cfg.db_path.is_file():
+        return {"executed": False, "db": str(cfg.db_path), "message": "no database yet: nothing to re-embed"}
+    if args.batch_size < 1:
+        raise CliError("--batch-size must be a positive integer", 2)
+    stored = _stored_identity(cfg.db_path)
+    with Memory(cfg.db_path, read_only=True) as m:
+        st = m.stats(None)
+    entities, facts = st["nodes"]["Entity"], st["facts_valid"] + st["facts_invalidated"]
+    target = _embedder_report(cfg)
+    if not args.yes:
+        return {
+            "executed": False,
+            "db": str(cfg.db_path),
+            "entities": entities,
+            "facts": facts,
+            "from": stored,
+            "to": {k: target[k] for k in ("model", "dimensions", "endpoint")},
+            "next": "re-run with --yes: every entity and fact is embedded again with the configured embedder (the "
+            "database is write-locked meanwhile; with an OpenAI embedder this costs a few cents per 10k facts)",
+        }
+    if not cfg.embed_dimensions:  # the dimensions of the *configured* model, not those of the old vectors
+        cfg.embed_dimensions = probe_endpoint(cfg) if cfg.custom_embedder else DEFAULT_EMBED_DIMS
+    _, embedder, _ = make_providers(cfg, need_llm=False, need_embedder=True)
+    if embedder is None:
+        raise CliError(f"{KEY_NAME} is not set: run `sqgraph-memory init` (or configure --embed-base-url)")
+
+    def progress(kind: str, done: int, total: int) -> None:
+        if args.progress:
+            sys.stderr.write(json.dumps({"progress": kind, "done": done, "total": total}) + "\n")
+            sys.stderr.flush()
+
+    mem = Memory(
+        cfg.db_path, None, embedder, default_group_id=cfg.group_id, tz=cfg.tz, allow_embedder_change=True
+    )
+    try:
+        res = mem.reembed(batch_size=args.batch_size, progress=progress)
+    finally:
+        mem.close()
+    if cfg.custom_embedder and not MemoryConfig.load(cfg.home, apply_env=False).embed_dimensions:
+        _save_probed_dims(cfg, res["dimensions"])
+    return {"executed": True, "db": str(cfg.db_path), **res}
 
 
 def cmd_add(args: argparse.Namespace, cfg: MemoryConfig) -> dict[str, Any]:
@@ -293,7 +567,7 @@ def cmd_forget(args: argparse.Namespace, cfg: MemoryConfig) -> dict[str, Any]:
         raise CliError("--keep-episodes only applies to --entity", 2)
     if args.source is not None and args.episode is not None:
         raise CliError("--source cannot be combined with --episode", 2)
-    with open_memory(cfg) as (mem, _):
+    with open_memory(cfg, need_embedder=True) as (mem, _):  # touched entities get fresh embeddings
         g = cfg.group_id
         if args.episode is not None:
             res = mem.forget_episode(args.episode, group_id=g, dry_run=args.dry_run)
@@ -336,6 +610,10 @@ def mcp_argv(cfg: MemoryConfig, args: argparse.Namespace) -> list[str]:
         "--embed-model", cfg.embed_model,
         "--transport", args.transport,
     ]  # fmt: skip
+    if cfg.embed_base_url:
+        argv += ["--embed-base-url", cfg.embed_base_url, "--embed-api-key-env", cfg.embed_api_key_env]
+    if cfg.embed_dimensions:
+        argv += ["--embed-dimensions", str(cfg.embed_dimensions)]
     if args.transport != "stdio":
         argv += ["--host", args.host, "--port", str(args.port)]
     if args.read_only:
@@ -424,7 +702,16 @@ def run_doctor(cfg: MemoryConfig, *, online: bool = False) -> dict[str, Any]:
     else:
         add(_check("home", "warn", f"{cfg.home} does not exist: run `sqgraph-memory init`"))
     add(_check("api_key", "ok" if cfg.has_api_key() else "warn",
-               "configured" if cfg.has_api_key() else f"{KEY_NAME} not found (env or {cfg.env_path}): run `sqgraph-memory init`"))  # fmt: skip
+               "configured" if cfg.has_api_key() else f"{KEY_NAME} not found (env or {cfg.env_path}): needed for `add` (the LLM): run `sqgraph-memory init`"))  # fmt: skip
+    emb = _embedder_report(cfg)
+    emb_detail = f"endpoint={emb['endpoint']}, model={emb['model']}, dimensions={emb['dimensions'] or 'unknown'}"
+    if cfg.custom_embedder:
+        emb_detail += f", api key {emb['api_key']} (${cfg.embed_api_key_env})"
+        known = bool(cfg.embed_dimensions)
+        add(_check("embedder", "ok" if known else "warn",
+                   emb_detail if known else emb_detail + ": dimensions not probed yet, run `sqgraph-memory config --embed-base-url ...`"))  # fmt: skip
+    else:
+        add(_check("embedder", "ok" if cfg.has_api_key() else "warn", emb_detail if cfg.has_api_key() else f"{emb_detail}: {KEY_NAME} missing, vector search disabled"))  # fmt: skip
 
     if cfg.db_path.is_file():
         try:
@@ -435,6 +722,14 @@ def run_doctor(cfg: MemoryConfig, *, online: bool = False) -> dict[str, Any]:
             add(_check("database", "ok", f"{cfg.db_path} ({st['nodes']['Episode']} episodes, {st['facts_valid']} valid facts{extra})"))
         except Exception as exc:
             add(_check("database", "fail", f"{cfg.db_path}: {type(exc).__name__}: {exc}"))
+        stored = _stored_identity(cfg.db_path)
+        mismatch = _identity_mismatch(cfg, stored)
+        if mismatch:
+            add(_check("database embedding", "fail", mismatch))
+        elif stored is None or stored["model"] is None:
+            add(_check("database embedding", "ok", "no embedding model recorded yet (it is set by the first write with an embedder)"))  # fmt: skip
+        else:
+            add(_check("database embedding", "ok", f"{_describe_embedding(stored['model'], stored['dimensions'], stored['endpoint'])} matches the configuration"))  # fmt: skip
     else:
         add(_check("database", "warn", f"{cfg.db_path} not created yet (created on the first `sqgraph-memory add`)"))
 
@@ -465,8 +760,12 @@ def run_doctor(cfg: MemoryConfig, *, online: bool = False) -> dict[str, Any]:
             if embedder is None:
                 add(_check("online embedding", "fail", f"{KEY_NAME} not set"))
             else:
-                vec = embedder.embed(["sqgraph-memory doctor"])[0]
-                add(_check("online embedding", "ok", f"{len(vec)} dimensions"))
+                n = probe_dimensions(embedder)
+                where = cfg.embed_base_url or "openai"
+                if n != embedder.dimensions:
+                    add(_check("online embedding", "fail", f"{where} produces {n} dimensions for {cfg.embed_model!r}, the configuration says {embedder.dimensions}"))  # fmt: skip
+                else:
+                    add(_check("online embedding", "ok", f"{where}: {n} dimensions"))
         except Exception as exc:
             add(_check("online embedding", "fail", f"{type(exc).__name__}: {str(exc)[:200]}"))
 
@@ -487,11 +786,32 @@ def build_parser() -> argparse.ArgumentParser:
     common.add_argument("--compact", action="store_true", help="one-line JSON instead of indented")
     sub = ap.add_subparsers(dest="command", metavar="COMMAND", required=True, parser_class=_Parser)
 
+    def embed_options(p: argparse.ArgumentParser) -> None:
+        p.add_argument("--embed-base-url", metavar="URL", help="OpenAI-compatible endpoint serving the embeddings, e.g. http://192.168.1.20:11434/v1 (Ollama); 'openai' = the OpenAI API")  # fmt: skip
+        p.add_argument("--embed-model", metavar="NAME", help="embedding model name (as the server knows it, e.g. bge-m3)")
+        p.add_argument("--embed-dimensions", type=int, metavar="N", help="vector size of the model (default: 1536 for OpenAI, else probed from the endpoint)")  # fmt: skip
+        p.add_argument("--embed-api-key-env", metavar="NAME", help="env var / .env key with an optional API key for the endpoint (default: SQGRAPH_EMBED_API_KEY)")  # fmt: skip
+        p.add_argument("--no-probe", action="store_true", help="do not call the endpoint to check it / detect the dimensions")
+
     p = sub.add_parser("init", parents=[common], help="create the home directory, config and API key file")
     p.add_argument("--api-key-stdin", action="store_true", help="read the OpenAI API key from stdin (never pass it as an argument)")
     p.add_argument("--group-id", help="namespace of your memories (default: me)")
     p.add_argument("--tz", help="timezone for naive timestamps (default: Asia/Tokyo)")
+    embed_options(p)
     p.set_defaults(fn=cmd_init)
+
+    p = sub.add_parser("config", parents=[common], help="show the settings (no secrets) or change them")
+    p.add_argument("--group-id")
+    p.add_argument("--tz")
+    p.add_argument("--llm-model", metavar="NAME", help="chat model used by `add` (OpenAI)")
+    embed_options(p)
+    p.set_defaults(fn=cmd_config)
+
+    p = sub.add_parser("reembed", parents=[common], help="recompute every embedding with the configured embedder (after changing the model)")  # fmt: skip
+    p.add_argument("--yes", action="store_true", help="required to actually run (without it the plan is shown)")
+    p.add_argument("--batch-size", type=int, default=64)
+    p.add_argument("--progress", action="store_true", help="print JSON progress lines on stderr")
+    p.set_defaults(fn=cmd_reembed)
 
     p = sub.add_parser("add", parents=[common], help="remember something (LLM extraction, takes a few seconds)")
     p.add_argument("text", metavar="TEXT", help="the text to remember; '-' reads stdin")
@@ -563,7 +883,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(fn=cmd_setup)
 
     p = sub.add_parser("doctor", parents=[common], help="check the installation (exit code 1 on failure)")
-    p.add_argument("--online", action="store_true", help="also make one embedding API call")
+    p.add_argument("--online", action="store_true", help="also make one embedding call (probes the embedding endpoint)")
     p.set_defaults(fn=cmd_doctor)
     return ap
 
@@ -590,7 +910,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         emit_error(f"missing dependency ({exc}): {EXTRAS_HINT}")
         return 1
     except Exception as exc:
-        emit_error(f"{type(exc).__name__}: {exc}")
+        hint = ""
+        if type(exc).__name__ in ("APIConnectionError", "APITimeoutError"):
+            hint = " (is the embedding / API server reachable? see `sqgraph-memory doctor --online`)"
+        emit_error(f"{type(exc).__name__}: {exc}{hint}")
         return 1
 
 

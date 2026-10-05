@@ -16,6 +16,7 @@ import argparse
 import functools
 import json
 import logging
+import os
 import sys
 import threading
 import time
@@ -26,11 +27,10 @@ from ..errors import SqgraphError
 from .core import FACT_INDEX, Memory
 from .providers import (
     DEFAULT_CHAT_MODEL,
-    DEFAULT_EMBED_DIMS,
     DEFAULT_EMBED_MODEL,
-    OpenAIEmbedder,
     OpenAILLM,
     UsageTracker,
+    build_embedder,
     load_env,
 )
 
@@ -74,8 +74,10 @@ class MemoryTools:
         max_chars: int = 20000,
         query_timeout: float = 10.0,
         default_channel: str = "personal",
+        write_blocker: str | None = None,
     ) -> None:
         self.memory = memory
+        self.write_blocker = write_blocker  # why add_memory cannot work (e.g. no OpenAI key); None = it can
         self.default_channel = default_channel
         self.group_id = group_id or memory.default_group_id
         self.locked_group = group_id is not None
@@ -120,6 +122,8 @@ class MemoryTools:
     ) -> dict[str, Any]:
         if self.read_only:
             raise PermissionError("this server is read-only (add_memory is disabled)")
+        if self.write_blocker:
+            raise RuntimeError(self.write_blocker)
         if not content or not content.strip():
             raise ValueError("content must not be empty")
         if channel is None:
@@ -578,6 +582,16 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--env-file", help=".env with OPENAI_API_KEY (default: search from the current directory)")
     ap.add_argument("--llm-model", default=DEFAULT_CHAT_MODEL)
     ap.add_argument("--embed-model", default=DEFAULT_EMBED_MODEL)
+    ap.add_argument(
+        "--embed-base-url",
+        help="OpenAI-compatible /v1 endpoint serving the embeddings (e.g. http://192.168.1.20:11434/v1); default: the OpenAI API",
+    )
+    ap.add_argument("--embed-dimensions", type=int, help="dimensions of the embedding model (default: 1536 for OpenAI, else probed)")
+    ap.add_argument(
+        "--embed-api-key-env",
+        default="SQGRAPH_EMBED_API_KEY",
+        help="environment variable (or .env key) holding an optional API key for --embed-base-url",
+    )
     ap.add_argument("--tz", default="Asia/Tokyo", help="timezone for naive timestamps / displayed times")
     ap.add_argument("--max-rows", type=int, default=100)
     ap.add_argument("--query-timeout", type=float, default=10.0)
@@ -587,9 +601,32 @@ def main(argv: list[str] | None = None) -> None:
     load_env(args.env_file)
     allowed = [c.strip() for c in args.allowed_channels.split(",") if c.strip()] if args.allowed_channels else None
     tracker = UsageTracker()
-    dims = _existing_dims(args.db) or DEFAULT_EMBED_DIMS
-    embedder = OpenAIEmbedder(args.embed_model, dimensions=dims, tracker=tracker)
-    llm = None if args.read_only else OpenAILLM(args.llm_model, tracker=tracker)
+    have_key = bool(os.environ.get("OPENAI_API_KEY"))
+    embedder = None
+    if args.embed_base_url or have_key:  # a LAN embedder needs no OpenAI key
+        try:
+            embedder, _ = build_embedder(
+                args.embed_model,
+                base_url=args.embed_base_url,
+                dimensions=args.embed_dimensions,
+                existing_dims=_existing_dims(args.db),
+                api_key=os.environ.get(args.embed_api_key_env) or None,
+                tracker=tracker,
+            )
+        except Exception as exc:
+            raise SystemExit(
+                f"cannot reach the embedding endpoint {args.embed_base_url} to find its dimensions ({type(exc).__name__}: "
+                f"{str(exc)[:200]}): start the server, or pass --embed-dimensions"
+            ) from exc
+    else:
+        log.warning("OPENAI_API_KEY is not set: semantic (vector) search is disabled")
+    llm = None
+    write_blocker = None
+    if not args.read_only:
+        if have_key:
+            llm = OpenAILLM(args.llm_model, tracker=tracker)
+        else:
+            write_blocker = "OPENAI_API_KEY is not set: add_memory needs the OpenAI API (run `sqgraph-memory init`)"
     memory = Memory(args.db, llm, embedder, default_group_id=args.group_id, tz=args.tz, read_only=args.read_only)
     tools = MemoryTools(
         memory,
@@ -600,7 +637,10 @@ def main(argv: list[str] | None = None) -> None:
         max_rows=args.max_rows,
         query_timeout=args.query_timeout,
         default_channel=args.default_channel,
+        write_blocker=write_blocker,
     )
+    if write_blocker:
+        log.warning("%s", write_blocker)
     if allowed is not None and args.allow_cypher:
         log.warning("read_cypher is enabled together with --allowed-channels: it BYPASSES the channel ACL")
     elif allowed is not None:
