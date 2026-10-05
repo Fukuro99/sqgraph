@@ -20,6 +20,8 @@ pip install -e ".[dev]"     # テスト用 (pytest)
 
 要件: Python 3.10 以上、SQLite 3.38 以上 (JSON の `->` 演算子を使用)、拡張ロード可能な `sqlite3` モジュール。
 
+ローカルのエージェント用の個人メモリとして使うだけなら `uv tool install "sqgraph[mcp]"` から (「個人メモリとして使う」を参照)。
+
 ## クイックスタート (Python API)
 
 ```python
@@ -332,6 +334,7 @@ python -m sqgraph.memory.mcp --db memory.db [--group-id G] [--allowed-channels a
 | `get_entity` | 1 エンティティの全履歴 (失効分含むタイムライン) と関連エンティティ |
 | `get_episodes` | 元の発言の確認、前後の会話の確認 |
 | `add_memory` | 決定・担当・状態変化・予定など長期的に覚えるべきことの記録 (`--read-only` では無効) |
+| `forget_memory` | エピソード / ファクト / エンティティ / 期間を指定した削除 (`dry_run` で影響範囲の確認)。書き込み可能で `--allowed-channels` なしのときだけ登録される |
 | `get_schema` | ラベル / 関係タイプ / インデックス / 件数と Cypher サブセットの説明 |
 | `read_cypher` | 読み取り専用 Cypher (行数 / 文字数 / 時間の制限つき)。上記で足りない集計・結合用 |
 
@@ -360,6 +363,54 @@ claude mcp add sqgraph-memory-backend -- python -m sqgraph.memory.mcp --db /path
   }
 }
 ```
+
+### 個人メモリとして使う (CLI / MCP / Skill)
+
+同じマシンのローカルエージェント (Claude Code / Codex CLI / Cursor / Claude Desktop) が **1 つの SQLite ファイルを共有する個人用の長期記憶**として使うための配布形態です。Python だけで入ります (Node / Docker は不要)。
+
+```bash
+uv tool install "sqgraph[mcp]"      # または pipx install "sqgraph[mcp]"
+# GitHub から: uv tool install "sqgraph[mcp] @ git+https://github.com/<owner>/sqgraph"
+
+sqgraph-memory init                 # ~/.sqgraph-memory を作成。OPENAI_API_KEY は環境変数 or 対話入力 (非表示)
+#   CI など非対話: echo "$OPENAI_API_KEY" | sqgraph-memory init --api-key-stdin
+sqgraph-memory setup                # 検出したエージェントに MCP サーバーと Skill を登録
+sqgraph-memory doctor [--online]    # 環境・DB・登録状況の診断 (失敗があれば終了コード 1)
+```
+
+`uvx sqgraph-memory ...` のような一時環境では登録するパスが消えることがあるため、`setup` は上の `uv tool install` を推奨する警告を出します。
+
+`setup` が書き込むもの (既存の設定ファイルは `.bak` にバックアップし、他のサーバー設定には触れません。何度実行しても同じ結果で、`--dry-run` で確認、`--uninstall` で元に戻せます):
+
+| エージェント | MCP の登録先 | Skill |
+|---|---|---|
+| Claude Code | `claude mcp add --scope user sqgraph-memory -- <実行ファイル> mcp` (`claude` が PATH にないときは実行すべきコマンドを表示) | `~/.claude/skills/sqgraph-memory/SKILL.md` |
+| Codex CLI | `~/.codex/config.toml` の `[mcp_servers.sqgraph-memory]` (`command` / `args`) | `~/.agents/skills/sqgraph-memory/SKILL.md` |
+| Cursor | `~/.cursor/mcp.json` の `mcpServers` | `~/.cursor/skills/sqgraph-memory/SKILL.md` |
+| Claude Desktop | `claude_desktop_config.json` の `mcpServers` (Windows `%APPDATA%\Claude`、macOS `~/Library/Application Support/Claude`、Linux `~/.config/Claude`) | なし |
+
+`--agents claude-code,codex,cursor,claude-desktop|all` で対象を指定し (既定は検出できたもの)、`--command "uvx --from 'sqgraph[mcp]' sqgraph-memory mcp"` で起動コマンドを丸ごと差し替え、`--no-skill` で Skill を入れません。登録後はエージェントを再起動してください。Skill (`SKILL.md`) は、いつ検索し、いつ覚えさせ、いつ忘れるか (明示的に頼まれたときだけ、`dry_run` で確認してから) をエージェントに教えます。
+
+**CLI** (出力は常に UTF-8 の JSON、エラーは stderr に `{"error": ...}` で非ゼロ終了。`--compact` で 1 行):
+
+| コマンド | 内容 |
+|---|---|
+| `init [--api-key-stdin] [--group-id G] [--tz TZ]` | ホーム・設定・`.env` を作る (キーは引数で渡せません) |
+| `add TEXT\|- [--source claude-code] [--author user] [--channel personal] [--occurred-at T] [--source-ref R]` | 覚える (LLM による抽出で数秒かかる。`-` は stdin) |
+| `search QUERY [--limit N] [--as-of T] [--history] [--center ENTITY]` | ファクト検索 (予定のファクトも含む。`--history` で失効分も) |
+| `entity NAME` / `entities QUERY` / `episodes [--entity E] [--query Q]` / `stats` | プロファイルと履歴 / 名前解決 / 元のメモ / 件数 |
+| `forget (--episode ID \| --source-ref REF [--source S] \| --fact ID \| --entity NAME [--keep-episodes] \| --since/--until/--channel [--source S]) [--dry-run]` | 削除 (対象の種類はちょうど 1 つ) |
+| `purge --yes [--dry-run]` | 設定中の group の全記憶を削除 |
+| `mcp [--transport stdio\|streamable-http] [--read-only]` | MCP サーバー (エージェントが起動する。設定ファイルの DB / group / モデルを自動で渡す) |
+| `setup` / `doctor` | 上記 |
+
+`python -m sqgraph.memory` でも同じです。API キーがないときも `search` / `entity` / `episodes` / `stats` / `forget` は動き (ベクトル検索だけ無効になり `warning` が付きます)、LLM が要るのは `add` だけです。
+
+**全エージェントで 1 ファイルを共有**: 全員が `~/.sqgraph-memory/memory.db` を開き、書き込みは `memory.db.lock` のクロスプロセスのファイルロックで直列化されます (複数のエージェントが同時に `add` しても壊れず、待ち時間は `lock_timeout` まで)。あるエージェントが覚えたことは他のエージェントからも検索できます。MCP サーバーは `--group-id` を設定ファイルの値に固定して起動します。
+
+**忘れる**: `forget` / `purge` / MCP の `forget_memory` は、DB から対象のエピソード・ファクト・孤立したエンティティを消し、残ったエンティティの要約と埋め込みを再計算します (削除されたファクトに失効させられていたファクトは有効に戻ります)。削除後は SQLite の `secure_delete` と WAL チェックポイントで、消した本文が DB ファイルにそのまま残らないようにします。`--dry-run` で何が消えるか確認できます。次のものは対象外です: DB ファイルの外にあるコピー (バックアップ、クラウド同期、Litestream など)、およびエピソードを取り込むときに OpenAI API へ送った内容 (OpenAI のポリシーに従って保持されます)。
+
+**データの場所と権限**: 既定は `~/.sqgraph-memory/` (`SQGRAPH_MEMORY_HOME` で変更)。中身は `memory.db`、`.env` (`OPENAI_API_KEY=...`)、`config.json` (`group_id` 既定 `me`、`tz` 既定 `Asia/Tokyo`、`llm_model`、`embed_model`、`db`) です。POSIX ではディレクトリを 0700、ファイルを 0600 で作ります (Windows ではユーザープロファイルの ACL に任せます)。`SQGRAPH_MEMORY_DB` / `SQGRAPH_MEMORY_GROUP` で DB と group を上書きできます。`setup` 実行時にこれら (と `SQGRAPH_MEMORY_HOME`) が設定されていれば、パスは絶対パスにして各エージェントの登録 (`env`) に引き継ぎます (`--dry-run` の出力にも表示)。API キーの値は出力にもログにも出しません。エージェントは MCP サーバーをシェルの環境変数なしで起動するため、キーは `.env` から読みます。
 
 ### Discord bot への組み込み (概要)
 

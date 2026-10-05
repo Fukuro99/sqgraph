@@ -154,6 +154,9 @@ class GraphDB:
         Open the database read-only (write queries are rejected).
     max_var_length:
         Upper bound used for unbounded variable-length patterns such as ``-[*]->``.
+    secure_delete:
+        Run ``PRAGMA secure_delete=ON`` (writable databases): deleted content is overwritten with zeros
+        instead of lingering in free pages. See also :meth:`checkpoint` and :meth:`optimize_fulltext`.
     """
 
     def __init__(
@@ -161,6 +164,7 @@ class GraphDB:
         path: str | FsPath = ":memory:",
         read_only: bool = False,
         max_var_length: int = 10,
+        secure_delete: bool = False,
     ) -> None:
         self.path = str(path)
         self.read_only = read_only
@@ -197,6 +201,8 @@ class GraphDB:
                 conn.execute("PRAGMA journal_mode=WAL")
             conn.execute("PRAGMA synchronous=NORMAL")
             conn.execute("PRAGMA analysis_limit=2000")
+            if secure_delete and not read_only:
+                conn.execute("PRAGMA secure_delete=ON")
             if read_only:
                 self._check_schema()
             else:
@@ -231,6 +237,57 @@ class GraphDB:
         self._require_writable()
         with self._atomic():
             self._conn.execute("ANALYZE")
+
+    def set_secure_delete(self, on: bool = True) -> None:
+        """Switch ``PRAGMA secure_delete`` on this connection (no-op on a read-only database)."""
+        if not self.read_only:
+            with self._lock:
+                self._conn.execute(f"PRAGMA secure_delete={'ON' if on else 'OFF'}")
+
+    def checkpoint(self, truncate: bool = True) -> None:
+        """Run ``PRAGMA wal_checkpoint`` (``TRUNCATE`` by default, else ``PASSIVE``).
+
+        Moves the write-ahead log into the database file; ``TRUNCATE`` also empties the ``-wal`` file, so
+        deleted data no longer survives in it. A no-op for in-memory and read-only databases. It cannot
+        truncate while another connection is reading; it then does as much as it can.
+        """
+        if self.read_only or self.path == ":memory:":
+            return
+        with self._lock:
+            if self._depth:
+                raise SqgraphError("cannot checkpoint inside a transaction")
+            self._conn.execute(f"PRAGMA wal_checkpoint({'TRUNCATE' if truncate else 'PASSIVE'})").fetchall()
+
+    def optimize_fulltext(self, names: Iterable[str] | None = None) -> None:
+        """Merge the segments of fulltext indexes (FTS5 ``optimize``), dropping the remains of deleted rows.
+
+        ``names`` selects the indexes (default: all).
+        """
+        self._require_writable()
+        if names is None:
+            indexes = list(self._fts.values())
+        else:
+            indexes = [self._get_fulltext_index(n) for n in names]
+        with self._atomic():
+            for ix in indexes:
+                self._conn.execute(f"INSERT INTO {ix.table}({ix.table}) VALUES('optimize')")
+
+    def get_meta(self, key: str) -> str | None:
+        """Value stored under ``key`` in the ``_meta`` table, or ``None``."""
+        with self._lock:
+            row = self._conn.execute("SELECT value FROM _meta WHERE key = ?", (key,)).fetchone()
+        return row[0] if row else None
+
+    def set_meta(self, key: str, value: str) -> None:
+        """Store ``value`` under ``key`` in the ``_meta`` table (applications may keep their own keys)."""
+        self._require_writable()
+        if not isinstance(key, str) or not key or not isinstance(value, str):
+            raise SqgraphError("meta key and value must be strings (key non-empty)")
+        with self._atomic():
+            self._conn.execute(
+                "INSERT INTO _meta(key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (key, value),
+            )
 
     def __enter__(self) -> "GraphDB":
         return self

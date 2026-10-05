@@ -73,8 +73,10 @@ class MemoryTools:
         max_rows: int = 100,
         max_chars: int = 20000,
         query_timeout: float = 10.0,
+        default_channel: str = "personal",
     ) -> None:
         self.memory = memory
+        self.default_channel = default_channel
         self.group_id = group_id or memory.default_group_id
         self.locked_group = group_id is not None
         self.allowed = None if allowed_channels is None else list(dict.fromkeys(allowed_channels))
@@ -121,7 +123,7 @@ class MemoryTools:
         if not content or not content.strip():
             raise ValueError("content must not be empty")
         if channel is None:
-            channel = self.allowed[0] if self.allowed else "mcp"
+            channel = self.allowed[0] if self.allowed else self.default_channel
         if self.allowed is not None and channel not in self.allowed:
             raise PermissionError(f"channel {channel!r} is not among the allowed channels")
         res = self.memory.add_episode(
@@ -143,6 +145,48 @@ class MemoryTools:
             "facts_invalidated": len(res.facts_invalidated),
             "llm_calls": res.llm_calls,
         }
+
+    def forget_memory(
+        self,
+        episode_id: str | None = None,
+        fact_id: str | None = None,
+        entity: str | None = None,
+        since: str | None = None,
+        until: str | None = None,
+        channel: str | None = None,
+        dry_run: bool = False,
+        group_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Permanently delete memory; exactly one selector: ``episode_id`` | ``fact_id`` | ``entity`` | a
+        ``since`` / ``until`` / ``channel`` range. Disabled on read-only servers and with ``--allowed-channels``."""
+        if self.read_only:
+            raise PermissionError("this server is read-only (forget_memory is disabled)")
+        if self.allowed is not None:
+            raise PermissionError("forget_memory is not available with a channel restriction (--allowed-channels)")
+        selectors = [
+            name
+            for name, given in (
+                ("episode_id", episode_id),
+                ("fact_id", fact_id),
+                ("entity", entity),
+                ("since/until/channel", since or until or channel),
+            )
+            if given
+        ]
+        if len(selectors) != 1:
+            raise ValueError("give exactly one of: episode_id, fact_id, entity, or a since/until/channel range")
+        group = self._group(group_id)
+        if episode_id:
+            res = self.memory.forget_episode(episode_id, group_id=group, dry_run=dry_run)
+        elif fact_id:
+            res = self.memory.forget_fact(fact_id, group_id=group, dry_run=dry_run)
+        elif entity:
+            res = self.memory.forget_entity(entity, group_id=group, dry_run=dry_run)
+        else:
+            res = self.memory.forget_range(
+                since=since or None, until=until or None, channel=channel or None, group_id=group, dry_run=dry_run
+            )
+        return {"group_id": group, **res.to_dict()}
 
     def search_memory(
         self,
@@ -298,7 +342,9 @@ INSTRUCTIONS = (
     "Long-term memory of a team: a temporal knowledge graph built from chat messages and notes. "
     "Use search_memory first for questions about who/what/when/status; use get_entity for the full history of one "
     "person/service/project; add_memory to record durable facts (decisions, ownership, status changes, plans). "
-    "Facts have validity intervals (valid_at / invalid_at); superseded facts stay available as history."
+    "Facts have validity intervals (valid_at / invalid_at); superseded facts stay available as history. "
+    "forget_memory (when present) deletes memory permanently: use it only when the user explicitly asks to forget "
+    "something, and preview with dry_run=true."
 )
 
 TOOL_DOCS = {
@@ -307,7 +353,16 @@ TOOL_DOCS = {
         "user tells you something worth remembering later (who owns what, a decision, a schedule, an absence, a change of "
         "state). The text is analysed by an LLM: entities and facts are extracted, merged with existing ones, and older "
         "contradicting facts are marked as superseded (never deleted). Write self-contained sentences; put dates in the "
-        "text or in occurred_at (ISO 8601, default now). Not available on read-only servers."
+        "text or in occurred_at (ISO 8601, default now). Pass source = your client name (e.g. 'claude-code'). Not available on read-only servers."
+    ),
+    "forget_memory": (
+        "PERMANENTLY delete memory, only when the user explicitly asks to forget something. Give exactly one of: "
+        "episode_id (one stored message/note), fact_id, entity (id or exact name: the entity, all its facts and the "
+        "episodes mentioning it) or a time/channel range (since / until / channel: episodes with since <= occurred_at "
+        "< until). Facts that only the deleted episodes supported go too; facts they had superseded become valid "
+        "again; entities left without any mention are removed. Use dry_run=true first to preview what would be "
+        "deleted (ids returned), and confirm with the user. Returns the ids deleted / restored / updated. Not "
+        "available on read-only servers or with --allowed-channels (forgetting across channel ACLs is unsupported)."
     ),
     "search_memory": (
         "Search long-term memory for facts (hybrid semantic + keyword + graph search). Use it FIRST for questions about "
@@ -368,12 +423,43 @@ def build_server(tools: MemoryTools, name: str = "sqgraph-memory") -> Any:
             content: str,
             channel: str | None = None,
             author: str = "claude",
+            source: str = "mcp",
             occurred_at: str | None = None,
             source_ref: str | None = None,
             group_id: str | None = None,
         ) -> dict[str, Any]:
             return await wrap(tools.add_memory)(
-                content=content, channel=channel, author=author, occurred_at=occurred_at, source_ref=source_ref, group_id=group_id
+                content=content,
+                channel=channel,
+                author=author,
+                source=source,
+                occurred_at=occurred_at,
+                source_ref=source_ref,
+                group_id=group_id,
+            )
+
+    if not tools.read_only and tools.allowed is None:
+
+        @server.tool(name="forget_memory", description=TOOL_DOCS["forget_memory"])
+        async def forget_memory(
+            episode_id: str | None = None,
+            fact_id: str | None = None,
+            entity: str | None = None,
+            since: str | None = None,
+            until: str | None = None,
+            channel: str | None = None,
+            dry_run: bool = False,
+            group_id: str | None = None,
+        ) -> dict[str, Any]:
+            return await wrap(tools.forget_memory)(
+                episode_id=episode_id,
+                fact_id=fact_id,
+                entity=entity,
+                since=since,
+                until=until,
+                channel=channel,
+                dry_run=dry_run,
+                group_id=group_id,
             )
 
     @server.tool(name="search_memory", description=TOOL_DOCS["search_memory"])
@@ -479,6 +565,11 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--db", required=True, help="path of the memory database (created when writable)")
     ap.add_argument("--group-id", help="fix the namespace (tool calls cannot use another group)")
     ap.add_argument("--allowed-channels", help="comma-separated channels readable/writable through this server")
+    ap.add_argument(
+        "--default-channel",
+        default="personal",
+        help="channel add_memory writes to when none is given (and no --allowed-channels); facts only merge within a channel",
+    )
     ap.add_argument("--read-only", action="store_true", help="open the DB read-only and disable add_memory")
     ap.add_argument("--transport", choices=["stdio", "streamable-http"], default="stdio")
     ap.add_argument("--host", default="127.0.0.1")
@@ -508,6 +599,7 @@ def main(argv: list[str] | None = None) -> None:
         allow_cypher=args.allow_cypher,
         max_rows=args.max_rows,
         query_timeout=args.query_timeout,
+        default_channel=args.default_channel,
     )
     if allowed is not None and args.allow_cypher:
         log.warning("read_cypher is enabled together with --allowed-channels: it BYPASSES the channel ACL")

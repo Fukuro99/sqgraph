@@ -10,7 +10,7 @@ The core :mod:`sqgraph` package stays LLM-free; models are plugged in through th
 are included). See ``README.md`` (エージェント長期記憶) for the data model, ACL design and MCP server.
 """
 
-from .core import Answer, EpisodeRef, EpisodeResult, FactHit, Memory
+from .core import MEMORY_SCHEMA_VERSION, Answer, EpisodeRef, EpisodeResult, FactHit, ForgetResult, Memory
 from .providers import (
     DEFAULT_CHAT_MODEL,
     DEFAULT_EMBED_DIMS,
@@ -31,6 +31,8 @@ __all__ = [
     "FactHit",
     "EpisodeRef",
     "EpisodeResult",
+    "ForgetResult",
+    "MEMORY_SCHEMA_VERSION",
     "Answer",
     "LLMProvider",
     "Embedder",

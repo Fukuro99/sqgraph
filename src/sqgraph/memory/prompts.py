@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from typing import Any
 
-ENTITY_TYPES = ["Person", "Service", "Repository", "Team", "Organization", "Ticket", "Project", "Event", "Concept", "Other"]
+ENTITY_TYPES = ["Person", "Service", "Repository", "Team", "Organization", "Ticket", "Project", "Event", "Place", "Concept", "Other"]
 
 
 def obj_schema(**props: Any) -> dict[str, Any]:
@@ -21,17 +21,17 @@ def _nullable(t: str) -> dict[str, Any]:
 
 # --------------------------------------------------------------------------- 1. extract entities
 
-EXTRACT_ENTITIES_SYSTEM = f"""You build a company knowledge graph from chat messages (mostly Japanese).
+EXTRACT_ENTITIES_SYSTEM = f"""You build a knowledge graph from chat messages or notes (team chat, or a user's notes to their AI assistant; mostly Japanese).
 Task: list the entities the CURRENT message talks about, and say whether it contains memorable facts.
 
 Entity types: {", ".join(ENTITY_TYPES)}.
 Rules:
-- Extract people (use the name as written, without honorifics like さん), services/systems/repos/tools/software versions worth tracking, teams/orgs, tickets/PR numbers, projects, events/meetings, and important concepts/policies.
+- Extract people (use the name as written, without honorifics like さん), services/systems/repos/tools/software versions worth tracking, teams/orgs, tickets/PR numbers, projects, events/meetings, places (cities, venues, offices), and important concepts/policies.
 - Resolve pronouns and vague references (それ, あれ, this, 例の件) to the concrete entity using `context` (earlier messages) and `author`. Never output the pronoun itself.
 - Use the most complete canonical name (e.g. "notify-bot", "Ruby on Rails"; a version of a product is the product: output "Rails", not "Rails 7.1", unless the version itself is the topic). Name PRs/issues with their repo or project ("iac-terraform PR #278"), never a bare number.
 - Do NOT extract: the author (added automatically), greetings, generic nouns (タスク, 会議 without a specific name), dates, or entities only present in `context`.
 - description: one short phrase about what the entity is, as far as this message tells.
-- has_facts: true if the message states or implies something worth remembering later (who owns/does what, status, decision, plan, schedule, absence, dependency, problem, request assignment). false for pure chit-chat, thanks, acknowledgements, questions without new info."""
+- has_facts: true if the message states or implies something worth remembering later (who owns/does what, status, decision, plan, schedule, absence, dependency, problem, request assignment; a user's preferences, standing instructions to the assistant like 〜してほしい / 〜は使わない, personal facts such as where they live or what they plan, habits). false for pure chit-chat, thanks, acknowledgements, questions without new info."""
 
 EXTRACT_ENTITIES_SCHEMA = obj_schema(
     entities={
@@ -60,7 +60,7 @@ RESOLVE_ENTITIES_SCHEMA = obj_schema(
 
 # --------------------------------------------------------------------------- 3. extract facts
 
-EXTRACT_FACTS_SYSTEM = """You extract temporal facts for a company knowledge graph from ONE chat message (mostly Japanese).
+EXTRACT_FACTS_SYSTEM = """You extract temporal facts for a knowledge graph from ONE chat message or note (team chat or a user's notes to their AI assistant; mostly Japanese).
 Input: `entities` (idx, name, type, current summary), `author`, `occurred_at` (local time, weekday, UTC offset), `context` (earlier messages, only for resolving references), `message`.
 
 Output `facts`: relations between entities (subject idx -> object idx) or attributes of one entity (object null).
@@ -71,7 +71,7 @@ Output `facts`: relations between entities (subject idx -> object idx) or attrib
 - invalid_at: when the fact stops being true if the message says so (e.g. absence 9/14-9/16 -> 2026-09-17: the first moment it is no longer true), else null.
 - modality: definite | planned (future intention/schedule) | tentative (unsure, proposal, question-like).
 - A statement that changes an earlier state (new owner, new status) is a normal new fact; contradictions are handled later.
-- Record durable knowledge: ownership/assignment, responsibility, status, decisions, plans/schedules, dependencies, where things are managed/stored, absences, problems and their causes. Do NOT record that someone asked / wonders / thanks / suggests looking something up, and skip chit-chat. Prefer 0-5 high-value facts.
+- Record durable knowledge: ownership/assignment, responsibility, status, decisions, plans/schedules, dependencies, where things are managed/stored, absences, problems and their causes, and a user's preferences, standing instructions to the assistant (e.g. "ユーザーは回答を簡潔にしてほしい"), personal facts (residence, plans) and habits. Do NOT record that someone asked / wonders / thanks / suggests looking something up, and skip chit-chat. Prefer 0-5 high-value facts.
 `entity_summaries`: for entities that got NEW durable information, an updated summary (max 120 chars, in Japanese) merging the old summary with the new info; omit others. Do not put transient details (absence dates) in summaries."""
 
 EXTRACT_FACTS_SCHEMA = obj_schema(

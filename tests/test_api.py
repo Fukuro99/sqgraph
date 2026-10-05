@@ -298,3 +298,115 @@ def test_context_manager_closes(tmp_path):
         db.create_node("A")
     with pytest.raises(Exception):
         db.create_node("A")
+
+
+# --------------------------------------------------------------------------- secure delete / checkpoint / meta
+
+
+def test_secure_delete_option_and_switch(tmp_path):
+    with GraphDB(tmp_path / "a.db") as db:
+        assert db._conn.execute("PRAGMA secure_delete").fetchone()[0] == 0
+        db.set_secure_delete(True)
+        assert db._conn.execute("PRAGMA secure_delete").fetchone()[0] == 1
+        db.set_secure_delete(False)
+        assert db._conn.execute("PRAGMA secure_delete").fetchone()[0] == 0
+    with GraphDB(tmp_path / "b.db", secure_delete=True) as db:
+        assert db._conn.execute("PRAGMA secure_delete").fetchone()[0] == 1
+    with GraphDB(tmp_path / "b.db", read_only=True, secure_delete=True) as ro:
+        ro.set_secure_delete(True)  # no-op on a read-only database
+    with GraphDB(secure_delete=True) as mem:
+        assert mem._conn.execute("PRAGMA secure_delete").fetchone()[0] == 1
+
+
+def _file_bytes(path):
+    out = b""
+    for suffix in ("", "-wal"):
+        try:
+            out += open(str(path) + suffix, "rb").read()
+        except FileNotFoundError:
+            pass
+    return out
+
+
+def test_secure_delete_removes_deleted_text_from_the_file(tmp_path):
+    secret = b"ZZ-api-secret-5521"
+    for secure, expect_gone in ((True, True), (False, False)):
+        path = tmp_path / f"s{int(secure)}.db"
+        with GraphDB(path, secure_delete=secure) as db:
+            keep = db.create_node("Doc", {"text": "x" * 200})
+            doomed = [db.create_node("Doc", {"text": secret.decode() + " " + "y" * 100}) for _ in range(5)]
+            db.checkpoint()
+            assert secret in _file_bytes(path)
+            for n in doomed:
+                db.delete_node(n.id)
+            db.checkpoint(truncate=True)
+            assert db.get_node(keep.id) is not None
+        assert (secret not in _file_bytes(path)) is expect_gone
+
+
+def test_checkpoint_truncates_the_wal(tmp_path):
+    import os
+
+    path = tmp_path / "c.db"
+    with GraphDB(path) as db:
+        for i in range(50):
+            db.create_node("N", {"i": i, "pad": "p" * 500})
+        wal = str(path) + "-wal"
+        assert os.path.getsize(wal) > 0
+        db.checkpoint(truncate=False)  # PASSIVE: copies pages, leaves the file size
+        db.checkpoint()
+        assert os.path.getsize(wal) == 0
+        assert db.stats()["nodes"] == 50
+        with db.transaction():
+            with pytest.raises(SqgraphError, match="transaction"):
+                db.checkpoint()
+    with GraphDB() as mem:
+        mem.checkpoint()  # no-ops
+    with GraphDB(path, read_only=True) as ro:
+        ro.checkpoint()
+
+
+def test_optimize_fulltext(tmp_path):
+    with GraphDB(tmp_path / "f.db") as db:
+        db.create_fulltext_index("a_ft", "Doc", ["text"])
+        db.create_relationship_fulltext_index("b_ft", "REL", ["text"])
+        n = [db.create_node("Doc", {"text": f"alpha beta {i}"}) for i in range(30)]
+        db.create_edge(n[0].id, n[1].id, "REL", {"text": "gamma delta"})
+        for x in n[2:10]:
+            db.delete_node(x.id)
+        db.optimize_fulltext()  # all indexes
+        db.optimize_fulltext(["a_ft"])
+        db.optimize_fulltext([])
+        assert len(db.fulltext_search("a_ft", "alpha", k=100)) == 22
+        assert len(db.fulltext_search("b_ft", "gamma")) == 1
+        with pytest.raises(SqgraphError, match="no such fulltext index"):
+            db.optimize_fulltext(["nope"])
+    with GraphDB(tmp_path / "f.db", read_only=True) as ro:
+        with pytest.raises(SqgraphError):
+            ro.optimize_fulltext()
+
+
+def test_meta_get_set(tmp_path):
+    path = tmp_path / "m.db"
+    with GraphDB(path) as db:
+        assert db.get_meta("schema_version") == "3"
+        assert db.get_meta("mine") is None
+        db.set_meta("mine", "1")
+        db.set_meta("mine", "2")  # overwrite
+        assert db.get_meta("mine") == "2"
+        with pytest.raises(SqgraphError):
+            db.set_meta("", "x")
+        with pytest.raises(SqgraphError):
+            db.set_meta("k", 5)  # type: ignore[arg-type]
+        with pytest.raises(SqgraphError):
+            with db.transaction():
+                db.set_meta("rolled", "back")
+                raise SqgraphError("abort")
+        assert db.get_meta("rolled") is None
+    with GraphDB(path, read_only=True) as ro:
+        assert ro.get_meta("mine") == "2"
+        with pytest.raises(SqgraphError):
+            ro.set_meta("mine", "3")
+    with GraphDB() as mem:
+        mem.set_meta("a", "b")
+        assert mem.get_meta("a") == "b"

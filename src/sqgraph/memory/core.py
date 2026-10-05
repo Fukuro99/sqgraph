@@ -28,15 +28,17 @@ import json
 import os
 import threading
 from collections import Counter, defaultdict
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone, tzinfo
-from typing import Any, Callable, Iterable, Sequence
+from typing import Any, Callable, Iterable, Iterator, Sequence
 
 from ..db import GraphDB
 from ..errors import SqgraphError
 from ..schema import RELATIONSHIP
 from ..types import Node, Relationship
 from . import prompts
+from .filelock import FileLock
 from .providers import Embedder, LLMProvider
 from .util import (
     cosine,
@@ -65,6 +67,13 @@ FACT_ID = "fact_id"  # relationship property index on FACT.id
 FACT_TYPE = "FACT"
 EPISODE_FT = "episode_ft"
 RRF_K = 60
+
+# Version of the memory data layout, kept in the ``_meta`` table (key ``memory_schema_version``). Databases
+# created before the key existed count as version 1. To change the layout: bump the constant and register a
+# migration ``{from_version: fn(memory)}`` in ``_MIGRATIONS`` (run in order, each in its own transaction).
+MEMORY_SCHEMA_VERSION = 1
+META_SCHEMA_KEY = "memory_schema_version"
+_MIGRATIONS: dict[int, Callable[["Memory"], None]] = {}
 
 
 # --------------------------------------------------------------------------- result types
@@ -127,6 +136,30 @@ class EpisodeResult:
 
     def to_dict(self) -> dict[str, Any]:
         return dict(self.__dict__)
+
+
+@dataclass
+class ForgetResult:
+    """What a ``forget_*`` / :meth:`Memory.purge` call deleted or changed (ids, not counts).
+
+    ``facts_restored`` are facts that had been superseded by a deleted fact and are valid again;
+    ``entities_updated`` are surviving entities whose aliases / summaries / embedding were recomputed.
+    With ``dry_run`` nothing was written.
+    """
+
+    episodes_deleted: list[str] = field(default_factory=list)
+    facts_deleted: list[str] = field(default_factory=list)
+    facts_restored: list[str] = field(default_factory=list)
+    entities_deleted: list[str] = field(default_factory=list)
+    entities_updated: list[str] = field(default_factory=list)
+    dry_run: bool = False
+
+    def to_dict(self) -> dict[str, Any]:
+        return {k: list(v) if isinstance(v, list) else v for k, v in self.__dict__.items()}
+
+    @property
+    def empty(self) -> bool:
+        return not (self.episodes_deleted or self.facts_deleted or self.entities_deleted)
 
 
 @dataclass
@@ -219,6 +252,12 @@ class Memory:
         results. Default Asia/Tokyo (JST).
     context_window:
         Number of preceding messages of the same channel given to the LLM as context.
+    lock_timeout:
+        Seconds a write operation waits for the cross-process write lock (``<db path>.lock``) before raising
+        :class:`TimeoutError`. Every write holds that lock for its whole duration (including LLM calls), so
+        several processes (agents) can safely share one database file.
+
+    A database opened here has ``PRAGMA secure_delete=ON``: forgotten data is overwritten, not left in free pages.
     """
 
     def __init__(
@@ -233,9 +272,10 @@ class Memory:
         min_content_chars: int = 5,
         read_only: bool = False,
         clock: Callable[[], datetime] | None = None,
+        lock_timeout: float = 300.0,
     ) -> None:
         self._owns_db = not isinstance(db, GraphDB)
-        self.db = db if isinstance(db, GraphDB) else GraphDB(db, read_only=read_only)
+        self.db = db if isinstance(db, GraphDB) else GraphDB(db, read_only=read_only, secure_delete=True)
         self.llm = llm
         self.embedder = embedder
         self.default_group_id = default_group_id
@@ -244,8 +284,15 @@ class Memory:
         self.min_content_chars = min_content_chars
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         self._write_lock = threading.RLock()
+        self.lock_timeout = lock_timeout
+        self._lock_depth = 0
+        self._file_lock: FileLock | None = None
         self._llm_calls = 0
         try:
+            if not self.db.read_only:
+                self.db.set_secure_delete(True)
+                if self.db.path != ":memory:":
+                    self._file_lock = FileLock(self.db.path + ".lock", lock_timeout)
             self._ensure_schema()
         except BaseException:
             self.close()  # do not leak a connection opened here
@@ -263,6 +310,35 @@ class Memory:
     def __exit__(self, *exc: object) -> None:
         self.close()
 
+    @contextmanager
+    def _write_guard(self) -> Iterator[None]:
+        """Exclusive write access: the in-process lock, then the cross-process file lock (outermost entry only)."""
+        with self._write_lock:
+            if self._lock_depth == 0 and self._file_lock is not None:
+                self._file_lock.acquire(self.lock_timeout)
+            self._lock_depth += 1
+            try:
+                yield
+            finally:
+                self._lock_depth -= 1
+                if self._lock_depth == 0 and self._file_lock is not None:
+                    self._file_lock.release()
+
+    @property
+    def schema_version(self) -> int:
+        """Version of the memory data layout stored in the database (see ``MEMORY_SCHEMA_VERSION``)."""
+        stored = self._stored_version()
+        return 1 if stored is None else stored
+
+    def _stored_version(self) -> int | None:
+        raw = self.db.get_meta(META_SCHEMA_KEY)
+        if raw is None:
+            return None
+        try:
+            return int(raw)
+        except ValueError:
+            raise SqgraphError(f"invalid {META_SCHEMA_KEY} in the database: {raw!r}") from None
+
     @property
     def usage(self) -> Any:
         """The LLM provider's :class:`UsageTracker` if it has one."""
@@ -277,8 +353,18 @@ class Memory:
         return 1536
 
     def _ensure_schema(self) -> None:
+        with self._write_guard():  # concurrent first opens must not race on index creation / migration
+            self._ensure_schema_locked()
+
+    def _ensure_schema_locked(self) -> None:
         db = self.db
         self._reject_old_format()
+        stored = self._stored_version()
+        if stored is not None and stored > MEMORY_SCHEMA_VERSION:
+            raise SqgraphError(
+                f"this memory database has schema version {stored} (created by a newer sqgraph; this one "
+                f"supports up to {MEMORY_SCHEMA_VERSION}): upgrade sqgraph"
+            )
         if db.read_only:
             names = {i["name"] for i in db.list_indexes()}
             missing = {FACT_INDEX, FACT_FT, FACT_ID, ENTITY_FT} - names
@@ -294,11 +380,28 @@ class Memory:
             db.create_fulltext_index(EPISODE_FT, "Episode", ["text_norm"], if_not_exists=True, tokenizer="trigram")
             db.create_property_index("Memory", "id", name="mem_id")
             db.create_property_index("Memory", "source_ref", name="mem_source_ref")
+            self._migrate(stored)
         ix = next((i for i in db.vector_indexes() if i.name == FACT_INDEX), None)
         if ix and self.embedder is not None and ix.dimensions != self.embedder.dimensions:
             raise SqgraphError(
                 f"embedding dimension mismatch: database has {ix.dimensions}, embedder produces {self.embedder.dimensions}"
             )
+
+    def _migrate(self, stored: int | None) -> None:
+        """Bring the stored memory schema version up to date (``None``: no version recorded yet)."""
+        version = stored if stored is not None else 1  # databases from before the key existed are version 1
+        if stored is None and not self.db.query("MATCH (e:Episode) RETURN e.id AS id LIMIT 1"):
+            version = MEMORY_SCHEMA_VERSION  # nothing stored yet: starts at the current layout
+        while version < MEMORY_SCHEMA_VERSION:
+            step = _MIGRATIONS.get(version)
+            if step is None:
+                raise SqgraphError(f"no migration from memory schema version {version} to {version + 1}")
+            with self.db.transaction():
+                step(self)
+                self.db.set_meta(META_SCHEMA_KEY, str(version + 1))
+            version += 1
+        if stored != version:
+            self.db.set_meta(META_SCHEMA_KEY, str(version))
 
     def _reject_old_format(self) -> None:
         """Databases from before edge-based facts (Fact nodes, node-level fact indexes) are not migrated."""
@@ -404,7 +507,7 @@ class Memory:
         if self.db.read_only:
             raise SqgraphError("memory database is read-only")
         group = self._group(group_id)
-        with self._write_lock:
+        with self._write_guard():
             calls0 = self._llm_calls
             usd0 = self.usage.snapshot() if self.usage else None
             if source_ref:
@@ -461,7 +564,8 @@ class Memory:
             if progress:
                 progress(i + 1, len(rows), r)
         if not self.db.read_only:
-            self.db.analyze()
+            with self._write_guard():
+                self.db.analyze()
         return out
 
     # -- pipeline ---------------------------------------------------------------------------
@@ -1117,7 +1221,7 @@ class Memory:
             summary, source = p.get("summary", ""), "stored"
         else:
             summary, source = "", "stored"
-        if allowed is not None and not summary:
+        if not summary:  # e.g. every summary line was dropped by a forget: derive one from the valid facts
             summary, source = self._derived_summary(p["id"], allowed, group), "derived"
         return {
             "id": p["id"],
@@ -1650,6 +1754,372 @@ class Memory:
         )
         views = [self._entity_view(e, allowed, group) for e in ents[:4]]
         return Answer(question, text, hits, views, payload["as_of"])
+
+    # ================================================================== FORGET
+
+    # Deleting is physical: rows are removed (``PRAGMA secure_delete`` overwrites them), the fulltext indexes are
+    # merged and the WAL is truncated, so forgotten text does not linger in the file. Facts derived from deleted
+    # episodes go with them (a fact asserted by several episodes only loses the deleted ones as sources); a
+    # deleted fact gives the facts it superseded back their validity.
+
+    def _need_writable(self) -> None:
+        if self.db.read_only:
+            raise SqgraphError("memory database is read-only")
+
+    def forget_episode(
+        self,
+        episode_id: str | None = None,
+        *,
+        source: str | None = None,
+        source_ref: str | None = None,
+        group_id: str | None = None,
+        dry_run: bool = False,
+    ) -> ForgetResult:
+        """Delete one source episode (by ``episode_id``, or by ``source_ref`` / ``(source, source_ref)``).
+
+        Facts asserted only by it are deleted too (facts with other sources keep those and lose this one),
+        superseded facts are restored and entities left without mentions / facts are removed. An unknown
+        episode yields an empty result.
+        """
+        if episode_id is None and source_ref is None:
+            raise ValueError("give episode_id or source_ref (optionally with source)")
+        if not dry_run:
+            self._need_writable()
+        group = self._group(group_id)
+        with self._write_guard():
+            ids: set[str] = set()
+            if episode_id is not None:
+                n = self._one("MATCH (e:Episode {id:$id}) RETURN e", {"id": episode_id})
+                if n is not None and n.get("group_id") == group:
+                    ids.add(n["id"])
+            else:
+                cy = "MATCH (e:Episode {group_id:$g, source_ref:$r}) RETURN e"
+                params = {"g": group, "r": source_ref}
+                if source is not None:
+                    cy, params = "MATCH (e:Episode {group_id:$g, source_ref:$r, source:$s}) RETURN e", {**params, "s": source}
+                ids = {r["e"]["id"] for r in self.db.query(cy, params)}
+            return self._forget(group, episode_ids=ids, dry_run=dry_run)
+
+    def forget_fact(self, fact_id: str, *, group_id: str | None = None, dry_run: bool = False) -> ForgetResult:
+        """Delete one fact (its episodes stay). Facts it superseded become valid again."""
+        if not dry_run:
+            self._need_writable()
+        group = self._group(group_id)
+        with self._write_guard():
+            return self._forget(group, fact_ids={fact_id}, dry_run=dry_run)
+
+    def forget_entity(
+        self,
+        entity: str,
+        *,
+        with_episodes: bool = True,
+        group_id: str | None = None,
+        dry_run: bool = False,
+    ) -> ForgetResult:
+        """Delete an entity (``entity``: id, or exact name / alias), every fact it is part of and, with
+        ``with_episodes`` (default), every episode that mentions it.
+
+        Only exact names count (no fuzzy matching, since this deletes); a name shared by several entities
+        raises ``ValueError`` listing their ids. An unknown entity yields an empty result.
+        """
+        if not dry_run:
+            self._need_writable()
+        group = self._group(group_id)
+        with self._write_guard():
+            nodes = self._entities_by_ref(group, entity)
+            if len(nodes) > 1:
+                options = ", ".join(f"{n['id']} ({n.get('type')} {n['name']!r})" for n in nodes)
+                raise ValueError(f"{entity!r} is ambiguous; use an entity id: {options}")
+            return self._forget(
+                group, entity_ids={n["id"] for n in nodes}, entity_episodes=with_episodes, dry_run=dry_run
+            )
+
+    def forget_range(
+        self,
+        *,
+        since: str | datetime | None = None,
+        until: str | datetime | None = None,
+        channel: str | None = None,
+        source: str | None = None,
+        group_id: str | None = None,
+        dry_run: bool = False,
+    ) -> ForgetResult:
+        """Delete the episodes with ``since <= occurred_at < until`` (naive times are in ``tz``), optionally
+        only those of a ``channel`` / ``source``. At least one filter is required."""
+        if since is None and until is None and channel is None and source is None:
+            raise ValueError("forget_range needs at least one of since / until / channel / source")
+        bounds: dict[str, str | None] = {}
+        for label, value in (("since", since), ("until", until)):
+            dt = parse_time(value, self.tz) if value is not None else None
+            if value is not None and dt is None:
+                raise ValueError(f"cannot parse {label}: {value!r}")
+            bounds[label] = to_iso(dt) if dt else None
+        if not dry_run:
+            self._need_writable()
+        group = self._group(group_id)
+        with self._write_guard():
+            ids = set()
+            for r in self.db.query("MATCH (e:Episode {group_id:$g}) RETURN e", {"g": group}):
+                n = r["e"]
+                at = n.get("occurred_at", "")
+                if bounds["since"] is not None and at < bounds["since"]:
+                    continue
+                if bounds["until"] is not None and at >= bounds["until"]:
+                    continue
+                if channel is not None and n.get("channel") != channel:
+                    continue
+                if source is not None and n.get("source") != source:
+                    continue
+                ids.add(n["id"])
+            return self._forget(group, episode_ids=ids, dry_run=dry_run)
+
+    def purge(self, *, group_id: str | None = None, dry_run: bool = False) -> ForgetResult:
+        """Delete every episode, entity and fact of the group."""
+        if not dry_run:
+            self._need_writable()
+        group = self._group(group_id)
+        with self._write_guard():
+            return self._forget(group, everything=True, dry_run=dry_run)
+
+    def _entities_by_ref(self, group: str, ref: str) -> list[Node]:
+        """Entities whose id, or whose name / alias (normalised), equals ``ref`` (no fuzzy matching)."""
+        n = self._entity_node(group, ref)
+        if n is not None:
+            return [n]
+        key = norm_key(ref)
+        if not key:
+            return []
+        rows = self.db.query("MATCH (e:Entity {group_id:$g}) WHERE $k IN e.alias_keys RETURN e", {"g": group, "k": key})
+        return [r["e"] for r in rows]
+
+    def _forget(
+        self,
+        group: str,
+        *,
+        episode_ids: Iterable[str] = (),
+        fact_ids: Iterable[str] = (),
+        entity_ids: Iterable[str] = (),
+        entity_episodes: bool = False,
+        everything: bool = False,
+        dry_run: bool = False,
+    ) -> ForgetResult:
+        """Shared cascade of all forget operations; the whole change is planned in memory, then applied in one
+        transaction (so ``dry_run`` reports exactly what a real run would do)."""
+        db = self.db
+        g = {"g": group}
+        eps: dict[str, Node] = {r["e"]["id"]: r["e"] for r in db.query("MATCH (e:Episode {group_id:$g}) RETURN e", g)}
+        ents: dict[str, Node] = {r["x"]["id"]: r["x"] for r in db.query("MATCH (x:Entity {group_id:$g}) RETURN x", g)}
+        facts: dict[str, Relationship] = {
+            r["f"]["id"]: r["f"] for r in db.query("MATCH ()-[f:FACT {group_id:$g}]->() RETURN f", g)
+        }
+        ent_eps: dict[str, set[str]] = defaultdict(set)  # entity -> episodes mentioning it
+        ep_ents: dict[str, set[str]] = defaultdict(set)
+        for r in db.query("MATCH (e:Episode {group_id:$g})-[:MENTIONS]->(x:Entity) RETURN e.id AS e, x.id AS x", g):
+            ent_eps[r["x"]].add(r["e"])
+            ep_ents[r["e"]].add(r["x"])
+        ent_facts: dict[str, set[str]] = defaultdict(set)  # entity -> facts it is an endpoint of
+        for fid, f in facts.items():
+            for x in (f.get("subject_id"), f.get("object_id")):
+                if x:
+                    ent_facts[x].add(fid)
+
+        # -- what goes ------------------------------------------------------------------------------
+        if everything:
+            E, N, F = set(eps), set(ents), set(facts)
+        else:
+            E = {i for i in episode_ids if i in eps}
+            N = {i for i in entity_ids if i in ents}
+            if entity_episodes:
+                E |= {e for x in N for e in ent_eps[x] if e in eps}
+            F = {i for i in fact_ids if i in facts} | {fid for x in N for fid in ent_facts[x]}
+        changes: dict[str, dict[str, Any]] = defaultdict(dict)  # surviving fact id -> property updates (None = remove)
+
+        def getp(fid: str, key: str, default: Any = None) -> Any:
+            if key in changes.get(fid, ()):
+                v = changes[fid][key]
+                return default if v is None else v
+            return facts[fid].get(key, default)
+
+        # facts lose their deleted sources; facts left without any source go too
+        for fid, f in facts.items():
+            sources = f.get("episode_ids", [])
+            if fid in F or E.isdisjoint(sources):
+                continue
+            rest = [x for x in sources if x not in E]
+            if not rest:
+                F.add(fid)
+                continue
+            upd: dict[str, Any] = {"episode_ids": rest}
+            chans = list(dict.fromkeys(eps[x].get("channel") for x in rest if x in eps and eps[x].get("channel")))
+            if chans:
+                upd["channels"] = chans
+            changes[fid].update(upd)
+
+        # -- supersede links ------------------------------------------------------------------------
+        restored: list[str] = []
+        superseded: dict[str, list[str]] = defaultdict(list)  # fact -> facts it superseded
+        for fid, f in facts.items():
+            if f.get("superseded_by"):
+                superseded[f["superseded_by"]].append(fid)
+
+        def surviving_superseder(fid: str) -> str | None:
+            """The fact that (transitively, through deleted facts) superseded ``fid``, if it survives."""
+            seen: set[str] = set()
+            nxt = facts[fid].get("superseded_by")
+            while nxt in F and nxt not in seen:
+                seen.add(nxt)
+                nxt = facts[nxt].get("superseded_by")
+            return nxt if nxt in facts and nxt not in F else None
+
+        for fid, f in facts.items():  # deleted ids vanish from the lists of the surviving facts
+            if fid not in F and any(x in F for x in f.get("supersedes", [])):
+                changes[fid]["supersedes"] = [x for x in f["supersedes"] if x not in F] or None
+        for did in sorted(F):
+            d = facts[did]
+            nxt = surviving_superseder(did)
+            for oid in superseded.get(did, []):
+                if oid in F:
+                    continue
+                o = facts[oid]
+                if nxt is not None:
+                    # chain old -> deleted -> newer: the old fact now ends where the newer one begins
+                    changes[oid].update(
+                        {"invalid_at": max(facts[nxt].get("valid_at", ""), o.get("valid_at", "")), "superseded_by": nxt}
+                    )
+                    changes[nxt]["supersedes"] = list(dict.fromkeys([*(getp(nxt, "supersedes") or []), oid]))
+                    continue
+                upd = {"expired_at": None, "superseded_by": None}
+                if o.get("invalid_at") == max(d.get("valid_at", ""), o.get("valid_at", "")):
+                    upd["invalid_at"] = None  # set by the supersession (a stated end time is kept)
+                changes[oid].update(upd)
+                restored.append(oid)
+
+        # -- entities -------------------------------------------------------------------------------
+        touched: set[str] = {x for e in E for x in ep_ents[e]}
+        for fid in F:
+            touched |= {x for x in (facts[fid].get("subject_id"), facts[fid].get("object_id")) if x}
+        touched = (touched - N) & set(ents)
+        deleted_ents = set(N)
+        updates: dict[str, dict[str, Any]] = {}
+        embed_texts: dict[str, str] = {}
+        now = self._now()
+        for x in sorted(touched):
+            remaining_eps = ent_eps[x] - E
+            remaining_facts = ent_facts[x] - F
+            if not remaining_eps and not remaining_facts:
+                deleted_ents.add(x)
+                continue
+            upd, text = self._recompute_entity(
+                ents[x], now, [eps[e] for e in remaining_eps if e in eps], [e for e in ent_eps[x] if e in E and e in eps],
+                [facts[f] for f in remaining_facts], [facts[f] for f in ent_facts[x] & F], getp, eps
+            )
+            updates[x] = upd
+            embed_texts[x] = text
+
+        result = ForgetResult(
+            episodes_deleted=sorted(E),
+            facts_deleted=sorted(F),
+            facts_restored=sorted(set(restored)),
+            entities_deleted=sorted(deleted_ents),
+            entities_updated=sorted(updates),
+            dry_run=dry_run,
+        )
+        if dry_run or result.empty:
+            return result
+
+        # -- apply ----------------------------------------------------------------------------------
+        vectors: list[list[float]] | None = None
+        if self.embedder is not None and embed_texts:
+            try:
+                vectors = self.embedder.embed(list(embed_texts.values()))
+            except Exception:  # forgetting must not depend on the embedding API being reachable
+                vectors = None
+        if vectors is not None:
+            for x, v in zip(embed_texts, vectors):
+                updates[x]["embedding"] = v
+        else:
+            for upd in updates.values():
+                upd["embedding"] = None  # a stale vector could still encode forgotten text
+        with db.transaction():
+            for fid, ch in changes.items():
+                if fid not in F and ch:
+                    db.update_edge(facts[fid].id, ch)
+            for fid in F:
+                db.delete_edge(facts[fid].id)
+            for e in E:
+                db.delete_node(eps[e].id, detach=True)
+            for x in deleted_ents:
+                db.delete_node(ents[x].id, detach=True)
+            for x, upd in updates.items():
+                db.update_node(ents[x].id, upd)
+        db.optimize_fulltext([ENTITY_FT, FACT_FT, EPISODE_FT])
+        db.checkpoint(truncate=True)
+        return result
+
+    def _recompute_entity(
+        self,
+        node: Node,
+        now: str,
+        remaining_eps: list[Node],
+        deleted_eps: list[str],
+        remaining_facts: list[Relationship],
+        deleted_facts: list[Relationship],
+        getp: Callable[..., Any],
+        eps: dict[str, Node],
+    ) -> tuple[dict[str, Any], str]:
+        """Property updates of a surviving entity after forgetting, and the text its embedding is built from.
+
+        Dropped: the per-channel summary lines of the channels of the deleted episodes / facts (they may state
+        what was forgotten) and the aliases that no remaining mentioning episode uses any more.
+        """
+        p = node.properties
+        name = p["name"]
+        drop = {eps[e].get("channel") for e in deleted_eps} | {c for f in deleted_facts for c in f.get("channels", [])}
+        entries = {c: t for c, t in self._entries(p).items() if c not in drop}
+        upd: dict[str, Any] = {"updated_at": now}
+        if self._entries(p):
+            upd.update(
+                summaries=[f"{c}\t{t}" for c, t in entries.items()],
+                summary=" / ".join(entries.values()),
+                summary_channels=list(entries),
+            )
+        elif p.get("summary") and set(p.get("summary_channels", [])) & drop:  # legacy single summary
+            upd.update(summary="", summary_channels=[])
+        texts = [
+            (e.get("text_norm") or nfkc(e.get("content", "")).casefold(), nfkc(e.get("author") or "").casefold(), e.get("channel"))
+            for e in remaining_eps
+        ]
+        mention_channels = {c for _, _, c in texts}
+
+        def seen_in(form: str) -> set[str]:
+            f = nfkc(form).casefold().strip()
+            return {c for t, a, c in texts if f and (f in t or f in a)}
+
+        aliases = [a for a in p.get("aliases", []) if seen_in(a)]
+        forms = {name: mention_channels, **{a: seen_in(a) for a in aliases}}
+        chans = mention_channels | {c for f in remaining_facts for c in f.get("channels", [])}
+        old_channels = list(p.get("channels", []))
+        upd.update(
+            aliases=aliases,
+            alias_keys=sorted({k for k in (norm_key(x) for x in [name, *aliases]) if k}),
+            alias_src=[
+                e
+                for e in p.get("alias_src", [])
+                if e.partition("\t")[2] in forms and e.partition("\t")[0] in forms[e.partition("\t")[2]]
+            ],
+            search_text=nfkc("\n".join([name, *aliases])).casefold(),
+            channels=[c for c in old_channels if c in chans] + sorted(chans - set(old_channels)),
+        )
+        if entries:
+            body = " / ".join(entries.values())
+        else:  # the same fallback as a restricted view: the currently valid facts
+            valid = []
+            for f in remaining_facts:
+                eff = {k: getp(f["id"], k) for k in ("valid_at", "invalid_at")}
+                if _fact_status(eff, now) == "valid":
+                    valid.append((eff["valid_at"] or "", f["fact"]))
+            body = " / ".join(t for _, t in sorted(valid, reverse=True)[:4])
+        return upd, short(f"{name}: {body}", 400)
 
     # -- misc ----------------------------------------------------------------------------------------
 

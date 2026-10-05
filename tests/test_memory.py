@@ -531,3 +531,104 @@ def test_core_db_stays_llm_free():
     src = open(sqgraph.__file__, encoding="utf-8").read()
     assert "openai" not in src.lower()
     assert isinstance(GraphDB(":memory:"), GraphDB)
+
+
+# --------------------------------------------------------------------------- memory schema version
+
+
+def test_schema_version_is_recorded_and_exposed(tmp_path):
+    from sqgraph.memory import MEMORY_SCHEMA_VERSION
+
+    assert MEMORY_SCHEMA_VERSION == 1
+    path = tmp_path / "mem.db"
+    with Memory(path, FakeLLM(), FakeEmbedder(), default_group_id=G) as mem:
+        assert mem.schema_version == MEMORY_SCHEMA_VERSION
+        assert mem.db.get_meta("memory_schema_version") == "1"
+    with Memory(":memory:", FakeLLM(), FakeEmbedder()) as mem:
+        assert mem.schema_version == 1 and mem.db.get_meta("memory_schema_version") == "1"
+
+
+def test_database_without_a_recorded_version_counts_as_version_1(tmp_path):
+    path = tmp_path / "mem.db"
+    with Memory(path, FakeLLM(), FakeEmbedder(), default_group_id=G) as mem:
+        ep(mem, "[[Rails|Service]] {{alice|USES|Rails}}")
+        mem.db._conn.execute("DELETE FROM _meta WHERE key = 'memory_schema_version'")
+    with Memory(path, None, FakeEmbedder(), default_group_id=G, read_only=True) as ro:
+        assert ro.schema_version == 1  # reading never writes
+        assert ro.db.get_meta("memory_schema_version") is None
+    with Memory(path, FakeLLM(), FakeEmbedder(), default_group_id=G) as mem:
+        assert mem.schema_version == 1 and mem.db.get_meta("memory_schema_version") == "1"
+        assert mem.search("alice USES Rails")
+
+
+def test_newer_database_is_rejected_without_touching_it(tmp_path):
+    from sqgraph.errors import SqgraphError
+
+    path = tmp_path / "mem.db"
+    with GraphDB(path) as db:
+        db.set_meta("memory_schema_version", "99")
+    with pytest.raises(SqgraphError, match="newer sqgraph.*upgrade"):
+        Memory(path, FakeLLM(), FakeEmbedder(), default_group_id=G)
+    with pytest.raises(SqgraphError, match="newer sqgraph"):
+        Memory(path, None, None, default_group_id=G, read_only=True)
+    with GraphDB(path, read_only=True) as db:
+        assert db.list_indexes() == [] and db.get_meta("memory_schema_version") == "99"  # nothing was created
+    with GraphDB(path) as db:
+        db.set_meta("memory_schema_version", "not-a-number")
+    with pytest.raises(SqgraphError, match="invalid"):
+        Memory(path, FakeLLM(), FakeEmbedder(), default_group_id=G)
+
+
+def test_older_database_is_migrated_step_by_step(tmp_path, monkeypatch):
+    from sqgraph.memory import core
+
+    path = tmp_path / "mem.db"
+    with Memory(path, FakeLLM(), FakeEmbedder(), default_group_id=G) as mem:
+        ep(mem, "[[Rails|Service]] {{alice|USES|Rails}}")
+    ran: list[int] = []
+
+    def step(n):
+        def run(memory):
+            ran.append(n)
+            assert memory.db.get_meta("memory_schema_version") == str(n)
+            memory.db.set_meta(f"migrated_{n}", "yes")
+
+        return run
+
+    monkeypatch.setattr(core, "MEMORY_SCHEMA_VERSION", 3)
+    monkeypatch.setattr(core, "_MIGRATIONS", {1: step(1), 2: step(2)})
+    # a read-only open does not migrate
+    with Memory(path, None, FakeEmbedder(), default_group_id=G, read_only=True) as ro:
+        assert ro.schema_version == 1 and ran == []
+    with Memory(path, FakeLLM(), FakeEmbedder(), default_group_id=G) as mem:
+        assert ran == [1, 2] and mem.schema_version == 3
+        assert mem.db.get_meta("migrated_1") == "yes" and mem.db.get_meta("migrated_2") == "yes"
+    with Memory(path, FakeLLM(), FakeEmbedder(), default_group_id=G):
+        assert ran == [1, 2]  # up to date: nothing runs again
+
+
+def test_failed_or_missing_migration_leaves_the_version_untouched(tmp_path, monkeypatch):
+    from sqgraph.errors import SqgraphError
+    from sqgraph.memory import core
+
+    path = tmp_path / "mem.db"
+    with Memory(path, FakeLLM(), FakeEmbedder(), default_group_id=G) as mem:
+        ep(mem, "[[Rails|Service]] {{alice|USES|Rails}}")
+
+    def boom(memory):
+        memory.db.set_meta("half_done", "yes")
+        raise RuntimeError("migration failed")
+
+    monkeypatch.setattr(core, "MEMORY_SCHEMA_VERSION", 2)
+    monkeypatch.setattr(core, "_MIGRATIONS", {1: boom})
+    with pytest.raises(RuntimeError, match="migration failed"):
+        Memory(path, FakeLLM(), FakeEmbedder(), default_group_id=G)
+    monkeypatch.setattr(core, "_MIGRATIONS", {})
+    with pytest.raises(SqgraphError, match="no migration from memory schema version 1 to 2"):
+        Memory(path, FakeLLM(), FakeEmbedder(), default_group_id=G)
+    with GraphDB(path, read_only=True) as db:
+        assert db.get_meta("half_done") is None  # rolled back with the failed step
+        assert db.get_meta("memory_schema_version") == "1"
+    # a brand-new database starts at the current version without running any migration
+    with Memory(tmp_path / "new.db", FakeLLM(), FakeEmbedder(), default_group_id=G) as fresh:
+        assert fresh.schema_version == 2

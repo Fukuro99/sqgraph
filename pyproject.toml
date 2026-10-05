@@ -4,11 +4,14 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sqgraph"
-version = "0.1.0"
+version = "0.2.0"
 description = "Embedded property graph database on SQLite + sqlite-vec with an openCypher subset, for GraphRAG"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = ["sqlite-vec", "lark"]
+
+[project.scripts]
+sqgraph-memory = "sqgraph.memory.cli:main"
 
 [project.optional-dependencies]
 dev = ["pytest"]
@@ -21,6 +24,7 @@ where = ["src"]
 [tool.setuptools.package-data]
 "sqgraph.cypher" = ["grammar.lark"]
 "sqgraph.viewer" = ["static/*.html"]
+"sqgraph.memory" = ["skill/*.md"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
