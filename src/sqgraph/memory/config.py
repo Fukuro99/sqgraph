@@ -5,10 +5,13 @@ Layout of the home directory (``$SQGRAPH_MEMORY_HOME`` or ``~/.sqgraph-memory``)
     memory.db      the SQLite database shared by every local agent
     memory.db.lock cross-process write lock (created by sqgraph.memory)
     .env           OPENAI_API_KEY=...   (mode 0600 on POSIX; optionally SQGRAPH_EMBED_API_KEY=... for a custom embedder endpoint)
-    config.json    {"group_id", "tz", "llm_model", "embed_model", "embed_base_url", "embed_dimensions",
+    config.json    {"group_id", "tz", "extractor", "llm_model", "embed_model", "embed_base_url", "embed_dimensions",
                     "embed_api_key_env", "db"}
 
-Environment overrides: ``SQGRAPH_MEMORY_HOME``, ``SQGRAPH_MEMORY_DB``, ``SQGRAPH_MEMORY_GROUP``.
+``extractor`` says who extracts entities / facts from what is added: ``"agent"`` (default: the calling agent itself, in
+two steps, no OpenAI key needed) or ``"openai"`` (the server calls an OpenAI LLM, ``llm_model``; for bots).
+
+Environment overrides: ``SQGRAPH_MEMORY_HOME``, ``SQGRAPH_MEMORY_DB``, ``SQGRAPH_MEMORY_GROUP``, ``SQGRAPH_MEMORY_EXTRACTOR``.
 API key values are never printed or logged by this module.
 """
 
@@ -26,6 +29,9 @@ from .providers import DEFAULT_CHAT_MODEL, DEFAULT_EMBED_DIMS, DEFAULT_EMBED_MOD
 ENV_HOME = "SQGRAPH_MEMORY_HOME"
 ENV_DB = "SQGRAPH_MEMORY_DB"
 ENV_GROUP = "SQGRAPH_MEMORY_GROUP"
+ENV_EXTRACTOR = "SQGRAPH_MEMORY_EXTRACTOR"
+EXTRACTORS = ("agent", "openai")
+DEFAULT_EXTRACTOR = "agent"
 DEFAULT_GROUP = "me"
 DEFAULT_TZ = "Asia/Tokyo"
 KEY_NAME = "OPENAI_API_KEY"
@@ -74,6 +80,7 @@ class MemoryConfig:
     home: Path
     group_id: str = DEFAULT_GROUP
     tz: str = DEFAULT_TZ
+    extractor: str = DEFAULT_EXTRACTOR  # "agent" = the calling agent extracts (2 steps, no key); "openai" = one-shot OpenAI LLM
     llm_model: str = DEFAULT_CHAT_MODEL
     embed_model: str = DEFAULT_EMBED_MODEL
     embed_base_url: str | None = None  # None = the OpenAI API; else an OpenAI-compatible /v1 endpoint (e.g. on the LAN)
@@ -111,6 +118,8 @@ class MemoryConfig:
             if isinstance(data, dict):
                 cfg.group_id = str(data.get("group_id") or cfg.group_id)
                 cfg.tz = str(data.get("tz") or cfg.tz)
+                ext = str(data.get("extractor") or "").strip().lower()
+                cfg.extractor = ext if ext in EXTRACTORS else DEFAULT_EXTRACTOR
                 cfg.llm_model = str(data.get("llm_model") or cfg.llm_model)
                 cfg.embed_model = str(data.get("embed_model") or cfg.embed_model)
                 cfg.embed_base_url = str(data.get("embed_base_url") or "").strip() or None
@@ -123,12 +132,18 @@ class MemoryConfig:
                 cfg.group_id = os.environ[ENV_GROUP]
             if os.environ.get(ENV_DB):
                 cfg.db = os.environ[ENV_DB]
+            if os.environ.get(ENV_EXTRACTOR):
+                ext = os.environ[ENV_EXTRACTOR].strip().lower()
+                if ext not in EXTRACTORS:
+                    raise ValueError(f"{ENV_EXTRACTOR} must be one of: {', '.join(EXTRACTORS)}")
+                cfg.extractor = ext
         return cfg
 
     def to_json(self) -> dict[str, Any]:
         return {
             "group_id": self.group_id,
             "tz": self.tz,
+            "extractor": self.extractor,
             "llm_model": self.llm_model,
             "embed_model": self.embed_model,
             "embed_base_url": self.embed_base_url,

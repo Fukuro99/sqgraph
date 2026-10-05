@@ -24,9 +24,13 @@ Access control: every Episode and Fact records its source ``channel``(s). All re
 
 from __future__ import annotations
 
+import base64
+import hashlib
 import json
 import os
+import re
 import threading
+import zlib
 from collections import Counter, defaultdict
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -139,9 +143,12 @@ class EpisodeResult:
     facts_invalidated: list[str] = field(default_factory=list)
     llm_calls: int = 0
     usd: float | None = None
+    warnings: list[str] = field(default_factory=list)  # agent extraction: items dropped / merged by the server
 
     def to_dict(self) -> dict[str, Any]:
-        return dict(self.__dict__)
+        d = dict(self.__dict__)
+        d["warnings"] = list(self.warnings)
+        return d
 
 
 @dataclass
@@ -235,6 +242,64 @@ def _fact_status(p: dict[str, Any], at: str) -> str:
     if va is not None and va > at:
         return "scheduled"
     return "valid"
+
+
+# --------------------------------------------------------------------------- agent extraction tokens
+
+TOKEN_PREFIX = "sqm1"  # format version 1 of the prepare_episode token
+_TOKEN_MAX_BYTES = 8 * 1024 * 1024
+_FACT_ID_RE = re.compile(r"^fact_[0-9a-f]{12}$")
+_MODALITIES = ("definite", "planned", "tentative")
+_DEFAULT_CONFIDENCE = {"definite": 1.0, "planned": 0.7, "tentative": 0.5}
+
+
+def _encode_token(payload: dict[str, Any]) -> str:
+    """``sqm1.<urlsafe base64 of zlib(JSON)>.<blake2b checksum>``: self-contained, the checksum only catches copy errors."""
+    raw = zlib.compress(json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8"), 9)
+    body = base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+    return f"{TOKEN_PREFIX}.{body}.{hashlib.blake2b(raw, digest_size=4).hexdigest()}"
+
+
+def _decode_token(token: Any) -> dict[str, Any]:
+    bad = "invalid token (it must be passed back exactly as returned by prepare / add_memory)"
+    if not isinstance(token, str) or not token.strip():
+        raise ValueError(f"{bad}: empty")
+    parts = token.strip().split(".")
+    if len(parts) != 3 or parts[0] != TOKEN_PREFIX:
+        raise ValueError(f"{bad}: unknown format")
+    try:
+        raw = base64.urlsafe_b64decode(parts[1] + "=" * (-len(parts[1]) % 4))
+    except Exception:
+        raise ValueError(f"{bad}: not base64") from None
+    if hashlib.blake2b(raw, digest_size=4).hexdigest() != parts[2]:
+        raise ValueError(f"{bad}: checksum mismatch (truncated or altered)")
+    try:
+        d = zlib.decompressobj().decompress(raw, _TOKEN_MAX_BYTES)
+        data = json.loads(d.decode("utf-8"))
+    except Exception:
+        raise ValueError(f"{bad}: corrupt payload") from None
+    if not isinstance(data, dict) or data.get("v") != 1:
+        raise ValueError(f"{bad}: unsupported version {data.get('v') if isinstance(data, dict) else None!r}")
+    try:
+        out = {
+            "group_id": str(data["g"]),
+            "source": str(data["s"]),
+            "channel": str(data["c"]),
+            "author": None if data.get("a") is None else str(data["a"]),
+            "occurred_at": str(data["t"]),
+            "source_ref": None if data.get("r") is None else str(data["r"]),
+            "content": str(data["x"]),
+        }
+    except KeyError as exc:
+        raise ValueError(f"{bad}: missing field {exc.args[0]!r}") from None
+    if parse_time(out["occurred_at"], timezone.utc) is None:
+        raise ValueError(f"{bad}: bad time")
+    return out
+
+
+def _content_key(text: str) -> str:
+    """NFKC / case-folded text without separators: the form entity ``alias_keys`` are searched in."""
+    return re.sub(r"[\s_\-・/／.]+", "", nfkc(text).casefold())
 
 
 # --------------------------------------------------------------------------- Memory
@@ -636,6 +701,533 @@ class Memory:
             with self._write_guard():
                 self.db.analyze()
         return out
+
+    # -- agent extraction (two phases, no server-side LLM) -------------------------------------------------
+    # prepare_episode(): read-only; returns the context + instructions for the calling agent (the LLM) and a
+    # stateless token. commit_episode(): the agent's extraction is validated and written with the same
+    # structures / write path (_commit, _write_fact, _invalidate) as the OpenAI pipeline, so supersession
+    # semantics are identical.
+
+    @staticmethod
+    def read_token(token: str) -> dict[str, Any]:
+        """Decode a :meth:`prepare_episode` token (``group_id``, ``source``, ``channel``, ``author``,
+        ``occurred_at`` (UTC ISO), ``source_ref``, ``content``). ``ValueError`` if it is malformed or altered."""
+        return _decode_token(token)
+
+    def _episode_by_ref(self, group: str, source: str, source_ref: str) -> Node | None:
+        return self._one(
+            "MATCH (e:Episode {group_id:$g, source:$s, source_ref:$r}) RETURN e",
+            {"g": group, "s": source, "r": source_ref},
+        )
+
+    def prepare_episode(
+        self,
+        content: str,
+        *,
+        group_id: str | None = None,
+        source: str = "api",
+        channel: str = "default",
+        author: str | None = None,
+        occurred_at: str | datetime | None = None,
+        source_ref: str | None = None,
+        max_entities: int = 20,
+        max_facts: int = 30,
+    ) -> dict[str, Any]:
+        """Phase 1 of agent extraction: no LLM, no write, no write lock.
+
+        Returns ``{"already_stored": True, "episode_id"}`` if ``(source, source_ref)`` was ingested, else
+        ``{"already_stored": False, "token", "instructions", "schema", "context", "next"}``. ``context`` holds the
+        message, the author ref, the preceding episodes of the channel, the existing entities the message may be
+        about (name / alias matches, fulltext, vector search) and the currently valid facts around them. Only
+        information visible in ``channel`` is returned (the same ACL as the pipeline's LLM input). The calling
+        agent writes the extraction JSON (``schema``) and passes it with ``token`` to :meth:`commit_episode`.
+        """
+        group = self._group(group_id)
+        if source_ref:
+            dup = self._episode_by_ref(group, source, source_ref)
+            if dup is not None:
+                return {"already_stored": True, "episode_id": dup["id"]}
+        occurred = parse_time(occurred_at, self.tz) if occurred_at else self._clock()
+        if occurred is None:
+            raise ValueError(f"cannot parse occurred_at: {occurred_at!r}")
+        occurred_iso = to_iso(occurred)
+        text = clean_message(content or "")
+        if not text:
+            raise ValueError("content must not be empty")
+        allowed = {channel}
+        qvec = self._embed_query(short(text, 1500))
+        author_name, author_aliases = person_forms(author) if author else (None, [])
+
+        author_node: Node | None = None
+        if author_name:
+            aw = self._author_entity(author_name, author_aliases, author)
+            self._resolve_entities(group, [aw], None)
+            author_node = aw.node
+        author_visible = author_node is not None and self._entity_visible(author_node.properties, allowed)
+
+        cands = self._agent_candidate_nodes(
+            group, channel, text, qvec, author_node if author_visible else None, max(0, max_entities)
+        )
+        around = list(cands)
+        if author_visible and author_node is not None and author_node["id"] not in {n["id"] for n in cands}:
+            around.append(author_node)
+        related = self._agent_related_facts(group, channel, text, qvec, occurred_iso, around, max(0, max_facts))
+        views = [self._entity_view(n, allowed, group) for n in cands]
+        token = _encode_token(
+            {"v": 1, "g": group, "s": source, "c": channel, "a": author, "t": occurred_iso, "r": source_ref, "x": text}
+        )
+        return {
+            "already_stored": False,
+            "token": token,
+            "instructions": prompts.AGENT_EXTRACTION_INSTRUCTIONS,
+            "schema": prompts.AGENT_EXTRACTION_SCHEMA,
+            "context": {
+                "message": {
+                    "content": text,
+                    "author": author_name,
+                    "occurred_at": local_with_weekday(occurred_iso, self.tz),
+                    "channel": channel,
+                },
+                "author_ref": (
+                    {"ref": "author", "name": author_name, "existing_id": author_node["id"] if author_visible else None}
+                    if author_name
+                    else None
+                ),
+                "recent": self._recent_context(group, channel, occurred_iso),
+                "candidate_entities": [
+                    {
+                        "id": v["id"],
+                        "name": v["name"],
+                        "type": v["type"],
+                        "aliases": v["aliases"][:6],
+                        "summary": short(v["summary"], 120),
+                    }
+                    for v in views
+                ],
+                "related_facts": related,
+            },
+            "next": (
+                "Write the extraction JSON (see `schema`, `instructions`) and call commit_memory(token, extraction) "
+                "(CLI: sqgraph-memory commit --token ... < extraction.json) with this exact token."
+            ),
+        }
+
+    def _agent_candidate_nodes(
+        self, group: str, channel: str, text: str, qvec: list[float] | None, author_node: Node | None, limit: int
+    ) -> list[Node]:
+        """Existing entities (visible in ``channel``) the message may be about, best first (at most ``limit``)."""
+        allowed = {channel}
+        scored: dict[str, float] = defaultdict(float)
+        nodes: dict[str, Node] = {}
+
+        def add(n: Node, s: float) -> None:
+            if n.get("group_id") == group and self._entity_visible(n.properties, allowed):
+                scored[n["id"]] = max(scored[n["id"]], s)
+                nodes.setdefault(n["id"], n)
+
+        if author_node is not None:
+            add(author_node, 1000.0)
+        # (a) a name / alias occurring in the message (substring of the separator-free text)
+        ckey = _content_key(text)
+        for r in self.db.query("MATCH (e:Entity {group_id:$g}) WHERE $c IN e.channels RETURN e", {"g": group, "c": channel}):
+            e = r["e"]
+            name, aliases = self._visible_forms(e.properties, allowed)
+            best = max(
+                (
+                    len(k)
+                    for k in (norm_key(f) for f in [name, *aliases])
+                    if k and k in ckey and (len(k) >= 3 or not k.isascii())
+                ),
+                default=0,
+            )
+            if best:
+                add(e, 100.0 + best)
+        # (b) trigram fulltext / term containment / vector similarity of the whole message
+        terms = query_terms(text)[:60]
+        q = fts_or_query(terms)
+        if q:
+            for rank, (n, _) in enumerate(self.db.fulltext_search(ENTITY_FT, q, k=max(limit, 5) * 2)):
+                add(n, 50.0 - rank * 0.1)
+        for rank, n in enumerate(self._match_entities(group, allowed, text, terms, qvec, None, limit=max(limit, 5))):
+            add(n, 40.0 - rank * 0.1)
+        if qvec is not None:
+            for n, s in self.db.vector_search(ENTITY_INDEX, qvec, k=max(limit, 5)):
+                # an entity embedding encodes its summaries: only trust it when every source channel is visible here
+                if s >= 0.5 and set(n.get("summary_channels", [])) <= allowed:
+                    add(n, 20.0 * s)
+        ranked = sorted(scored.items(), key=lambda kv: -kv[1])[:limit]
+        return [nodes[i] for i, _ in ranked]
+
+    def _agent_related_facts(
+        self,
+        group: str,
+        channel: str,
+        text: str,
+        qvec: list[float] | None,
+        occurred_iso: str,
+        entities: list[Node],
+        limit: int,
+    ) -> list[dict[str, Any]]:
+        """Facts valid / scheduled at ``occurred_iso`` and visible in ``channel``: those touching ``entities`` plus
+        vector / fulltext matches of the message, fused with RRF."""
+        if limit <= 0:
+            return []
+        allowed = {channel}
+
+        def ok(f: Relationship) -> bool:
+            return (
+                f.get("group_id") == group
+                and self._fact_visible(f.properties, allowed)
+                and _fact_status(f.properties, occurred_iso) in ("valid", "scheduled")
+            )
+
+        pool: dict[str, Relationship] = {}
+        touching: dict[str, Relationship] = {}
+        for n in entities:
+            for f in self._facts_of_entity(n["id"], group):
+                if ok(f):
+                    touching[f["id"]] = f
+        around = list(touching.values())
+        self._rank_by_similarity(around, qvec)
+        pool.update(touching)
+        lists: list[tuple[float, list[str]]] = [(1.0, [f["id"] for f in around[: limit * 2]])]
+        if qvec is not None:
+            ids = []
+            for f, _ in self.db.vector_search(FACT_INDEX, qvec, k=max(40, limit * 3)):
+                if ok(f):
+                    pool[f["id"]] = f
+                    ids.append(f["id"])
+            lists.append((0.8, ids))
+        q = fts_or_query(query_terms(text)[:60])
+        if q:
+            ids = []
+            for f, _ in self.db.fulltext_search(FACT_FT, q, k=max(40, limit * 3)):
+                if ok(f):
+                    pool[f["id"]] = f
+                    ids.append(f["id"])
+            lists.append((0.8, ids))
+        ranked = sorted(_rrf(lists).items(), key=lambda kv: -kv[1])[:limit]
+        facts = [pool[i] for i, _ in ranked]
+        ents = self._nodes("Entity", {x for f in facts for x in (f.get("subject_id"), f.get("object_id")) if x}, group)
+
+        def ref(eid: str | None) -> dict[str, Any] | None:
+            if not eid or eid not in ents:
+                return None
+            return {"id": eid, "name": self._visible_forms(ents[eid].properties, allowed)[0]}
+
+        return [
+            {
+                "id": f["id"],
+                "fact": f["fact"],
+                "relation": f.get("relation", ""),
+                "subject": ref(f.get("subject_id")) or {"id": f.get("subject_id"), "name": "?"},
+                "object": ref(f.get("object_id")),
+                "valid_at": self._local(f.get("valid_at")),
+                "invalid_at": self._local(f.get("invalid_at")),
+                "status": _fact_status(f.properties, occurred_iso),
+            }
+            for f in facts
+        ]
+
+    def commit_episode(self, token: str, extraction: dict[str, Any] | str) -> EpisodeResult:
+        """Phase 2 of agent extraction: validate the agent's ``extraction`` and write the episode, entities and facts.
+
+        Runs under the write guard (in-process lock + cross-process file lock). The token (see
+        :meth:`prepare_episode`) carries group, source, channel, author, time and text, so nothing is kept on the
+        server between the phases. ``ValueError`` lists every problem of a malformed ``extraction``. The database may
+        have changed since ``prepare_episode``: stale ``duplicate_of`` / ``contradicts`` ids are dropped with a
+        message in ``EpisodeResult.warnings``, and entities marked new (``existing_id`` null) are still merged into an
+        existing entity with the same name / alias. Needs no LLM; embeddings use the configured embedder (none: no vectors).
+        """
+        if self.db.read_only:
+            raise SqgraphError("memory database is read-only")
+        tok = _decode_token(token)
+        group, source, channel = tok["group_id"], tok["source"], tok["channel"]
+        with self._write_guard():
+            if tok["source_ref"]:
+                dup = self._episode_by_ref(group, source, tok["source_ref"])
+                if dup is not None:
+                    return EpisodeResult(dup["id"], skipped=True)
+            work, facts, warnings = self._extraction_to_work(group, tok, extraction)
+            self._finalize_summaries(work, channel)
+            if self.embedder is not None:  # one batched call for the entities needing a vector and the new facts
+                slots: list[tuple[str, Any]] = [("entity", w) for w in work if w.node is None or w.chan_summary is not None]
+                slots += [("fact", f) for f in facts]
+                texts = [self._entity_embed_text(o, channel) if k == "entity" else o["fact"] for k, o in slots]
+                if texts:
+                    for (k, o), v in zip(slots, self.embedder.embed(texts)):
+                        if k == "entity":
+                            o.embedding = v
+                        else:
+                            o["embedding"] = v
+            res = self._commit(
+                group,
+                source,
+                channel,
+                tok["author"],
+                tok["occurred_at"],
+                self._now(),
+                tok["content"],
+                tok["source_ref"],
+                new_id("ep"),
+                work,
+                facts,
+            )
+            res.warnings = warnings
+            return res
+
+    def _extraction_to_work(
+        self, group: str, tok: dict[str, Any], extraction: Any
+    ) -> tuple[list[_WorkEntity], list[dict[str, Any]], list[str]]:
+        """Validate an agent extraction and build what ``_understand`` produces: ``_WorkEntity`` list + fact dicts."""
+        if isinstance(extraction, str):
+            try:
+                extraction = json.loads(extraction)
+            except ValueError as exc:
+                raise ValueError(f"extraction is not valid JSON: {exc}") from None
+        if not isinstance(extraction, dict):
+            raise ValueError('extraction must be a JSON object like {"entities": [...], "facts": [...]}')
+        errors: list[str] = []
+        warnings: list[str] = []
+        channel, occurred_iso = tok["channel"], tok["occurred_at"]
+        ents_in, facts_in = extraction.get("entities") or [], extraction.get("facts") or []
+        if not isinstance(ents_in, list):
+            errors.append("entities must be an array")
+            ents_in = []
+        if not isinstance(facts_in, list):
+            errors.append("facts must be an array")
+            facts_in = []
+
+        # -- entities ---------------------------------------------------------------------------
+        work: list[_WorkEntity] = []
+        refs: dict[str, _WorkEntity] = {}
+        author_name, author_aliases = person_forms(tok["author"]) if tok["author"] else (None, [])
+        if author_name:
+            aw = self._author_entity(author_name, author_aliases, tok["author"])
+            self._resolve_entities(group, [aw], None)
+            work.append(aw)
+            refs["author"] = aw
+
+        def opt_str(v: Any, where: str) -> str | None:
+            if v is None:
+                return None
+            if not isinstance(v, str):
+                errors.append(f"{where} must be a string or null")
+                return None
+            return v.strip() or None
+
+        for i, e in enumerate(ents_in):
+            where = f"entities[{i}]"
+            if not isinstance(e, dict):
+                errors.append(f"{where} must be an object")
+                continue
+            ref, name = opt_str(e.get("ref"), f"{where}.ref"), opt_str(e.get("name"), f"{where}.name")
+            if ref is None:
+                errors.append(f"{where}.ref is required")
+            if name is None:
+                errors.append(f"{where}.name is required")
+            existing_id = opt_str(e.get("existing_id"), f"{where}.existing_id")
+            typ = opt_str(e.get("type"), f"{where}.type")
+            summary = opt_str(e.get("summary"), f"{where}.summary")
+            raw_aliases = e.get("aliases")
+            if raw_aliases is not None and not (isinstance(raw_aliases, list) and all(isinstance(a, str) for a in raw_aliases)):
+                errors.append(f"{where}.aliases must be an array of strings")
+                raw_aliases = None
+            if ref is None or name is None:
+                continue
+            if ref == "author":
+                if author_name:
+                    warnings.append(f'{where}: the author is added automatically; ignored (reference it as "author")')
+                else:
+                    errors.append(f'{where}.ref "author" is reserved (this episode has no author)')
+                continue
+            if ref in refs:
+                errors.append(f"{where}.ref {ref!r} is used twice")
+                continue
+            if typ is not None and typ not in prompts.ENTITY_TYPES:
+                warnings.append(f"{where}: unknown type {typ!r} stored as 'Other'")
+                typ = "Other"
+            forms = list(dict.fromkeys([name, *[a.strip() for a in (raw_aliases or []) if a.strip()]]))
+            keys = {k for k in (norm_key(f) for f in forms) if k}
+            node: Node | None = None
+            if existing_id:
+                node = self._one("MATCH (e:Entity {id:$id}) RETURN e", {"id": existing_id})
+                if node is None:
+                    errors.append(f"{where}.existing_id {existing_id!r} does not exist (use an id from candidate_entities, or null)")
+                    continue
+                if node.get("group_id") != group:
+                    errors.append(f"{where}.existing_id {existing_id!r} belongs to another group")
+                    continue
+            else:  # safety net: the agent may have missed a candidate; the deterministic exact / alias match decides
+                found = (
+                    self._exact_matches(group, keys, typ)
+                    if typ
+                    else list({n["id"]: n for n in (*self._exact_matches(group, keys, "Person"), *self._exact_matches(group, keys, "Other"))}.values())
+                )
+                if len(found) == 1:
+                    node = found[0]
+                    warnings.append(f"{where}: {name!r} matched the existing entity {node['name']!r} ({node['id']}) by name: merged")
+                elif len(found) > 1:
+                    warnings.append(f"{where}: {name!r} matches several existing entities; stored as a new entity (use existing_id)")
+            prev = next(
+                (
+                    w
+                    for w in work
+                    if (node is not None and w.node is not None and w.node["id"] == node["id"]) or w.match_keys & keys
+                ),
+                None,
+            )
+            if prev is not None:  # the same thing declared twice (or the author itself): merge into the first
+                prev.forms += forms
+                prev.match_keys |= keys
+                if summary and prev.new_summary is None:
+                    prev.new_summary = short(summary, 300)
+                refs[ref] = prev
+                continue
+            w = _WorkEntity(
+                len(work),
+                node["name"] if node is not None else name,
+                node.get("type", "Other") if node is not None else (typ or "Other"),
+                "",
+                node=node,
+                forms=forms,
+                match_keys=keys,
+            )
+            if summary:
+                w.new_summary = short(summary, 300)
+            work.append(w)
+            refs[ref] = w
+
+        # -- facts ------------------------------------------------------------------------------
+        facts: list[dict[str, Any]] = []
+
+        def entity_ref(v: Any, where: str, nullable: bool) -> _WorkEntity | None:
+            if v is None or v == "":
+                if not nullable:
+                    errors.append(f"{where} is required")
+                return None
+            if not isinstance(v, str) or v not in refs:
+                hint = ' ("author" is the message author)' if author_name else ""
+                errors.append(f"{where} {v!r} is not a declared entity ref{hint}")
+                return None
+            return refs[v]
+
+        def fact_ids(v: Any, where: str) -> list[str]:
+            if v is None:
+                return []
+            vals = [v] if isinstance(v, str) else v
+            if not isinstance(vals, list) or not all(isinstance(x, str) for x in vals):
+                errors.append(f"{where} must be an array of fact ids")
+                return []
+            return [x.strip() for x in vals if x.strip()]
+
+        def lookup_fact(fid: str, where: str) -> Relationship | None:
+            """The existing fact, or ``None`` (a malformed / foreign-group id is an error, a vanished one a warning)."""
+            if not _FACT_ID_RE.match(fid):
+                errors.append(f"{where}: {fid!r} is not a fact id (copy ids from context.related_facts)")
+                return None
+            edge = self._fact_edge(fid)
+            if edge is None:
+                warnings.append(f"{where}: fact {fid} no longer exists; ignored")
+                return None
+            if edge.get("group_id") != group:
+                errors.append(f"{where}: fact {fid} belongs to another group")
+                return None
+            return edge
+
+        seen: set[str] = set()
+        for j, f in enumerate(facts_in):
+            where = f"facts[{j}]"
+            if not isinstance(f, dict):
+                errors.append(f"{where} must be an object")
+                continue
+            n_err = len(errors)
+            subj = entity_ref(f.get("subject"), f"{where}.subject", False)
+            obj = entity_ref(f.get("object"), f"{where}.object", True)
+            fact_text = opt_str(f.get("fact"), f"{where}.fact")
+            if fact_text is None:
+                errors.append(f"{where}.fact is required")
+            rel_raw = opt_str(f.get("relation"), f"{where}.relation")
+            rel = "_".join((rel_raw or "RELATES_TO").upper().replace("-", "_").split())
+            times: list[str | None] = []
+            for key in ("valid_at", "invalid_at"):
+                raw = f.get(key)
+                if raw is None or raw == "":
+                    times.append(None)
+                    continue
+                dt = parse_time(raw, self.tz) if isinstance(raw, (str, datetime)) else None
+                if dt is None:
+                    errors.append(f"{where}.{key} {raw!r} cannot be parsed (use ISO 8601, e.g. 2026-09-17 or 2026-09-14T09:00)")
+                    times.append(None)
+                else:
+                    times.append(to_iso(dt))
+            va, ia = times[0] or occurred_iso, times[1]
+            if ia is not None and ia <= va:
+                warnings.append(f"{where}: invalid_at is not after valid_at; ignored")
+                ia = None
+            modality = f.get("modality")
+            if modality is None or modality == "":
+                modality = "definite"
+            elif modality not in _MODALITIES:
+                errors.append(f"{where}.modality {modality!r} must be one of {', '.join(_MODALITIES)}")
+                modality = "definite"
+            conf = f.get("confidence")
+            if conf is None:
+                conf = _DEFAULT_CONFIDENCE[modality]
+            elif isinstance(conf, bool) or not isinstance(conf, (int, float)) or not 0 <= conf <= 1:
+                errors.append(f"{where}.confidence {conf!r} must be a number between 0 and 1")
+                conf = _DEFAULT_CONFIDENCE[modality]
+            dup_ids = fact_ids(f.get("duplicate_of"), f"{where}.duplicate_of")
+            if len(dup_ids) > 1:
+                errors.append(f"{where}.duplicate_of must be a single fact id")
+            duplicate_of: str | None = None
+            if dup_ids:
+                edge = lookup_fact(dup_ids[0], f"{where}.duplicate_of")
+                if edge is not None:
+                    if channel not in edge.get("channels", []):
+                        warnings.append(
+                            f"{where}.duplicate_of: fact {edge['id']} belongs to another channel; stored as a separate fact"
+                        )
+                    elif _fact_status(edge.properties, occurred_iso) == "ended":
+                        warnings.append(f"{where}.duplicate_of: fact {edge['id']} has already ended; stored as a new fact")
+                    else:
+                        duplicate_of = edge["id"]
+            contradicts: list[str] = []
+            for cid in dict.fromkeys(fact_ids(f.get("contradicts"), f"{where}.contradicts")):
+                edge = lookup_fact(cid, f"{where}.contradicts")
+                if edge is None:
+                    continue
+                if edge.get("invalid_at") is not None:
+                    warnings.append(f"{where}.contradicts: fact {cid} is no longer valid (already ended); left unchanged")
+                else:
+                    contradicts.append(cid)
+            if duplicate_of and contradicts:
+                warnings.append(f"{where}: a duplicate contradicts nothing; contradicts ignored")
+                contradicts = []
+            if len(errors) > n_err or subj is None or fact_text is None:
+                continue
+            if fact_text in seen:  # identical sentences within one message
+                continue
+            seen.add(fact_text)
+            facts.append(
+                {
+                    "subject": subj.idx,
+                    "object": obj.idx if obj is not None else None,
+                    "fact": fact_text,
+                    "relation": rel,
+                    "valid_at": va,
+                    "invalid_at": ia,
+                    "modality": modality,
+                    "confidence": float(conf),
+                    "duplicate_of": duplicate_of,
+                    "contradicts": contradicts,
+                }
+            )
+        if errors:
+            raise ValueError(
+                f"invalid extraction ({len(errors)} problem{'s' if len(errors) != 1 else ''}):\n- " + "\n- ".join(errors)
+            )
+        return work, facts, warnings
 
     # -- pipeline ---------------------------------------------------------------------------
 
@@ -1213,8 +1805,9 @@ class Memory:
             "episode_ids": [episode_id],
             "confidence": f["confidence"],
             "modality": f["modality"],
-            "embedding": f["embedding"],
         }
+        if f.get("embedding") is not None:
+            props["embedding"] = f["embedding"]
         if obj is not None:
             props["object_id"] = obj["id"]
         if ia is not None:

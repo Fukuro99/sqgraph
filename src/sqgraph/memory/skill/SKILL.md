@@ -6,8 +6,8 @@ description: Personal long-term memory shared by all agents on this machine (tem
 # sqgraph-memory: the user's personal long-term memory
 
 A temporal knowledge graph on one local SQLite file, shared by every agent on this machine (Claude Code, Codex,
-Cursor, Claude Desktop, ...). Text you add is analysed by an LLM into entities and facts. Facts have validity
-periods: when something changes ("I moved to Osaka"), the old fact is marked as superseded (kept as history), not
+Cursor, Claude Desktop, ...). When you add something, YOU turn it into entities and facts (there is no LLM on the
+server and no API key to set up). Facts have validity periods: when something changes ("I moved to Osaka"), the old fact is marked as superseded (kept as history), not
 overwritten. Anything one agent stores is visible to all the others.
 
 ## When to search
@@ -35,7 +35,31 @@ How to write it:
 - Do NOT store chit-chat, transient task details (current file, stack trace, todo of this session), things already
   in the repository, or guesses you made. When unsure whether it is lasting, ask the user.
 - NEVER store secrets: passwords, API keys, tokens, private keys, personal ID numbers.
-- A write takes a few seconds (LLM extraction). Do not add in a tight loop; batch related points into one sentence.
+- Adding is two calls (below). Do not add in a tight loop; batch related points into one note.
+
+### How an add works: you are the extractor
+
+1. `add_memory(content, source="<your agent name>", author="user")` stores NOTHING yet. It returns `token`,
+   `instructions`, `schema` and `context` (the note, recent notes, existing `candidate_entities`, currently valid
+   `related_facts`). If it says `already_stored`, or returns counts instead of a token (a server that extracts by itself), you are done.
+2. Read `instructions` and `context`, then write the `extraction` JSON yourself (`schema`) and call
+   `commit_memory(token, extraction)` with the token unchanged:
+
+```json
+{"entities": [{"ref": "e1", "name": "pnpm", "type": "Service", "existing_id": null,
+               "summary": "JS package manager the user prefers"}],
+ "facts": [{"subject": "author", "object": "e1", "relation": "PREFERS",
+            "fact": "ユーザーは npm ではなく pnpm を使ってほしい", "valid_at": null, "invalid_at": null,
+            "modality": "definite", "confidence": 0.95, "duplicate_of": null, "contradicts": []}]}
+```
+
+- `"author"` is the user (already exists); never list it. One self-contained sentence per fact, in the user's language.
+- Same thing as a `candidate_entities` entry (alias, other spelling)? Set `existing_id` to its id instead of creating a duplicate.
+- A `related_facts` entry that is no longer true because of this note (new owner, changed preference, cancelled plan)?
+  Put its id in `contradicts`; it is closed, not deleted. One that this note merely restates: `duplicate_of`.
+- `valid_at` / `invalid_at`: ISO dates computed from the note's time ("来週から", "9/14-9/16"); null = the note's time.
+- Do not invent facts that are not in the content. Nothing worth keeping is fine: `{}` stores just the note.
+- If `commit_memory` reports problems with the JSON, fix them and call it again with the same token.
 
 ## When to forget
 
@@ -49,8 +73,9 @@ Prefer the MCP tools when the `sqgraph-memory` MCP server is connected:
 - `search_memory(query, as_of?, include_invalid?, center_entity?)` -- facts with validity, status and sources
 - `get_entity(name_or_id)` -- full timeline of one person/project/thing; `search_entities(query)` to resolve a name
 - `get_episodes(entity?, query?)` -- the original stored notes
-- `add_memory(content, source="<your agent name>", author="user")` -- `source` is `claude-code`, `codex`, `cursor`, ...;
-  `author` defaults to "claude", so pass `author="user"` when recording what the user said or decided
+- `add_memory(content, source="<your agent name>", author="user")` then `commit_memory(token, extraction)` -- see
+  above; `source` is `claude-code`, `codex`, `cursor`, ...; `author` defaults to "claude", so pass `author="user"`
+  when recording what the user said or decided
 - `forget_memory(..., dry_run=true)` first, then again without `dry_run` after the user confirms
 
 Otherwise use the CLI (JSON on stdout; `--compact` for one line):
@@ -58,7 +83,8 @@ Otherwise use the CLI (JSON on stdout; `--compact` for one line):
 ```bash
 sqgraph-memory search "preferred package manager" [--history] [--as-of 2026-07-01] [--center Taro]
 sqgraph-memory entity "Taro"
-sqgraph-memory add --source <agent-name> "ユーザーは Python のパッケージ管理に uv を使う"
+sqgraph-memory add --source <agent-name> "ユーザーは Python のパッケージ管理に uv を使う"   # prints token + context
+sqgraph-memory commit --token <token> < extraction.json      # or pipe {"token": ..., "extraction": {...}} on stdin
 sqgraph-memory forget --fact <id> --dry-run        # also: --episode ID, --entity NAME, --since/--until
 sqgraph-memory forget --fact <id>                  # after the user confirmed
 ```

@@ -177,18 +177,18 @@ def test_server_registers_tools_according_to_policy(db_path):
     t, mem = tools_for(db_path, group_id=G)
     full = _tool_names(build_server(t))
     assert full == {
-        "add_memory", "forget_memory", "search_memory", "search_entities", "get_entity", "get_episodes", "get_schema", "read_cypher",
+        "add_memory", "commit_memory", "forget_memory", "search_memory", "search_entities", "get_entity", "get_episodes", "get_schema", "read_cypher",
     }
     mem.close()
 
     t2, mem2 = tools_for(db_path, group_id=G, allowed_channels=["pub"])
     names2 = _tool_names(build_server(t2))
-    assert "read_cypher" not in names2 and "forget_memory" not in names2 and "add_memory" in names2  # no forgetting under channel ACLs
+    assert "read_cypher" not in names2 and "forget_memory" not in names2 and "add_memory" in names2 and "commit_memory" in names2  # no forgetting under channel ACLs
     mem2.close()
 
     t3, mem3 = tools_for(db_path, group_id=G, read_only=True, db_read_only=True)
     names = _tool_names(build_server(t3))
-    assert "add_memory" not in names and "forget_memory" not in names and "search_memory" in names
+    assert "add_memory" not in names and "commit_memory" not in names and "forget_memory" not in names and "search_memory" in names
     mem3.close()
 
 

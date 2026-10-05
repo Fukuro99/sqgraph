@@ -9,4 +9,4 @@ litestream restore -config /etc/litestream.yml -if-db-not-exists -if-replica-exi
 # アプリを子プロセスとして起動し、動いている間ずっとレプリケーションする
 exec litestream replicate -config /etc/litestream.yml -exec "python -m sqgraph.memory.mcp \
   --db $DB_PATH --transport streamable-http --host 0.0.0.0 --port 8000 \
-  --group-id ${GROUP_ID:-main} ${MCP_EXTRA_ARGS}"
+  --group-id ${GROUP_ID:-main} --extractor ${EXTRACTOR:-openai} ${MCP_EXTRA_ARGS}"

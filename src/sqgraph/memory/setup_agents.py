@@ -39,7 +39,7 @@ Runner = Callable[[list[str]], "tuple[int, str, str]"]
 
 # --------------------------------------------------------------------------- helpers
 
-FORWARD_ENV = ("SQGRAPH_MEMORY_HOME", "SQGRAPH_MEMORY_DB", "SQGRAPH_MEMORY_GROUP")
+FORWARD_ENV = ("SQGRAPH_MEMORY_HOME", "SQGRAPH_MEMORY_DB", "SQGRAPH_MEMORY_GROUP", "SQGRAPH_MEMORY_EXTRACTOR")
 
 
 def forwarded_env(environ: Any = None) -> dict[str, str]:
@@ -51,7 +51,7 @@ def forwarded_env(environ: Any = None) -> dict[str, str]:
         v = src.get(k)
         if not v:
             continue
-        out[k] = v if k == "SQGRAPH_MEMORY_GROUP" else os.path.abspath(os.path.expanduser(v))
+        out[k] = v if k in ("SQGRAPH_MEMORY_GROUP", "SQGRAPH_MEMORY_EXTRACTOR") else os.path.abspath(os.path.expanduser(v))
     return out
 
 

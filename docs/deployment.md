@@ -127,11 +127,12 @@ litestream restore -config /etc/litestream.yml -if-db-not-exists -if-replica-exi
 # アプリを子プロセスとして起動し、動いている間ずっとレプリケーションする
 exec litestream replicate -config /etc/litestream.yml -exec "python -m sqgraph.memory.mcp \
   --db $DB_PATH --transport streamable-http --host 0.0.0.0 --port 8000 \
-  --group-id ${GROUP_ID:-main} ${MCP_EXTRA_ARGS}"
+  --group-id ${GROUP_ID:-main} --extractor ${EXTRACTOR:-openai} ${MCP_EXTRA_ARGS}"
 ```
 
 - `--host 0.0.0.0` はコンテナの外から届くようにするためです。**MCP サーバー自体には認証が無い**ので、必ず [6 章](#6-mcp-サーバーを公開するときの認証) の方法で前段に認証を置いてください。
 - `OPENAI_API_KEY` は環境変数で渡します (Secrets Manager / Cloudflare のシークレットから注入)。`.env` をイメージに焼き込まないでください。
+- 共有サーバーは `--extractor openai` (`EXTRACTOR` 環境変数で変更可) で起動します。MCP の既定は `agent` (呼び出したエージェントが抽出して `commit_memory` で保存。OpenAI キー不要) です。
 
 ### 3.4 読み取り用スナップショットの作り方 (パターン B / C)
 
@@ -184,7 +185,7 @@ conn.close()
 Environment=DB_PATH=/data/memory.db
 EnvironmentFile=/etc/sqgraph/env            # OPENAI_API_KEY=... (権限 600)
 ExecStart=/usr/local/bin/litestream replicate -config /etc/litestream.yml \
-  -exec "/opt/sqgraph/.venv/bin/python -m sqgraph.memory.mcp --db /data/memory.db --transport streamable-http --host 127.0.0.1 --port 8000 --group-id main"
+  -exec "/opt/sqgraph/.venv/bin/python -m sqgraph.memory.mcp --db /data/memory.db --transport streamable-http --host 127.0.0.1 --port 8000 --group-id main --extractor openai"
 Restart=always
 ```
 

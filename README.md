@@ -303,6 +303,42 @@ print(tracker.summary("run"))
 
 取り込み 1 件あたりの LLM 呼び出しは通常 2〜4 回です: ① エンティティ抽出 (直近の同チャンネル発言を文脈として渡し「それ」等を解決。覚えるべき事実が無い発言はここで打ち切り) → ② 既存エンティティとの同一判定 (完全一致・エイリアス一致は LLM 不要。曖昧な名前だけ、ベクトル / 全文 / 完全一致の候補をまとめて 1 回で判定) → ③ ファクト抽出 + エンティティ要約更新 → ④ 重複 / 矛盾判定 (関連する既存の有効ファクトがある時だけ)。埋め込みは 1 件につき 1〜2 回のバッチ呼び出しで、DB への書き込みは 1 トランザクションです。取り込みは内部ロックで直列化されます (bot ではキューに積む想定)。
 
+#### エージェント抽出 (サーバー側に LLM を持たない 2 段階モード)
+
+`add_episode` は OpenAI などの LLM がサーバー側でエンティティ・ファクトを抽出します (bot 向け)。**呼び出し側のエージェント自身 (Claude など) に抽出させる**場合は、状態を持たない 2 段階の API を使います。LLM も OpenAI キーも要りません (埋め込みだけ設定した埋め込みエンドポイントを使います)。
+
+```python
+mem = Memory("memory.db", None, embedder, default_group_id="me")      # llm は不要
+
+# 1 段階目: 書き込みなし・書き込みロックなし・LLM なし
+prep = mem.prepare_episode("来週から pnpm を使ってほしい", source="claude-code", channel="personal", author="user",
+                           occurred_at="2026-10-05 10:00", source_ref=None)
+# prep["already_stored"] (同じ (source, source_ref) が取り込み済みなら True + episode_id)
+# prep["token"]         自己完結した不透明な文字列 (グループ・出典・チャンネル・著者・時刻・本文を含む。サーバーは何も覚えない)
+# prep["instructions"]  エージェントへの抽出ルール (短い)      prep["schema"]  extraction の JSON Schema
+# prep["context"]       message / author_ref / recent / candidate_entities / related_facts (すべて LLM なしで計算)
+
+# エージェントが context を読んで extraction を作る (下のスキーマ)
+res = mem.commit_episode(prep["token"], extraction)                  # 書き込みロックの下で検証して保存
+# res.facts_created / facts_duplicate / facts_invalidated / res.warnings (サーバーが捨てた・統合したもの)
+```
+
+`context`: `message` (本文・著者・ローカル時刻と曜日・チャンネル)、`author_ref` (著者はエージェントが `"author"` で参照できる。既存なら `existing_id`)、`recent` (同じチャンネルの直前の発言)、`candidate_entities` (本文に出てくる名前 / エイリアスの一致、trigram 全文、ベクトル検索、著者から選んだ既存エンティティ。最大 `max_entities` 件、各 `{id, name, type, aliases, summary}`)、`related_facts` (候補エンティティに触れる、メッセージ時刻に有効 / 予定の既存ファクトと、本文に近いファクト。最大 `max_facts` 件)。情報はそのチャンネルから見えるものだけです (上の ACL と同じ。`related_facts` は全て同じチャンネルのファクトなので `duplicate_of` に使えます)。
+
+`extraction` のスキーマ (`prep["schema"]`):
+
+```json
+{"entities": [{"ref": "e1", "name": "pnpm", "type": "Service", "existing_id": null,
+               "summary": "JS package manager the user prefers", "aliases": []}],
+ "facts": [{"subject": "author", "object": "e1", "relation": "PREFERS",
+            "fact": "ユーザーは npm ではなく pnpm を使ってほしい", "valid_at": null, "invalid_at": null,
+            "modality": "definite", "confidence": 0.95, "duplicate_of": null, "contradicts": []}]}
+```
+
+`existing_id` は `candidate_entities` の id (同一物なら再利用)、`subject` / `object` は `ref` か `"author"` (属性ファクトは `object: null`)、`valid_at` が null ならメッセージ時刻、時刻は ISO 8601 (ローカル時刻 / `Z` 付き / 日付のみ)、`duplicate_of` は言い直しの既存ファクト id (同一チャンネルのみ)、`contradicts` はこの発言で成り立たなくなった有効なファクトの id (古い方が失効し `superseded_by` で結ばれる。意味は OpenAI パイプラインと同一です。内部で同じ `_commit` / `_write_fact` / `_invalidate` を使います)。要約は `summary` がそのエンティティのチャンネルの要約行になります。空の extraction (`{}`) は発言 (と著者の言及) だけを保存します。
+
+`commit_episode` は `ValueError` で不正な箇所を**すべて**列挙します (未定義の ref、存在しない / 別グループの `existing_id`、`fact_` の形でない id、解釈できない時刻、不正な `modality` / `confidence` など)。2 段階の間に DB が変わっていてもよいように、既に存在しない `duplicate_of` / `contradicts`、別チャンネルのファクトへの `duplicate_of`、失効済みのファクトは捨てて `res.warnings` に記録します。`existing_id: null` の新規エンティティでも、決定的な完全一致 / エイリアス一致 (型が両立するもの) があれば既存エンティティに統合します (重複を防ぐ安全網)。トークンの改ざん・破損・切り詰めは `invalid token` として拒否されます。
+
 プロバイダは `LLMProvider` (`complete_json` / `complete_text`) と `Embedder` (`embed`, `dimensions`) の Protocol です。実 API を使わない決定的な `FakeLLM` / `FakeEmbedder` が付属します (`tests/test_memory*.py` 参照)。
 
 ### アクセス制御 (チャンネル ACL)
@@ -324,7 +360,7 @@ print(tracker.summary("run"))
 
 ```bash
 python -m sqgraph.memory.mcp --db memory.db [--group-id G] [--allowed-channels a,b] [--read-only] \
-       [--transport stdio|streamable-http] [--host 127.0.0.1] [--port 8000] [--env-file .env]
+       [--extractor agent|openai] [--transport stdio|streamable-http] [--host 127.0.0.1] [--port 8000] [--env-file .env]
 ```
 
 | ツール | 使いどころ |
@@ -333,12 +369,15 @@ python -m sqgraph.memory.mcp --db memory.db [--group-id G] [--allowed-channels a
 | `search_entities` | 名前・エイリアスの解決、存在する人 / サービスの列挙 |
 | `get_entity` | 1 エンティティの全履歴 (失効分含むタイムライン) と関連エンティティ |
 | `get_episodes` | 元の発言の確認、前後の会話の確認 |
-| `add_memory` | 決定・担当・状態変化・予定など長期的に覚えるべきことの記録 (`--read-only` では無効) |
+| `add_memory` | 決定・担当・状態変化・予定・好みなど長期的に覚えるべきことの記録 (`--read-only` では無効)。`--extractor agent` (既定) では**何も保存せず**、`token` / `instructions` / `schema` / `context` を返す。`openai` ではサーバー側の LLM で抽出して保存する |
+| `commit_memory` | `agent` モードの 2 段階目。`add_memory` の `token` と、エージェントが作った `extraction` を渡して保存する (`openai` モードでも使える。`--read-only` では無効) |
 | `forget_memory` | エピソード / ファクト / エンティティ / 期間を指定した削除 (`dry_run` で影響範囲の確認)。書き込み可能で `--allowed-channels` なしのときだけ登録される |
 | `get_schema` | ラベル / 関係タイプ / インデックス / 件数と Cypher サブセットの説明 |
 | `read_cypher` | 読み取り専用 Cypher (行数 / 文字数 / 時間の制限つき)。上記で足りない集計・結合用 |
 
-サーバー側で強制する設定: `--group-id` を指定すると名前空間が固定され (他の `group_id` は拒否)、`--allowed-channels` を指定すると全ての読み取りがそのチャンネルに制限され (呼び出し側は狭めることしかできない)、`add_memory` も許可チャンネルにしか書けません。**`read_cypher` は ACL を迂回する生アクセスなので、`--allowed-channels` 指定時は既定で無効**です (`--allow-cypher` で明示的に有効化できます)。`--read-only` では DB を読み取り専用で開き `add_memory` を登録しません。`streamable-http` は認証を持たないので、既定の `127.0.0.1` のまま使うか、リバースプロキシで保護してください。
+`--extractor` (既定 `agent`) は、`add_memory` のエンティティ・ファクト抽出を誰が行うかです。`agent` ではサーバーに LLM も OpenAI キーも要らず、呼び出したエージェント自身が `instructions` に従って `extraction` を作り `commit_memory` を呼びます (「エージェント抽出」参照。MCP の sampling には依存しません)。`openai` は従来どおり `add_memory` 1 回で OpenAI の LLM が抽出します (bot 向け。`OPENAI_API_KEY` が必要で、無いと `add_memory` はエラーになります)。
+
+サーバー側で強制する設定: `--group-id` を指定すると名前空間が固定され (他の `group_id` は拒否)、`--allowed-channels` を指定すると全ての読み取りがそのチャンネルに制限され (呼び出し側は狭めることしかできない)、`add_memory` / `commit_memory` も許可チャンネルにしか書けません (`commit_memory` はトークンのチャンネルとグループを検査します)。**`read_cypher` は ACL を迂回する生アクセスなので、`--allowed-channels` 指定時は既定で無効**です (`--allow-cypher` で明示的に有効化できます)。`--read-only` では DB を読み取り専用で開き `add_memory` / `commit_memory` を登録しません。`streamable-http` は認証を持たないので、既定の `127.0.0.1` のまま使うか、リバースプロキシで保護してください。
 
 Claude Code への登録:
 
@@ -349,7 +388,7 @@ claude mcp add sqgraph-memory-backend -- python -m sqgraph.memory.mcp --db /path
     --group-id my-guild --allowed-channels backend,infra
 ```
 
-`.mcp.json` の例 (`OPENAI_API_KEY` は環境変数、または `--env-file` の `.env` から読みます):
+`.mcp.json` の例 (`--extractor openai` のときだけ `OPENAI_API_KEY` を環境変数、または `--env-file` の `.env` から読みます):
 
 ```json
 {
@@ -368,12 +407,16 @@ claude mcp add sqgraph-memory-backend -- python -m sqgraph.memory.mcp --db /path
 
 同じマシンのローカルエージェント (Claude Code / Codex CLI / Cursor / Claude Desktop) が **1 つの SQLite ファイルを共有する個人用の長期記憶**として使うための配布形態です。Python だけで入ります (Node / Docker は不要)。
 
+**抽出は呼び出したエージェント自身が行います (既定の `extractor: "agent"`)**: 記憶するとき、エージェントは `add_memory` (CLI は `add`) で `instructions` と `context` (既存の候補エンティティ・関連する有効ファクト) を受け取り、自分で `extraction` JSON を作って `commit_memory` (CLI は `commit`) で保存します。**OpenAI キーは不要**で、サーバー側に LLM はありません (埋め込みだけ LAN のサーバーなどに任せられます)。bot のように 1 回の呼び出しで OpenAI に抽出させたいときは `--extractor openai` を使います。
+
 ```bash
 uv tool install "sqgraph[mcp]"      # または pipx install "sqgraph[mcp]"
 # GitHub から: uv tool install "sqgraph[mcp] @ git+https://github.com/<owner>/sqgraph"
 
-sqgraph-memory init                 # ~/.sqgraph-memory を作成。OPENAI_API_KEY は環境変数 or 対話入力 (非表示)
-#   CI など非対話: echo "$OPENAI_API_KEY" | sqgraph-memory init --api-key-stdin
+sqgraph-memory init                 # ~/.sqgraph-memory を作成 (抽出はエージェント: OpenAI キーは聞かれない)
+sqgraph-memory init --embed-base-url http://192.168.1.20:1234/v1 --embed-model <モデル名>   # 埋め込みを LAN のサーバーで (下記)
+#   OpenAI の LLM で抽出したいとき: sqgraph-memory init --extractor openai   (キーは環境変数 or 対話入力 (非表示))
+#   非対話: echo "$OPENAI_API_KEY" | sqgraph-memory init --extractor openai --api-key-stdin
 sqgraph-memory setup                # 検出したエージェントに MCP サーバーと Skill を登録
 sqgraph-memory doctor [--online]    # 環境・DB・登録状況の診断 (失敗があれば終了コード 1)
 ```
@@ -395,28 +438,39 @@ sqgraph-memory doctor [--online]    # 環境・DB・登録状況の診断 (失�
 
 | コマンド | 内容 |
 |---|---|
-| `init [--api-key-stdin] [--group-id G] [--tz TZ] [--embed-base-url URL] [--embed-model M] [--embed-dimensions N] [--no-probe]` | ホーム・設定・`.env` を作る (キーは引数で渡せません)。`--embed-base-url` で埋め込みを別サーバーにできます (下の「埋め込みを LAN 内のサーバーで動かす」) |
-| `add TEXT\|- [--source claude-code] [--author user] [--channel personal] [--occurred-at T] [--source-ref R]` | 覚える (LLM による抽出で数秒かかる。`-` は stdin) |
+| `init [--extractor agent\|openai] [--api-key-stdin] [--group-id G] [--tz TZ] [--embed-base-url URL] [--embed-model M] [--embed-dimensions N] [--no-probe]` | ホーム・設定を作る (キーは引数で渡せません。OpenAI キーを聞くのは `--extractor openai` のときだけ)。`--embed-base-url` で埋め込みを別サーバーにできます (下の「埋め込みを LAN 内のサーバーで動かす」) |
+| `add TEXT\|- [--source claude-code] [--author user] [--channel personal] [--occurred-at T] [--source-ref R]` | 覚える。`agent` モード (既定) は何も保存せず、`token` / `instructions` / `schema` / `context` の JSON を出力 (`-` は stdin)。`openai` モードは LLM による抽出まで行って保存 (数秒) |
+| `commit [--token T] [--extraction FILE\|-]` | `agent` モードの 2 段階目。`add` の `token` と、エージェントが作った extraction JSON (stdin か `--extraction FILE`。`{"token": ..., "extraction": {...}}` を 1 つの JSON で stdin に渡してもよい) で保存し、作成 / 重複 / 失効の件数と `warnings` を返す |
 | `search QUERY [--limit N] [--as-of T] [--history] [--center ENTITY]` | ファクト検索 (予定のファクトも含む。`--history` で失効分も) |
 | `entity NAME` / `entities QUERY` / `episodes [--entity E] [--query Q]` / `stats` | プロファイルと履歴 / 名前解決 / 元のメモ / 件数 |
 | `forget (--episode ID \| --source-ref REF [--source S] \| --fact ID \| --entity NAME [--keep-episodes] \| --since/--until/--channel [--source S]) [--dry-run]` | 削除 (対象の種類はちょうど 1 つ) |
 | `purge --yes [--dry-run]` | 設定中の group の全記憶を削除 |
-| `config [--embed-base-url URL\|openai] [--embed-model M] [--embed-dimensions N] [--llm-model M] [--group-id G] [--tz TZ] [--embed-api-key-env NAME] [--no-probe]` | 設定を表示 (秘密は出しません) / 変更。埋め込みの設定を変えるとエンドポイントを確認し、DB の埋め込みと合わないときは `reembed` を促します |
+| `config [--extractor agent\|openai] [--embed-base-url URL\|openai] [--embed-model M] [--embed-dimensions N] [--llm-model M] [--group-id G] [--tz TZ] [--embed-api-key-env NAME] [--no-probe]` | 設定を表示 (秘密は出しません) / 変更。埋め込みの設定を変えるとエンドポイントを確認し、DB の埋め込みと合わないときは `reembed` を促します |
 | `reembed [--yes] [--batch-size N] [--progress]` | すべてのエンティティとファクトの埋め込みを、設定中の埋め込みモデルで作り直す (`--yes` なしは計画の表示だけ) |
-| `mcp [--transport stdio\|streamable-http] [--read-only]` | MCP サーバー (エージェントが起動する。設定ファイルの DB / group / モデル / 埋め込みエンドポイントを自動で渡す) |
-| `setup` / `doctor [--online]` | 上記 (`doctor` は埋め込みの接続先・モデル・次元と、DB に記録された埋め込みとの一致も報告。`--online` で実際に 1 回呼びます) |
+| `mcp [--transport stdio\|streamable-http] [--read-only] [--extractor agent\|openai]` | MCP サーバー (エージェントが起動する。設定ファイルの DB / group / extractor / モデル / 埋め込みエンドポイントを自動で渡す) |
+| `setup` / `doctor [--online]` | 上記 (`doctor` は extractor、埋め込みの接続先・モデル・次元と、DB に記録された埋め込みとの一致も報告。`agent` モードでは OpenAI キーの確認は `skip`。`--online` で実際に 1 回呼びます) |
 
-`python -m sqgraph.memory` でも同じです。API キーがないときも `search` / `entity` / `episodes` / `stats` / `forget` は動き (ベクトル検索だけ無効になり `warning` が付きます)、LLM が要るのは `add` だけです。埋め込みを LAN のサーバーに任せている場合は OpenAI のキーなしでもベクトル検索が動きます。
+`python -m sqgraph.memory` でも同じです。既定の `agent` モードでは OpenAI の LLM を一切使わないので、キーなしで `add` / `commit` / `search` / `entity` / `episodes` / `stats` / `forget` がすべて動きます (OpenAI の埋め込みを使う場合と、埋め込みエンドポイントが無い場合は、ベクトル検索だけが無効になり `warning` が付きます。LAN の埋め込みサーバーなら キーなしでベクトル検索も動きます)。LLM のキーが要るのは `--extractor openai` の `add` だけです。
+
+**`add` → `commit` の流れ (CLI)**:
+
+```bash
+sqgraph-memory add --source claude-code "来週から Osaka に引っ越します。pnpm を使ってほしい" > prep.json
+#   prep.json の instructions と context を読んで、extraction.json を作る (エージェントの仕事)
+sqgraph-memory commit --token "$(jq -r .token prep.json)" --extraction extraction.json
+```
+
+`token` は自己完結しているので、別のプロセスから `commit` しても動きます。同じ `--source-ref` を 2 回 `add` / `commit` しても、保存されるのは 1 回だけです。
 
 **全エージェントで 1 ファイルを共有**: 全員が `~/.sqgraph-memory/memory.db` を開き、書き込みは `memory.db.lock` のクロスプロセスのファイルロックで直列化されます (複数のエージェントが同時に `add` しても壊れず、待ち時間は `lock_timeout` まで)。あるエージェントが覚えたことは他のエージェントからも検索できます。MCP サーバーは `--group-id` を設定ファイルの値に固定して起動します。
 
-**忘れる**: `forget` / `purge` / MCP の `forget_memory` は、DB から対象のエピソード・ファクト・孤立したエンティティを消し、残ったエンティティの要約と埋め込みを再計算します (削除されたファクトに失効させられていたファクトは有効に戻ります)。削除後は SQLite の `secure_delete` と WAL チェックポイントで、消した本文が DB ファイルにそのまま残らないようにします。`--dry-run` で何が消えるか確認できます。次のものは対象外です: DB ファイルの外にあるコピー (バックアップ、クラウド同期、Litestream など)、およびエピソードを取り込むときに OpenAI API へ送った内容 (OpenAI のポリシーに従って保持されます)。
+**忘れる**: `forget` / `purge` / MCP の `forget_memory` は、DB から対象のエピソード・ファクト・孤立したエンティティを消し、残ったエンティティの要約と埋め込みを再計算します (削除されたファクトに失効させられていたファクトは有効に戻ります)。削除後は SQLite の `secure_delete` と WAL チェックポイントで、消した本文が DB ファイルにそのまま残らないようにします。`--dry-run` で何が消えるか確認できます。次のものは対象外です: DB ファイルの外にあるコピー (バックアップ、クラウド同期、Litestream など)、エピソードを取り込むときに OpenAI API へ送った内容 (`--extractor openai` のとき。OpenAI のポリシーに従って保持されます)、および呼び出したエージェント (LLM) が `add` の結果として読んだ内容 (そのエージェントの会話ログ)。
 
-**データの場所と権限**: 既定は `~/.sqgraph-memory/` (`SQGRAPH_MEMORY_HOME` で変更)。中身は `memory.db`、`.env` (`OPENAI_API_KEY=...`)、`config.json` (`group_id` 既定 `me`、`tz` 既定 `Asia/Tokyo`、`llm_model`、`embed_model`、`embed_base_url` 既定 null = OpenAI API、`embed_dimensions` 既定 null = OpenAI なら 1536 / カスタムなら自動検出して保存、`embed_api_key_env` 既定 `SQGRAPH_EMBED_API_KEY`、`db`) です。POSIX ではディレクトリを 0700、ファイルを 0600 で作ります (Windows ではユーザープロファイルの ACL に任せます)。`SQGRAPH_MEMORY_DB` / `SQGRAPH_MEMORY_GROUP` で DB と group を上書きできます。`setup` 実行時にこれら (と `SQGRAPH_MEMORY_HOME`) が設定されていれば、パスは絶対パスにして各エージェントの登録 (`env`) に引き継ぎます (`--dry-run` の出力にも表示)。API キーの値は出力にもログにも出しません。エージェントは MCP サーバーをシェルの環境変数なしで起動するため、キーは `.env` から読みます。
+**データの場所と権限**: 既定は `~/.sqgraph-memory/` (`SQGRAPH_MEMORY_HOME` で変更)。中身は `memory.db`、`.env` (`OPENAI_API_KEY=...`。`extractor: "openai"` か OpenAI の埋め込みを使うときだけ)、`config.json` (`group_id` 既定 `me`、`tz` 既定 `Asia/Tokyo`、`extractor` 既定 `agent` (`agent` / `openai`。フィールドの無い既存の設定も `agent` として扱う)、`llm_model` (`openai` モード用)、`embed_model`、`embed_base_url` 既定 null = OpenAI API、`embed_dimensions` 既定 null = OpenAI なら 1536 / カスタムなら自動検出して保存、`embed_api_key_env` 既定 `SQGRAPH_EMBED_API_KEY`、`db`) です。POSIX ではディレクトリを 0700、ファイルを 0600 で作ります (Windows ではユーザープロファイルの ACL に任せます)。`SQGRAPH_MEMORY_DB` / `SQGRAPH_MEMORY_GROUP` / `SQGRAPH_MEMORY_EXTRACTOR` で DB・group・extractor を上書きできます。`setup` 実行時にこれら (と `SQGRAPH_MEMORY_HOME`) が設定されていれば、パスは絶対パスにして各エージェントの登録 (`env`) に引き継ぎます (`--dry-run` の出力にも表示)。API キーの値は出力にもログにも出しません。エージェントは MCP サーバーをシェルの環境変数なしで起動するため、キーは `.env` から読みます。
 
 #### 埋め込みを LAN 内のサーバーで動かす
 
-抽出用の LLM (`add`) は OpenAI のまま、**埋め込みだけを LAN 内の PC** (OpenAI 互換の `/v1/embeddings` を話すサーバー: Ollama / LM Studio / llama.cpp server / text-embeddings-inference / vLLM / Infinity など) に任せられます。検索 (`search` / `entity` / MCP の読み取りツール) は OpenAI のキーなしで動き、メモの本文が OpenAI に送られるのは `add` の LLM 抽出だけになります。
+抽出を呼び出したエージェントに任せる既定の `agent` モードなら、**埋め込みを LAN 内の PC** (OpenAI 互換の `/v1/embeddings` を話すサーバー: Ollama / LM Studio / llama.cpp server / text-embeddings-inference / vLLM / Infinity など) に任せることで、**OpenAI を一切使わず** (キーもネットワーク送信もなく) に運用できます。検索 (`search` / `entity` / MCP の読み取りツール) も `add` / `commit` も OpenAI のキーなしで動きます。`--extractor openai` の場合だけ、メモの本文が OpenAI に送られるのは `add` の LLM 抽出になります。
 
 ```bash
 # Ollama (サーバー側で: ollama pull bge-m3  /  OLLAMA_HOST=0.0.0.0 ollama serve)

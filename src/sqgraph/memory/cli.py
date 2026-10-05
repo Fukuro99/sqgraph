@@ -2,21 +2,24 @@
 
 All output is JSON on stdout (UTF-8); errors are ``{"error": ...}`` on stderr with a non-zero exit code.
 
-    sqgraph-memory init [--api-key-stdin] [--group-id G] [--tz TZ] [--embed-base-url URL] [--embed-model M] [--embed-dimensions N]
-    sqgraph-memory config [--embed-base-url URL|openai] [--embed-model M] [--embed-dimensions N] [--llm-model M] ...
+    sqgraph-memory init [--extractor agent|openai] [--api-key-stdin] [--group-id G] [--tz TZ] [--embed-base-url URL] ...
+    sqgraph-memory config [--extractor agent|openai] [--embed-base-url URL|openai] [--embed-model M] [--llm-model M] ...
     sqgraph-memory reembed [--yes]
-    sqgraph-memory add TEXT|- [--source claude-code] [--channel personal] ...
+    sqgraph-memory add TEXT|- [--source claude-code] [--channel personal] ...      (agent mode: prints what to extract)
+    sqgraph-memory commit [--token T] [--extraction FILE|-]                          (agent mode: stores the extraction)
     sqgraph-memory search QUERY [--limit 10] [--as-of DATE] [--history] [--center ENTITY]
     sqgraph-memory entity NAME | entities QUERY | episodes | stats
     sqgraph-memory forget (--episode ID | --source-ref REF | --fact ID | --entity NAME | --since/--until/--channel) [--dry-run]
     sqgraph-memory purge --yes [--dry-run]
-    sqgraph-memory mcp [--transport stdio|streamable-http] [--read-only]
+    sqgraph-memory mcp [--transport stdio|streamable-http] [--read-only] [--extractor agent|openai]
     sqgraph-memory setup [--agents ...] [--uninstall] | doctor [--online]
 
 The home directory (``$SQGRAPH_MEMORY_HOME`` or ``~/.sqgraph-memory``) holds ``memory.db`` -- one SQLite file shared
-by every agent on the machine -- plus ``.env`` (OPENAI_API_KEY) and ``config.json``. See :mod:`sqgraph.memory.config`.
-The embeddings can come from any OpenAI-compatible server (``--embed-base-url``, e.g. Ollama on another PC of the
-LAN); the LLM (``add``) stays on OpenAI.
+by every agent on the machine -- plus ``.env`` and ``config.json``. See :mod:`sqgraph.memory.config`.
+Who extracts the entities / facts of a note is the ``extractor`` setting: ``agent`` (default) means the calling agent
+itself: ``add`` prints the instructions and context, the agent answers with an extraction and ``commit`` stores it
+(no OpenAI key needed); ``openai`` makes ``add`` call an OpenAI LLM in one step. The embeddings can come from any
+OpenAI-compatible server (``--embed-base-url``, e.g. LM Studio / Ollama on another PC of the LAN).
 """
 
 from __future__ import annotations
@@ -35,7 +38,7 @@ from pathlib import Path
 from typing import Any, Iterator, NoReturn, Sequence
 
 from . import setup_agents
-from .config import KEY_NAME, MemoryConfig, ensure_private_dir
+from .config import EXTRACTORS, KEY_NAME, MemoryConfig, ensure_private_dir
 from .core import FACT_INDEX, META_EMBED_DIMS, META_EMBED_ENDPOINT, META_EMBED_MODEL, Memory
 from .providers import (
     DEFAULT_EMBED_DIMS,
@@ -271,6 +274,8 @@ def _apply_settings(cfg: MemoryConfig, args: argparse.Namespace) -> list[str]:
         except Exception as exc:
             raise CliError(f"invalid timezone {args.tz!r}: {exc}", 2) from exc
         put("tz", args.tz)
+    if getattr(args, "extractor", None):
+        put("extractor", args.extractor)
     if getattr(args, "llm_model", None):
         put("llm_model", args.llm_model.strip())
     before = (cfg.embed_base_url, cfg.embed_model)
@@ -350,18 +355,23 @@ def cmd_init(args: argparse.Namespace, cfg: MemoryConfig) -> dict[str, Any]:
     probe = _probe_embedder(cfg, args, changed)  # fails before anything is saved
     cfg.save()
 
-    key_state = "missing"
+    # An OpenAI key is needed by the "openai" extractor and by the OpenAI embedder; with the agent extractor and a
+    # custom (LAN) embedder nothing needs it, and init neither asks for nor copies one (--api-key-stdin still works).
+    needs_key = cfg.extractor == "openai" or not cfg.custom_embedder
+    key_state = "missing" if needs_key else "not-needed"
     key: str | None = None
     if args.api_key_stdin:
         key = (sys.stdin.readline() or "").strip()
         if not key:
             raise CliError("--api-key-stdin: no key received on stdin", 2)
         key_state = "stored"
+    elif not needs_key:
+        pass
     elif env_key:
         key, key_state = env_key.strip(), "stored-from-env"
     elif MemoryConfig.load(cfg.home).has_api_key():
         key_state = "existing"
-    elif sys.stdin is not None and sys.stdin.isatty():
+    elif cfg.extractor == "openai" and sys.stdin is not None and sys.stdin.isatty():
         key = getpass.getpass("OpenAI API key (input hidden, saved to %s): " % cfg.env_path).strip()
         key_state = "stored" if key else "missing"
     if key:
@@ -377,16 +387,22 @@ def cmd_init(args: argparse.Namespace, cfg: MemoryConfig) -> dict[str, Any]:
         "db_exists": db.db_path.is_file(),  # created on the first `add`
         "group_id": db.group_id,
         "tz": cfg.tz,
+        "extractor": cfg.extractor,
         "api_key": key_state,
         "embedder": _embedder_report(db),
     }
     if probe:
         out["probed"] = True
     warnings: list[str] = []
-    if key_state == "missing":
+    if key_state == "missing" and cfg.extractor == "openai":
         warnings.append(
             f"no {KEY_NAME} configured: set the env var and re-run `sqgraph-memory init`, or pipe it: "
             "`... | sqgraph-memory init --api-key-stdin`"
+        )
+    elif key_state == "missing":
+        warnings.append(
+            f"no embedding endpoint or {KEY_NAME} configured: semantic (vector) search is off (the agent extractor needs no key); "
+            "use --embed-base-url for a LAN embedding server, or provide the key"
         )
     warnings += _embedder_warnings(db, probed=probe is not None)
     if warnings:
@@ -408,6 +424,7 @@ def cmd_config(args: argparse.Namespace, cfg: MemoryConfig) -> dict[str, Any]:
         "db": str(eff.db_path),
         "group_id": eff.group_id,
         "tz": eff.tz,
+        "extractor": eff.extractor,
         "llm_model": eff.llm_model,
         "embedder": _embedder_report(eff),
         "openai_api_key": "configured" if eff.has_api_key() else "missing",
@@ -469,21 +486,8 @@ def cmd_reembed(args: argparse.Namespace, cfg: MemoryConfig) -> dict[str, Any]:
     return {"executed": True, "db": str(cfg.db_path), **res}
 
 
-def cmd_add(args: argparse.Namespace, cfg: MemoryConfig) -> dict[str, Any]:
-    text = sys.stdin.read() if args.text == "-" else args.text
-    if not text or not text.strip():
-        raise CliError("text must not be empty", 2)
-    with open_memory(cfg, need_llm=True) as (mem, _):
-        res = mem.add_episode(
-            text,
-            group_id=cfg.group_id,
-            source=args.source,
-            channel=args.channel,
-            author=args.author,
-            occurred_at=args.occurred_at,
-            source_ref=args.source_ref,
-        )
-    return {
+def _episode_summary(cfg: MemoryConfig, res: Any) -> dict[str, Any]:
+    out = {
         "group_id": cfg.group_id,
         "episode_id": res.episode_id,
         "already_stored": res.skipped,
@@ -494,6 +498,87 @@ def cmd_add(args: argparse.Namespace, cfg: MemoryConfig) -> dict[str, Any]:
         "facts_invalidated": len(res.facts_invalidated),
         "llm_calls": res.llm_calls,
     }
+    if res.warnings:
+        out["warnings"] = list(res.warnings)
+    return out
+
+
+COMMIT_NEXT = (
+    "Write the extraction JSON (see `schema`, `instructions`), then run: sqgraph-memory commit --token <token> "
+    "< extraction.json   (or pipe a single object {\"token\": ..., \"extraction\": ...} on stdin)"
+)
+
+
+def cmd_add(args: argparse.Namespace, cfg: MemoryConfig) -> dict[str, Any]:
+    text = sys.stdin.read() if args.text == "-" else args.text
+    if not text or not text.strip():
+        raise CliError("text must not be empty", 2)
+    if cfg.extractor == "agent":  # step 1 of 2: no LLM here, the calling agent extracts (see `commit`)
+        with open_memory(cfg, need_embedder=True) as (mem, warnings):
+            prep = mem.prepare_episode(
+                text,
+                group_id=cfg.group_id,
+                source=args.source,
+                channel=args.channel,
+                author=args.author,
+                occurred_at=args.occurred_at,
+                source_ref=args.source_ref,
+            )
+        if prep.get("already_stored"):
+            prep["next"] = "already stored: nothing to commit"
+        else:
+            prep["next"] = COMMIT_NEXT
+        return _with_warning({"group_id": cfg.group_id, **prep}, warnings)
+    with open_memory(cfg, need_llm=True) as (mem, _):
+        res = mem.add_episode(
+            text,
+            group_id=cfg.group_id,
+            source=args.source,
+            channel=args.channel,
+            author=args.author,
+            occurred_at=args.occurred_at,
+            source_ref=args.source_ref,
+        )
+    return _episode_summary(cfg, res)
+
+
+def _read_commit_input(args: argparse.Namespace) -> tuple[str, Any]:
+    """``(token, extraction)`` from ``--token`` / ``--extraction FILE|-`` (default stdin); the input may also be one
+    object ``{"token": ..., "extraction": ...}``."""
+    src = args.extraction if args.extraction not in (None, "-") else None
+    try:
+        raw = Path(src).read_text(encoding="utf-8-sig") if src else sys.stdin.read()
+    except OSError as exc:
+        raise CliError(f"cannot read the extraction file: {exc}", 2) from exc
+    if not raw.strip():
+        raise CliError("no extraction received (pass --extraction FILE, or pipe the JSON on stdin)", 2)
+    try:
+        data = json.loads(raw)
+    except ValueError as exc:
+        raise CliError(f"the extraction is not valid JSON: {exc}", 2) from exc
+    token = args.token
+    if isinstance(data, dict) and "extraction" in data and isinstance(data.get("token"), str):
+        token = token or data["token"]
+        data = data["extraction"]
+    if not token:
+        raise CliError('--token is required (or send {"token": ..., "extraction": ...} on stdin)', 2)
+    return token.strip(), data
+
+
+def cmd_commit(args: argparse.Namespace, cfg: MemoryConfig) -> dict[str, Any]:
+    token, extraction = _read_commit_input(args)
+    try:
+        tok = Memory.read_token(token)
+    except ValueError as exc:
+        raise CliError(str(exc), 2) from exc
+    if tok["group_id"] != cfg.group_id:
+        raise CliError(f"the token belongs to group {tok['group_id']!r}, but the configured group is {cfg.group_id!r}", 2)
+    with open_memory(cfg, need_embedder=True) as (mem, warnings):
+        try:
+            res = mem.commit_episode(token, extraction)
+        except ValueError as exc:
+            raise CliError(str(exc), 2) from exc
+    return _with_warning(_episode_summary(cfg, res), warnings)
 
 
 def cmd_search(args: argparse.Namespace, cfg: MemoryConfig) -> dict[str, Any]:
@@ -606,6 +691,7 @@ def mcp_argv(cfg: MemoryConfig, args: argparse.Namespace) -> list[str]:
         "--group-id", cfg.group_id,
         "--env-file", str(cfg.env_path),
         "--tz", cfg.tz,
+        "--extractor", getattr(args, "extractor", None) or cfg.extractor,
         "--llm-model", cfg.llm_model,
         "--embed-model", cfg.embed_model,
         "--transport", args.transport,
@@ -651,8 +737,13 @@ def cmd_setup(args: argparse.Namespace, cfg: MemoryConfig) -> dict[str, Any]:
         warnings=warnings,
         env=None if args.uninstall else setup_agents.forwarded_env(),
     )
-    if not args.uninstall and not cfg.has_api_key():
+    if not args.uninstall and cfg.extractor == "openai" and not cfg.has_api_key():
         out["note_init"] = "no API key configured yet: run `sqgraph-memory init` (agents launch the server without your shell environment)"
+    elif not args.uninstall and not cfg.custom_embedder and not cfg.has_api_key():
+        out["note_init"] = (
+            "no embedding endpoint configured: semantic search is off until you run `sqgraph-memory init --embed-base-url URL` "
+            "(a LAN embedding server) or provide an OpenAI key; adding memories needs no key (the agent extracts)"
+        )
     return out
 
 
@@ -701,8 +792,14 @@ def run_doctor(cfg: MemoryConfig, *, online: bool = False) -> dict[str, Any]:
         add(_check("home", status, detail))
     else:
         add(_check("home", "warn", f"{cfg.home} does not exist: run `sqgraph-memory init`"))
-    add(_check("api_key", "ok" if cfg.has_api_key() else "warn",
-               "configured" if cfg.has_api_key() else f"{KEY_NAME} not found (env or {cfg.env_path}): needed for `add` (the LLM): run `sqgraph-memory init`"))  # fmt: skip
+    if cfg.extractor == "agent":
+        add(_check("extractor", "ok", "agent: the calling agent extracts entities / facts (`add` then `commit`), no LLM key needed"))
+        add(_check("api_key", "ok" if cfg.has_api_key() else "skip",
+                   f"{KEY_NAME} configured (used for OpenAI embeddings)" if cfg.has_api_key() else f"{KEY_NAME} not needed (extractor=agent)"))  # fmt: skip
+    else:
+        add(_check("extractor", "ok", f"openai: `add` calls the OpenAI LLM {cfg.llm_model!r}"))
+        add(_check("api_key", "ok" if cfg.has_api_key() else "warn",
+                   "configured" if cfg.has_api_key() else f"{KEY_NAME} not found (env or {cfg.env_path}): needed for `add` (the LLM): run `sqgraph-memory init`"))  # fmt: skip
     emb = _embedder_report(cfg)
     emb_detail = f"endpoint={emb['endpoint']}, model={emb['model']}, dimensions={emb['dimensions'] or 'unknown'}"
     if cfg.custom_embedder:
@@ -793,8 +890,12 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument("--embed-api-key-env", metavar="NAME", help="env var / .env key with an optional API key for the endpoint (default: SQGRAPH_EMBED_API_KEY)")  # fmt: skip
         p.add_argument("--no-probe", action="store_true", help="do not call the endpoint to check it / detect the dimensions")
 
-    p = sub.add_parser("init", parents=[common], help="create the home directory, config and API key file")
+    def extractor_option(p: argparse.ArgumentParser) -> None:
+        p.add_argument("--extractor", choices=list(EXTRACTORS), help="who extracts entities / facts: 'agent' (default: the calling agent, no OpenAI key) or 'openai' (one-shot OpenAI LLM, for bots)")  # fmt: skip
+
+    p = sub.add_parser("init", parents=[common], help="create the home directory and config (an OpenAI key only with --extractor openai)")
     p.add_argument("--api-key-stdin", action="store_true", help="read the OpenAI API key from stdin (never pass it as an argument)")
+    extractor_option(p)
     p.add_argument("--group-id", help="namespace of your memories (default: me)")
     p.add_argument("--tz", help="timezone for naive timestamps (default: Asia/Tokyo)")
     embed_options(p)
@@ -803,7 +904,8 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("config", parents=[common], help="show the settings (no secrets) or change them")
     p.add_argument("--group-id")
     p.add_argument("--tz")
-    p.add_argument("--llm-model", metavar="NAME", help="chat model used by `add` (OpenAI)")
+    extractor_option(p)
+    p.add_argument("--llm-model", metavar="NAME", help="chat model used by `add` with --extractor openai")
     embed_options(p)
     p.set_defaults(fn=cmd_config)
 
@@ -813,7 +915,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--progress", action="store_true", help="print JSON progress lines on stderr")
     p.set_defaults(fn=cmd_reembed)
 
-    p = sub.add_parser("add", parents=[common], help="remember something (LLM extraction, takes a few seconds)")
+    p = sub.add_parser("add", parents=[common], help="remember something (agent mode: prints the context to extract from, then run `commit`; openai mode: LLM extraction)")  # fmt: skip
     p.add_argument("text", metavar="TEXT", help="the text to remember; '-' reads stdin")
     p.add_argument("--source", default="cli", help="who is writing: claude-code / codex / cursor / cli ...")
     p.add_argument("--author", default="user")
@@ -821,6 +923,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--occurred-at", help="ISO 8601 time of the event (default: now)")
     p.add_argument("--source-ref", help="idempotency key: the same (source, source-ref) is stored once")
     p.set_defaults(fn=cmd_add)
+
+    p = sub.add_parser("commit", parents=[common], help="store the extraction of an `add` (agent mode): --token T, extraction JSON on stdin or --extraction FILE")  # fmt: skip
+    p.add_argument("--token", help='the token printed by `add` (may instead be inside the stdin JSON: {"token": ..., "extraction": ...})')
+    p.add_argument("--extraction", metavar="FILE|-", help="file with the extraction JSON; '-' or omitted: stdin")
+    p.set_defaults(fn=cmd_commit)
 
     p = sub.add_parser("search", parents=[common], help="search facts (hybrid semantic + keyword + graph)")
     p.add_argument("query", metavar="QUERY")
@@ -872,6 +979,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--host", default="127.0.0.1")
     p.add_argument("--port", type=int, default=8000)
     p.add_argument("--read-only", action="store_true")
+    extractor_option(p)
     p.set_defaults(fn=cmd_mcp, raw=True)
 
     p = sub.add_parser("setup", parents=[common], help="register the MCP server and install the Skill for local agents")

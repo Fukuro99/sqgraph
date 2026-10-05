@@ -21,14 +21,15 @@ HANAKO = "[[Rails|Service]] [[花子|Person]] {{Rails|担当|花子|2026-08-15}}
 def home(tmp_path, monkeypatch):
     h = tmp_path / "mem-home"
     monkeypatch.setenv("SQGRAPH_MEMORY_HOME", str(h))
-    for k in ("OPENAI_API_KEY", "SQGRAPH_MEMORY_DB", "SQGRAPH_MEMORY_GROUP"):
+    for k in ("OPENAI_API_KEY", "SQGRAPH_MEMORY_DB", "SQGRAPH_MEMORY_GROUP", "SQGRAPH_MEMORY_EXTRACTOR"):
         monkeypatch.delenv(k, raising=False)
     return h
 
 
 @pytest.fixture
 def fakes(monkeypatch, home):
-    """Replace the OpenAI provider factory by deterministic fakes."""
+    """Replace the OpenAI provider factory by deterministic fakes (and select the one-shot ``openai`` extractor)."""
+    monkeypatch.setenv("SQGRAPH_MEMORY_EXTRACTOR", "openai")
 
     def make(cfg, *, need_llm, need_embedder):
         return (FakeLLM() if need_llm else None), (FakeEmbedder() if (need_llm or need_embedder) else None), []
@@ -157,6 +158,7 @@ def test_output_is_valid_utf8_json_unescaped_and_compact(capsys, home, fakes):
 
 
 def test_errors_are_json_on_stderr(capsys, home, monkeypatch):
+    monkeypatch.setenv("SQGRAPH_MEMORY_EXTRACTOR", "openai")
     code, out, err = run(capsys, "add", "覚えておいてください、これは長いテキストです")  # real providers, no key
     assert code == 1 and out is None and "OPENAI_API_KEY" in err["error"]
     code, out, err = run(capsys, "add", "-", stdin="   ", monkeypatch=monkeypatch)
@@ -316,13 +318,15 @@ def test_doctor_report_structure(capsys, home, tmp_path, monkeypatch):
     for n in ("python", "sqlite3", "enable_load_extension", "sqlite_vec", "import openai", "import mcp", "home", "api_key", "database"):
         assert n in names, n
     assert names["python"]["status"] == "ok" and names["sqlite_vec"]["status"] == "ok"
-    assert names["home"]["status"] == "warn" and names["api_key"]["status"] == "warn"
+    assert names["home"]["status"] == "warn" and names["api_key"]["status"] == "skip"  # extractor=agent: no OpenAI key needed
+    assert names["extractor"]["status"] == "ok"
     assert all(c["status"] in ("ok", "warn", "fail", "skip") for c in out["checks"])
     assert code == (0 if out["ok"] else 1)
     assert "sk-" not in json.dumps(out)
 
     # after init + a write, the database check reports counts
     run(capsys, "init", "--api-key-stdin", stdin="sk-doctor\n", monkeypatch=monkeypatch)
+    monkeypatch.setenv("SQGRAPH_MEMORY_EXTRACTOR", "openai")
     monkeypatch.setattr(cli, "make_providers", lambda cfg, *, need_llm, need_embedder: (FakeLLM() if need_llm else None, FakeEmbedder(), []))
     run(capsys, "add", TARO, "--occurred-at", "2026-07-01 10:00")
     code, out, _ = run(capsys, "doctor", "--online")

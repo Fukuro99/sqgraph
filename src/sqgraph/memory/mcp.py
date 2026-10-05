@@ -1,14 +1,19 @@
 """MCP server exposing the temporal memory to agents (Claude Code, other MCP clients).
 
-    python -m sqgraph.memory.mcp --db memory.db [--group-id G] [--allowed-channels a,b]
+    python -m sqgraph.memory.mcp --db memory.db [--group-id G] [--allowed-channels a,b] [--extractor agent|openai]
                                  [--read-only] [--transport stdio|streamable-http] [--port 8000]
 
 The handler logic lives in :class:`MemoryTools` (plain synchronous methods, easy to unit test);
 :func:`build_server` registers them with the official ``mcp`` Python SDK (v1 ``FastMCP`` and v2
 ``MCPServer`` are both supported).
 
+Who extracts the entities / facts of a new memory is ``--extractor``: ``agent`` (default) means the calling agent
+itself: ``add_memory`` returns the context + instructions + a token and ``commit_memory(token, extraction)`` stores the
+agent's extraction (no OpenAI key on the server); ``openai`` makes ``add_memory`` call an OpenAI LLM in one step (for
+bots; ``commit_memory`` stays available).
+
 Access control is enforced here, server-side: with ``--allowed-channels`` every read is restricted to
-those channels and ``add_memory`` may only write into them. ``read_cypher`` is raw graph access that
+those channels and ``add_memory`` / ``commit_memory`` may only write into them. ``read_cypher`` is raw graph access that
 bypasses that ACL, so it is disabled when ``--allowed-channels`` is set (unless ``--allow-cypher``).
 """
 
@@ -75,9 +80,15 @@ class MemoryTools:
         query_timeout: float = 10.0,
         default_channel: str = "personal",
         write_blocker: str | None = None,
+        extractor: str | None = None,
     ) -> None:
         self.memory = memory
-        self.write_blocker = write_blocker  # why add_memory cannot work (e.g. no OpenAI key); None = it can
+        # "agent": add_memory returns the prepare payload and the agent calls commit_memory; "openai": add_memory
+        # runs the server-side LLM pipeline. None = by what the Memory has: an LLM -> openai, else agent.
+        self.extractor = extractor or ("openai" if memory.llm is not None else "agent")
+        if self.extractor not in ("agent", "openai"):
+            raise ValueError("extractor must be 'agent' or 'openai'")
+        self.write_blocker = write_blocker  # why the openai add_memory cannot work (e.g. no OpenAI key); None = it can
         self.default_channel = default_channel
         self.group_id = group_id or memory.default_group_id
         self.locked_group = group_id is not None
@@ -110,6 +121,13 @@ class MemoryTools:
 
     # -- tools --------------------------------------------------------------------------------
 
+    def _write_channel(self, channel: str | None) -> str:
+        if channel is None:
+            channel = self.allowed[0] if self.allowed else self.default_channel
+        if self.allowed is not None and channel not in self.allowed:
+            raise PermissionError(f"channel {channel!r} is not among the allowed channels")
+        return channel
+
     def add_memory(
         self,
         content: str,
@@ -122,14 +140,22 @@ class MemoryTools:
     ) -> dict[str, Any]:
         if self.read_only:
             raise PermissionError("this server is read-only (add_memory is disabled)")
-        if self.write_blocker:
-            raise RuntimeError(self.write_blocker)
         if not content or not content.strip():
             raise ValueError("content must not be empty")
-        if channel is None:
-            channel = self.allowed[0] if self.allowed else self.default_channel
-        if self.allowed is not None and channel not in self.allowed:
-            raise PermissionError(f"channel {channel!r} is not among the allowed channels")
+        channel = self._write_channel(channel)
+        if self.extractor == "agent":
+            # step 1 of 2: no LLM on the server; the caller extracts entities / facts and calls commit_memory
+            return self.memory.prepare_episode(
+                content,
+                group_id=self._group(group_id),
+                source=source,
+                channel=channel,
+                author=author,
+                occurred_at=occurred_at,
+                source_ref=source_ref,
+            )
+        if self.write_blocker:
+            raise RuntimeError(self.write_blocker)
         res = self.memory.add_episode(
             content,
             group_id=self._group(group_id),
@@ -139,7 +165,11 @@ class MemoryTools:
             occurred_at=occurred_at,
             source_ref=source_ref,
         )
-        return {
+        return self._episode_summary(res)
+
+    @staticmethod
+    def _episode_summary(res: Any) -> dict[str, Any]:
+        out = {
             "episode_id": res.episode_id,
             "already_stored": res.skipped,
             "entities": len(res.entities),
@@ -149,6 +179,23 @@ class MemoryTools:
             "facts_invalidated": len(res.facts_invalidated),
             "llm_calls": res.llm_calls,
         }
+        if res.warnings:
+            out["warnings"] = list(res.warnings)
+        return out
+
+    def commit_memory(
+        self, token: str, extraction: dict[str, Any] | str, group_id: str | None = None
+    ) -> dict[str, Any]:
+        """Step 2 of the agent extraction: store ``extraction`` for the ``token`` returned by ``add_memory``."""
+        if self.read_only:
+            raise PermissionError("this server is read-only (commit_memory is disabled)")
+        tok = Memory.read_token(token)
+        group = self._group(group_id)
+        if tok["group_id"] != group:
+            raise PermissionError(f"this token belongs to group_id={tok['group_id']!r}, not {group!r}")
+        if self.allowed is not None and tok["channel"] not in self.allowed:
+            raise PermissionError(f"channel {tok['channel']!r} is not among the allowed channels")
+        return self._episode_summary(self.memory.commit_episode(token, extraction))
 
     def forget_memory(
         self,
@@ -343,9 +390,11 @@ class MemoryTools:
 # --------------------------------------------------------------------------- server wiring
 
 INSTRUCTIONS = (
-    "Long-term memory of a team: a temporal knowledge graph built from chat messages and notes. "
+    "Long-term memory of a team or a person: a temporal knowledge graph built from chat messages and notes. "
     "Use search_memory first for questions about who/what/when/status; use get_entity for the full history of one "
     "person/service/project; add_memory to record durable facts (decisions, ownership, status changes, plans). "
+    "When add_memory returns a `token` (agent extraction) nothing is stored yet: YOU extract the entities and facts "
+    "from the returned `context` following `instructions` / `schema`, then call commit_memory(token, extraction). "
     "Facts have validity intervals (valid_at / invalid_at); superseded facts stay available as history. "
     "forget_memory (when present) deletes memory permanently: use it only when the user explicitly asks to forget "
     "something, and preview with dry_run=true."
@@ -358,6 +407,28 @@ TOOL_DOCS = {
         "state). The text is analysed by an LLM: entities and facts are extracted, merged with existing ones, and older "
         "contradicting facts are marked as superseded (never deleted). Write self-contained sentences; put dates in the "
         "text or in occurred_at (ISO 8601, default now). Pass source = your client name (e.g. 'claude-code'). Not available on read-only servers."
+    ),
+    "add_memory_agent": (
+        "Step 1 of 2 to store a new piece of knowledge (a message, decision, preference, plan) in long-term memory; "
+        "NOTHING is stored yet. Use it when the user tells you something worth remembering later (who owns what, a "
+        "decision, a lasting preference, a schedule, an absence, a change of state). It returns `token`, `instructions`, "
+        "`schema` and `context` (the message, the author ref, recent notes, existing candidate entities and currently valid "
+        "related facts). YOU (the calling agent) are the extractor: read `instructions`, produce the `extraction` JSON "
+        "(entities with refs, facts as subject/relation/object sentences with valid_at/invalid_at), reuse `existing_id` of "
+        "candidate entities that are the same thing, set `contradicts` for related facts that are no longer true and "
+        "`duplicate_of` for ones it merely restates, then call commit_memory(token, extraction). Never invent facts that "
+        "are not in the content. Write self-contained sentences; put dates in the text or in occurred_at (ISO 8601, "
+        "default now). Pass source = your client name (e.g. 'claude-code') and author='user' for what the user said. "
+        "If the result says already_stored there is nothing to commit. Not available on read-only servers."
+    ),
+    "commit_memory": (
+        "Step 2 of 2 of add_memory: store the extraction you produced. Pass the `token` returned by add_memory unchanged and "
+        "`extraction` = {\"entities\": [{ref, name, type, existing_id?, summary?, aliases?}], \"facts\": [{subject, object, "
+        "relation, fact, valid_at?, invalid_at?, modality?, confidence?, duplicate_of?, contradicts?}]} (see add_memory's "
+        "`schema`; the author is the ref \"author\"). Entities are merged with existing ones, contradicted facts are marked "
+        "superseded (never deleted). If it reports problems in the JSON, fix them and call it again with the same token. "
+        "The result lists what was created and `warnings` for anything the server dropped or merged. An empty extraction "
+        "just stores the note. Not available on read-only servers."
     ),
     "forget_memory": (
         "PERMANENTLY delete memory, only when the user explicitly asks to forget something. Give exactly one of: "
@@ -422,7 +493,9 @@ def build_server(tools: MemoryTools, name: str = "sqgraph-memory") -> Any:
     # Explicit signatures below give the SDK a clean JSON schema for every tool.
     if not tools.read_only:
 
-        @server.tool(name="add_memory", description=TOOL_DOCS["add_memory"])
+        @server.tool(
+            name="add_memory", description=TOOL_DOCS["add_memory_agent" if tools.extractor == "agent" else "add_memory"]
+        )
         async def add_memory(
             content: str,
             channel: str | None = None,
@@ -441,6 +514,12 @@ def build_server(tools: MemoryTools, name: str = "sqgraph-memory") -> Any:
                 source_ref=source_ref,
                 group_id=group_id,
             )
+
+    if not tools.read_only:
+
+        @server.tool(name="commit_memory", description=TOOL_DOCS["commit_memory"])
+        async def commit_memory(token: str, extraction: dict[str, Any] | str, group_id: str | None = None) -> dict[str, Any]:
+            return await wrap(tools.commit_memory)(token=token, extraction=extraction, group_id=group_id)
 
     if not tools.read_only and tools.allowed is None:
 
@@ -574,13 +653,20 @@ def main(argv: list[str] | None = None) -> None:
         default="personal",
         help="channel add_memory writes to when none is given (and no --allowed-channels); facts only merge within a channel",
     )
-    ap.add_argument("--read-only", action="store_true", help="open the DB read-only and disable add_memory")
+    ap.add_argument("--read-only", action="store_true", help="open the DB read-only and disable add_memory / commit_memory")
+    ap.add_argument(
+        "--extractor",
+        choices=["agent", "openai"],
+        default="agent",
+        help="who extracts entities / facts: 'agent' (default: the calling agent, via add_memory + commit_memory; no OpenAI key) "
+        "or 'openai' (add_memory calls an OpenAI LLM in one step; needs OPENAI_API_KEY)",
+    )
     ap.add_argument("--transport", choices=["stdio", "streamable-http"], default="stdio")
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8000)
     ap.add_argument("--allow-cypher", action="store_true", help="keep read_cypher enabled even with --allowed-channels (bypasses the ACL!)")
     ap.add_argument("--env-file", help=".env with OPENAI_API_KEY (default: search from the current directory)")
-    ap.add_argument("--llm-model", default=DEFAULT_CHAT_MODEL)
+    ap.add_argument("--llm-model", default=DEFAULT_CHAT_MODEL, help="chat model of --extractor openai")
     ap.add_argument("--embed-model", default=DEFAULT_EMBED_MODEL)
     ap.add_argument(
         "--embed-base-url",
@@ -622,11 +708,11 @@ def main(argv: list[str] | None = None) -> None:
         log.warning("OPENAI_API_KEY is not set: semantic (vector) search is disabled")
     llm = None
     write_blocker = None
-    if not args.read_only:
+    if not args.read_only and args.extractor == "openai":
         if have_key:
             llm = OpenAILLM(args.llm_model, tracker=tracker)
         else:
-            write_blocker = "OPENAI_API_KEY is not set: add_memory needs the OpenAI API (run `sqgraph-memory init`)"
+            write_blocker = "OPENAI_API_KEY is not set: add_memory needs the OpenAI API (run `sqgraph-memory init`), or use --extractor agent"
     memory = Memory(args.db, llm, embedder, default_group_id=args.group_id, tz=args.tz, read_only=args.read_only)
     tools = MemoryTools(
         memory,
@@ -638,6 +724,7 @@ def main(argv: list[str] | None = None) -> None:
         query_timeout=args.query_timeout,
         default_channel=args.default_channel,
         write_blocker=write_blocker,
+        extractor=args.extractor,
     )
     if write_blocker:
         log.warning("%s", write_blocker)

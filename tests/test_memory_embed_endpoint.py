@@ -393,7 +393,7 @@ def test_reembed_needs_embedder_and_writable(tmp_path):
 def home(tmp_path, monkeypatch):
     h = tmp_path / "mem-home"
     monkeypatch.setenv("SQGRAPH_MEMORY_HOME", str(h))
-    for k in ("OPENAI_API_KEY", "SQGRAPH_MEMORY_DB", "SQGRAPH_MEMORY_GROUP", "SQGRAPH_EMBED_API_KEY"):
+    for k in ("OPENAI_API_KEY", "SQGRAPH_MEMORY_DB", "SQGRAPH_MEMORY_GROUP", "SQGRAPH_EMBED_API_KEY", "SQGRAPH_MEMORY_EXTRACTOR"):
         monkeypatch.delenv(k, raising=False)
     return h
 
@@ -419,7 +419,7 @@ def test_init_with_embed_base_url_probes_and_saves(capsys, home, stub, monkeypat
     cfg = read_config(home)
     assert (cfg["embed_base_url"], cfg["embed_model"], cfg["embed_dimensions"], cfg["embed_api_key_env"]) == (stub.url, "bge-m3", 384, "SQGRAPH_EMBED_API_KEY")
     assert "dimensions" not in stub.requests[0]["body"]
-    assert "OPENAI_API_KEY" in out["warning"]  # the LLM key is still missing
+    assert out["api_key"] == "not-needed" and "warning" not in out  # agent extractor + LAN embedder: no OpenAI key at all
 
     # a second init without options keeps everything and does not probe again
     n = len(stub.requests)
@@ -480,7 +480,8 @@ def test_search_uses_the_lan_embedder_without_openai_key(capsys, home, stub, mon
     code, out, _ = run(capsys, "forget", "--fact", hanako)
     assert code == 0 and out["facts_deleted"] == [hanako] and stub.requests
 
-    # `add` is the only command that needs the OpenAI LLM key
+    # only `add` with --extractor openai needs the OpenAI LLM key (the default agent extractor needs none)
+    monkeypatch.setenv("SQGRAPH_MEMORY_EXTRACTOR", "openai")
     code, _, err = run(capsys, "add", "覚えておいてください、これは長いテキストです")
     assert code == 1 and "OPENAI_API_KEY" in err["error"]
 
@@ -617,11 +618,20 @@ def test_mcp_main_with_lan_embedder_and_no_openai_key(tmp_path, stub, monkeypatc
         res = tools.search_memory("Rails 担当")
         assert res["count"] >= 1 and stub.requests and "dimensions" not in stub.requests[0]["body"]
         assert tools.get_entity("Rails")["found"] is True
-        with pytest.raises(RuntimeError, match="OPENAI_API_KEY"):  # writing needs the LLM: a clear error, nothing stored
+        with pytest.raises(RuntimeError, match="OPENAI_API_KEY"):  # --extractor openai needs the LLM: a clear error, nothing stored
             tools.add_memory("覚えておいてください、これは長いテキストです")
         assert tools.memory.stats("me")["nodes"]["Episode"] == 1
 
     checks.append(lan)
+    mcp_mod.main(["--db", str(path), "--group-id", "me", *env, "--extractor", "openai", "--embed-model", "bge-m3", "--embed-base-url", stub.url, "--embed-dimensions", "384"])  # fmt: skip
+
+    def agent(tools):  # the default extractor needs no OpenAI key: add_memory returns what the agent must extract from
+        assert tools.extractor == "agent" and tools.memory.llm is None and tools.write_blocker is None
+        prep = tools.add_memory("覚えておいてください、これは長いテキストです", author="user")
+        assert prep["token"] and prep["context"]["message"]["author"] == "user"
+        assert tools.memory.stats("me")["nodes"]["Episode"] == 1  # nothing stored by step 1
+
+    checks.append(agent)
     mcp_mod.main(["--db", str(path), "--group-id", "me", *env, "--embed-model", "bge-m3", "--embed-base-url", stub.url, "--embed-dimensions", "384"])  # fmt: skip
 
     def degraded(tools):  # no custom embedder and no key: the read tools fall back to fulltext instead of crashing
