@@ -279,6 +279,8 @@ def test_default_threshold_by_model_name():
     assert default_min_similarity("text-embedding-nomic-embed-text-v1.5") == 0.72  # LM Studio's id
     assert default_min_similarity("nomic-ai/nomic-embed-text-v1.5") == 0.72
     assert default_min_similarity("nomic-embed-text") == 0.72  # Ollama
+    assert default_min_similarity("text-embedding-qwen3-embedding-0.6b") == 0.46  # LM Studio's id
+    assert default_min_similarity("Qwen/Qwen3-Embedding-0.6B") == 0.46
     assert default_min_similarity("bge-m3") == 0.45
     assert default_min_similarity("some-future-model") == MIN_SIMILARITY_UNKNOWN_MODEL
     assert default_min_similarity(None) == MIN_SIMILARITY_NO_MODEL

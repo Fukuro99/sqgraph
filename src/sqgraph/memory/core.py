@@ -99,6 +99,7 @@ MIN_SIMILARITY_BY_MODEL: tuple[tuple[str, float], ...] = (
     ("text-embedding-3-large", 0.32),  # estimate (3-large is scaled like 3-small, slightly lower)
     ("text-embedding-ada-002", 0.78),  # estimate (ada-002 cosines rarely fall below ~0.7)
     ("nomic-embed-text", 0.72),  # measured (LM Studio id text-embedding-nomic-embed-text-v1.5, Ollama nomic-embed-text)
+    ("qwen3-embedding", 0.46),  # measured on 0.6B without a query instruction (LM Studio id text-embedding-qwen3-embedding-0.6b)
     ("bge-m3", 0.45),  # estimate
 )
 MIN_SIMILARITY_UNKNOWN_MODEL = 0.30  # an embedder with an unrecognised model name: low, so it only trims the clearly unrelated
