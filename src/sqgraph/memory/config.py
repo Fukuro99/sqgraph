@@ -6,7 +6,10 @@ Layout of the home directory (``$SQGRAPH_MEMORY_HOME`` or ``~/.sqgraph-memory``)
     memory.db.lock cross-process write lock (created by sqgraph.memory)
     .env           OPENAI_API_KEY=...   (mode 0600 on POSIX; optionally SQGRAPH_EMBED_API_KEY=... for a custom embedder endpoint)
     config.json    {"group_id", "tz", "extractor", "llm_model", "embed_model", "embed_base_url", "embed_dimensions",
-                    "embed_api_key_env", "db"}
+                    "embed_api_key_env", "search_min_similarity", "db"}
+
+``search_min_similarity`` is the cosine threshold of the relevance gate of ``search`` (``null`` = a default for the embedding
+model, see :func:`sqgraph.memory.core.default_min_similarity`).
 
 ``extractor`` says who extracts entities / facts from what is added: ``"agent"`` (default: the calling agent itself, in
 two steps, no OpenAI key needed) or ``"openai"`` (the server calls an OpenAI LLM, ``llm_model``; for bots).
@@ -86,6 +89,7 @@ class MemoryConfig:
     embed_base_url: str | None = None  # None = the OpenAI API; else an OpenAI-compatible /v1 endpoint (e.g. on the LAN)
     embed_dimensions: int | None = None  # None = 1536 (OpenAI), or probed from a custom endpoint and then saved
     embed_api_key_env: str = DEFAULT_EMBED_KEY_ENV  # env var / .env key holding an optional key for that endpoint
+    search_min_similarity: float | None = None  # relevance gate of search (cosine); None = a default for embed_model
     db: str | None = None  # None = <home>/memory.db
 
     # -- paths ---------------------------------------------------------------------------------
@@ -126,6 +130,10 @@ class MemoryConfig:
                 dims = data.get("embed_dimensions")
                 cfg.embed_dimensions = dims if isinstance(dims, int) and not isinstance(dims, bool) and dims > 0 else None
                 cfg.embed_api_key_env = str(data.get("embed_api_key_env") or cfg.embed_api_key_env)
+                sim = data.get("search_min_similarity")
+                cfg.search_min_similarity = (
+                    float(sim) if isinstance(sim, (int, float)) and not isinstance(sim, bool) and -1.0 <= sim <= 1.0 else None
+                )
                 cfg.db = data.get("db") or None
         if apply_env:
             if os.environ.get(ENV_GROUP):
@@ -149,6 +157,7 @@ class MemoryConfig:
             "embed_base_url": self.embed_base_url,
             "embed_dimensions": self.embed_dimensions,
             "embed_api_key_env": self.embed_api_key_env,
+            "search_min_similarity": self.search_min_similarity,
             "db": self.db,
         }
 

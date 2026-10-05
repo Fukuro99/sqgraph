@@ -302,7 +302,10 @@ def test_server_forget_memory_end_to_end(db_path):
         tools = {x.name: x for x in await server.list_tools()}
         tool = tools["forget_memory"]
         schema = getattr(tool, "inputSchema", None) or tool.input_schema
-        assert set(schema["properties"]) == {"episode_id", "fact_id", "entity", "since", "until", "channel", "dry_run", "group_id"}
+        assert set(schema["properties"]) == {
+            "episode_id", "fact_id", "entity", "since", "until", "channel", "dry_run", "group_id",
+            "episode", "fact", "entity_id", "name", "source_ref", "source",  # aliases / extra selectors
+        }
         assert not schema.get("required")
         assert "explicitly" in tools["forget_memory"].description and "dry_run" in tools["forget_memory"].description
         return await server.call_tool("forget_memory", {"entity": "Vault", "dry_run": True})

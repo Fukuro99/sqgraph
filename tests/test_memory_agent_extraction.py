@@ -113,7 +113,7 @@ def test_prepare_context_candidates_related_facts_recent_and_author():
         "facts": [{"subject": "j", "object": "s", "relation": "OWNS", "fact": "次郎 は Secret を担当している"}],
     }, channel="other", author="alice")
 
-    prep = mem.prepare_episode("レイルズ の担当が 花子 に変わります。Secret は別件", group_id=G, channel="personal", author="alice", occurred_at=AT)
+    prep = mem.prepare_episode("レイルズ の担当が 太郎 から 花子 に変わります。Secret は別件", group_id=G, channel="personal", author="alice", occurred_at=AT)  # names 太郎: his facts are related
     ctx = prep["context"]
     names = [c["name"] for c in ctx["candidate_entities"]]
     assert "Rails" in names and "alice" in names  # alias match + the author entity

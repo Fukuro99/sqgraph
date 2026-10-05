@@ -293,6 +293,8 @@ hits = mem.search("認証基盤は誰が担当？", group_id="my-guild",
 for h in hits:                                       # FactHit: fact, valid_at, invalid_at, status, episodes[出典] ...
     print(h.status, h.fact, h.valid_at, h.invalid_at, [(e.author, e.occurred_at, e.source_ref) for e in h.episodes])
 
+# 関連性ゲート: 質問と無関係なファクトは返さない。FactHit.similarity = 質問とのコサイン類似度 (ベクトルが無ければ None)。
+# しきい値は Memory(min_similarity=...) か mem.search(..., min_similarity=0.5) で上書き (既定: 埋め込みモデルごと)
 mem.search_entities("bob", channels=["backend"])            # [{id, name, type, aliases, summary, ...}]
 mem.get_entity("bob", channels=["backend"])                 # プロフィール + ファクトのタイムライン (失効分含む)
 mem.get_episodes(entity="Rails", channels=["backend"], limit=10)
@@ -365,13 +367,13 @@ python -m sqgraph.memory.mcp --db memory.db [--group-id G] [--allowed-channels a
 
 | ツール | 使いどころ |
 |---|---|
-| `search_memory` | まず最初に。人 / サービス / 決定 / 担当 / 状態 / 予定に関する質問。`as_of`, `include_invalid` (履歴), `center_entity` |
+| `search_memory` | まず最初に。人 / サービス / 決定 / 担当 / 状態 / 予定に関する質問。`as_of`, `include_invalid` (履歴), `center_entity`, `min_similarity` (関連性のしきい値)。関係のなさそうなファクトは返さず (無関係な質問は空)、各ファクトに質問とのコサイン類似度 `similarity` が付く |
 | `search_entities` | 名前・エイリアスの解決、存在する人 / サービスの列挙 |
 | `get_entity` | 1 エンティティの全履歴 (失効分含むタイムライン) と関連エンティティ |
 | `get_episodes` | 元の発言の確認、前後の会話の確認 |
 | `add_memory` | 決定・担当・状態変化・予定・好みなど長期的に覚えるべきことの記録 (`--read-only` では無効)。`--extractor agent` (既定) では**何も保存せず**、`token` / `instructions` / `schema` / `context` を返す。`openai` ではサーバー側の LLM で抽出して保存する |
 | `commit_memory` | `agent` モードの 2 段階目。`add_memory` の `token` と、エージェントが作った `extraction` を渡して保存する (`openai` モードでも使える。`--read-only` では無効) |
-| `forget_memory` | エピソード / ファクト / エンティティ / 期間を指定した削除 (`dry_run` で影響範囲の確認)。書き込み可能で `--allowed-channels` なしのときだけ登録される |
+| `forget_memory` | エピソード / ファクト / エンティティ / 期間を指定した削除 (`dry_run` で影響範囲の確認)。例: `forget_memory(episode_id="ep_...", dry_run=True)`。セレクタはちょうど 1 つ: `episode_id` (別名 `episode`) / `fact_id` (別名 `fact`) / `entity` (別名 `entity_id`, `name`) / `source_ref` (+ `source`) / `since`・`until`・`channel`。書き込み可能で `--allowed-channels` なしのときだけ登録される |
 | `get_schema` | ラベル / 関係タイプ / インデックス / 件数と Cypher サブセットの説明 |
 | `read_cypher` | 読み取り専用 Cypher (行数 / 文字数 / 時間の制限つき)。上記で足りない集計・結合用 |
 
@@ -441,11 +443,11 @@ sqgraph-memory doctor [--online]    # 環境・DB・登録状況の診断 (失�
 | `init [--extractor agent\|openai] [--api-key-stdin] [--group-id G] [--tz TZ] [--embed-base-url URL] [--embed-model M] [--embed-dimensions N] [--no-probe]` | ホーム・設定を作る (キーは引数で渡せません。OpenAI キーを聞くのは `--extractor openai` のときだけ)。`--embed-base-url` で埋め込みを別サーバーにできます (下の「埋め込みを LAN 内のサーバーで動かす」) |
 | `add TEXT\|- [--source claude-code] [--author user] [--channel personal] [--occurred-at T] [--source-ref R]` | 覚える。`agent` モード (既定) は何も保存せず、`token` / `instructions` / `schema` / `context` の JSON を出力 (`-` は stdin)。`openai` モードは LLM による抽出まで行って保存 (数秒) |
 | `commit [--token T] [--extraction FILE\|-]` | `agent` モードの 2 段階目。`add` の `token` と、エージェントが作った extraction JSON (stdin か `--extraction FILE`。`{"token": ..., "extraction": {...}}` を 1 つの JSON で stdin に渡してもよい) で保存し、作成 / 重複 / 失効の件数と `warnings` を返す |
-| `search QUERY [--limit N] [--as-of T] [--history] [--center ENTITY]` | ファクト検索 (予定のファクトも含む。`--history` で失効分も) |
+| `search QUERY [--limit N] [--as-of T] [--history] [--center ENTITY] [--min-similarity X]` | ファクト検索 (予定のファクトも含む。`--history` で失効分も)。関連性のしきい値は `--min-similarity` で一時的に変えられる |
 | `entity NAME` / `entities QUERY` / `episodes [--entity E] [--query Q]` / `stats` | プロファイルと履歴 / 名前解決 / 元のメモ / 件数 |
-| `forget (--episode ID \| --source-ref REF [--source S] \| --fact ID \| --entity NAME [--keep-episodes] \| --since/--until/--channel [--source S]) [--dry-run]` | 削除 (対象の種類はちょうど 1 つ) |
+| `forget (--episode ID \| --source-ref REF [--source S] \| --fact ID \| --entity NAME [--keep-episodes] \| --since/--until/--channel [--source S]) [--dry-run]` | 削除 (対象の種類はちょうど 1 つ。`--episode-id` / `--fact-id` / `--entity-id` は別名) |
 | `purge --yes [--dry-run]` | 設定中の group の全記憶を削除 |
-| `config [--extractor agent\|openai] [--embed-base-url URL\|openai] [--embed-model M] [--embed-dimensions N] [--llm-model M] [--group-id G] [--tz TZ] [--embed-api-key-env NAME] [--no-probe]` | 設定を表示 (秘密は出しません) / 変更。埋め込みの設定を変えるとエンドポイントを確認し、DB の埋め込みと合わないときは `reembed` を促します |
+| `config [--extractor agent\|openai] [--embed-base-url URL\|openai] [--embed-model M] [--embed-dimensions N] [--llm-model M] [--group-id G] [--tz TZ] [--embed-api-key-env NAME] [--search-min-similarity X\|default] [--no-probe]` | 設定を表示 (秘密は出しません) / 変更。埋め込みの設定を変えるとエンドポイントを確認し、DB の埋め込みと合わないときは `reembed` を促します |
 | `reembed [--yes] [--batch-size N] [--progress]` | すべてのエンティティとファクトの埋め込みを、設定中の埋め込みモデルで作り直す (`--yes` なしは計画の表示だけ) |
 | `mcp [--transport stdio\|streamable-http] [--read-only] [--extractor agent\|openai]` | MCP サーバー (エージェントが起動する。設定ファイルの DB / group / extractor / モデル / 埋め込みエンドポイントを自動で渡す) |
 | `setup` / `doctor [--online]` | 上記 (`doctor` は extractor、埋め込みの接続先・モデル・次元と、DB に記録された埋め込みとの一致も報告。`agent` モードでは OpenAI キーの確認は `skip`。`--online` で実際に 1 回呼びます) |
@@ -466,7 +468,11 @@ sqgraph-memory commit --token "$(jq -r .token prep.json)" --extraction extractio
 
 **忘れる**: `forget` / `purge` / MCP の `forget_memory` は、DB から対象のエピソード・ファクト・孤立したエンティティを消し、残ったエンティティの要約と埋め込みを再計算します (削除されたファクトに失効させられていたファクトは有効に戻ります)。削除後は SQLite の `secure_delete` と WAL チェックポイントで、消した本文が DB ファイルにそのまま残らないようにします。`--dry-run` で何が消えるか確認できます。次のものは対象外です: DB ファイルの外にあるコピー (バックアップ、クラウド同期、Litestream など)、エピソードを取り込むときに OpenAI API へ送った内容 (`--extractor openai` のとき。OpenAI のポリシーに従って保持されます)、および呼び出したエージェント (LLM) が `add` の結果として読んだ内容 (そのエージェントの会話ログ)。
 
-**データの場所と権限**: 既定は `~/.sqgraph-memory/` (`SQGRAPH_MEMORY_HOME` で変更)。中身は `memory.db`、`.env` (`OPENAI_API_KEY=...`。`extractor: "openai"` か OpenAI の埋め込みを使うときだけ)、`config.json` (`group_id` 既定 `me`、`tz` 既定 `Asia/Tokyo`、`extractor` 既定 `agent` (`agent` / `openai`。フィールドの無い既存の設定も `agent` として扱う)、`llm_model` (`openai` モード用)、`embed_model`、`embed_base_url` 既定 null = OpenAI API、`embed_dimensions` 既定 null = OpenAI なら 1536 / カスタムなら自動検出して保存、`embed_api_key_env` 既定 `SQGRAPH_EMBED_API_KEY`、`db`) です。POSIX ではディレクトリを 0700、ファイルを 0600 で作ります (Windows ではユーザープロファイルの ACL に任せます)。`SQGRAPH_MEMORY_DB` / `SQGRAPH_MEMORY_GROUP` / `SQGRAPH_MEMORY_EXTRACTOR` で DB・group・extractor を上書きできます。`setup` 実行時にこれら (と `SQGRAPH_MEMORY_HOME`) が設定されていれば、パスは絶対パスにして各エージェントの登録 (`env`) に引き継ぎます (`--dry-run` の出力にも表示)。API キーの値は出力にもログにも出しません。エージェントは MCP サーバーをシェルの環境変数なしで起動するため、キーは `.env` から読みます。
+**検索の関連性ゲート**: RRF の順位だけでは、小さな記憶だと無関係な質問にも全ファクトが返ってしまいます。そこで `search` / `answer` (と MCP の `search_memory`) は、候補ごとに証拠を確かめ、証拠のあるものだけを RRF で並べて返します。各候補の質問とのコサイン類似度 (`similarity`、ベクトルが無ければ null) は結果に付きます。残る条件 (どれか 1 つ): (a) 全文検索ヒット (ただし「ユーザー」「user」など全ファクトに出る語や、ファクトの半数以上に出る語はヒットと見なさない)、(b) `similarity >= min_similarity`、(c) 質問がエンティティ名・エイリアスをそのまま含むエンティティ (または `center_entity`) の 1 ホップのファクト (ユーザー本人のように全ファクトの半数以上を占めるハブや「ユーザー」という語での一致は弱い一致として扱う)、(d) 弱い一致 (全文の断片 / エンティティのベクトル) の 1 ホップ、または名指しされたエンティティの 2 ホップのファクトは `similarity >= min_similarity - 0.05`。さらに (b) / (d) だけで残った候補は、最良の候補の類似度より 0.08 以上低ければ落とします。埋め込みが使えないとき (キー / エンドポイント無し、サーバー停止中) は (a)、(c)、弱い一致の 1 ホップだけになり、全件は返しません。
+
+`min_similarity` の既定値は DB に記録された埋め込みモデルごとです (`text-embedding-3-small` 0.34、`-3-large` 0.32、`nomic-embed-text` (LM Studio の `text-embedding-nomic-embed-text-v1.5` を含む) 0.72、`bge-m3` 0.45、`ada-002` 0.78、不明なモデル 0.30)。モデルによって類似度の尺度が大きく違うためです (nomic はタスク接頭辞なしだと無関係な文でも 0.5〜0.7 が出ます)。`config --search-min-similarity X` で固定 (`default` で既定に戻す)、`search --min-similarity X` / MCP の `min_similarity` で 1 回だけ上書きできます。結果が空なのに記憶があるはずなら、別のキーワードや名前で検索するか、`min_similarity` を下げてください。`prepare_episode` (エージェント抽出) の `related_facts` / `candidate_entities` は、矛盾の見落としを避けるため検索より緩く (しきい値 −0.10 / −0.05、周辺の上位 6 件は常に) 選びます。
+
+**データの場所と権限**: 既定は `~/.sqgraph-memory/` (`SQGRAPH_MEMORY_HOME` で変更)。中身は `memory.db`、`.env` (`OPENAI_API_KEY=...`。`extractor: "openai"` か OpenAI の埋め込みを使うときだけ)、`config.json` (`group_id` 既定 `me`、`tz` 既定 `Asia/Tokyo`、`extractor` 既定 `agent` (`agent` / `openai`。フィールドの無い既存の設定も `agent` として扱う)、`llm_model` (`openai` モード用)、`embed_model`、`embed_base_url` 既定 null = OpenAI API、`embed_dimensions` 既定 null = OpenAI なら 1536 / カスタムなら自動検出して保存、`embed_api_key_env` 既定 `SQGRAPH_EMBED_API_KEY`、`search_min_similarity` 既定 null = 埋め込みモデルごとの既定値 (下の「検索の関連性ゲート」)、`db`) です。POSIX ではディレクトリを 0700、ファイルを 0600 で作ります (Windows ではユーザープロファイルの ACL に任せます)。`SQGRAPH_MEMORY_DB` / `SQGRAPH_MEMORY_GROUP` / `SQGRAPH_MEMORY_EXTRACTOR` で DB・group・extractor を上書きできます。`setup` 実行時にこれら (と `SQGRAPH_MEMORY_HOME`) が設定されていれば、パスは絶対パスにして各エージェントの登録 (`env`) に引き継ぎます (`--dry-run` の出力にも表示)。API キーの値は出力にもログにも出しません。エージェントは MCP サーバーをシェルの環境変数なしで起動するため、キーは `.env` から読みます。
 
 #### 埋め込みを LAN 内のサーバーで動かす
 
@@ -495,7 +501,7 @@ sqgraph-memory doctor --online      # エンドポイントに 1 回問い合わ
 - **API キー**: 多くのローカルサーバーはキー不要で、その場合ダミー値を送ります (`OPENAI_API_KEY` がこのエンドポイントに送られることはありません)。認証付きのサーバーでは環境変数 `SQGRAPH_EMBED_API_KEY` (名前は `--embed-api-key-env` で変更可) に入れて `init` を実行するか、`~/.sqgraph-memory/.env` に `SQGRAPH_EMBED_API_KEY=...` と書いてください。
 - **モデルを切り替えたら `reembed` が必要**: 次元数が同じでも別モデルのベクトルは比べられません。DB には使った埋め込みモデル・次元・エンドポイントが記録され、設定と合わないまま開こうとするとエラーで `sqgraph-memory reembed` を案内します (`config` / `doctor` も警告します)。`sqgraph-memory reembed` で計画 (件数) を確認し、`--yes` で全エンティティ・全ファクトを現在の設定で作り直します (次元数が変わるときはベクトルインデックスも作り直します。全件の埋め込みに成功してから 1 トランザクションで反映するので、サーバーが落ちても DB は元のままです。実行中は書き込みロックを保持します)。エンドポイントの URL だけを変える (同じモデル・同じ次元) 場合は `reembed` は不要です。
 - **通信は平文の HTTP です**: メモの本文 (エンティティ名・ファクト文・検索クエリ) がそのままそのサーバーに送られます。信頼できる LAN の中だけで使い、インターネットには公開しないでください (リバースプロキシで TLS を付けるなら `https://` の URL も指定できます)。サーバー側のログにメモが残る可能性にも注意してください。
-- サーバーが落ちている間の `search` などは数秒でエラーになります (接続 5 秒 / 全体 30 秒、リトライ 1 回)。`add` のバッチは 32 件ずつ送ります。
+- サーバーが落ちている間も `search` は数秒 (接続 5 秒 / 全体 30 秒、リトライ 1 回) でベクトルなしの検索 (全文 + エンティティ) に切り替わります。`add` / `commit` / `reembed` はエラーになります。`add` のバッチは 32 件ずつ送ります。
 
 ### Discord bot への組み込み (概要)
 

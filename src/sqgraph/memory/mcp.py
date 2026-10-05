@@ -25,11 +25,11 @@ import os
 import sys
 import threading
 import time
-from typing import Any
+from typing import Annotated, Any
 
 from ..db import GraphDB
 from ..errors import SqgraphError
-from .core import FACT_INDEX, Memory
+from .core import FACT_INDEX, NO_HITS_HINT, Memory
 from .providers import (
     DEFAULT_CHAT_MODEL,
     DEFAULT_EMBED_MODEL,
@@ -62,6 +62,17 @@ Look up a fact by id with MATCH ()-[f:FACT {id: $id}]->() (indexed). Typical que
 Times are UTC ISO-8601 strings ('2026-07-01T09:52:00Z'). A fact is valid at T when valid_at <= T and
 (invalid_at IS NULL or invalid_at > T). Contradicted facts are kept: invalid_at is set and superseded_by holds the id of the
 newer fact, whose supersedes property lists the ids of the older ones."""
+
+
+FORGET_USAGE = (
+    "Accepted selectors (give exactly one; dry_run and group_id may accompany it): "
+    "episode_id (alias episode) = one stored note, e.g. forget_memory(episode_id=\"ep_...\", dry_run=True); "
+    "fact_id (alias fact) = one fact, e.g. forget_memory(fact_id=\"fact_...\", dry_run=True); "
+    "entity (aliases entity_id, name) = an entity id or exact name, e.g. forget_memory(entity=\"Rails\", dry_run=True); "
+    "source_ref (optionally with source) = the note stored with that source_ref; "
+    "since / until / channel (optionally with source) = a time or channel range of notes. "
+    "Ids come from search_memory / get_entity / get_episodes results. Argument names not listed here are ignored by the server."
+)
 
 
 class MemoryTools:
@@ -197,6 +208,15 @@ class MemoryTools:
             raise PermissionError(f"channel {tok['channel']!r} is not among the allowed channels")
         return self._episode_summary(self.memory.commit_episode(token, extraction))
 
+    @staticmethod
+    def _alias(canonical: str, value: str | None, alias_name: str, alias_value: str | None) -> str | None:
+        """``value`` of the canonical parameter or of its alias (the same value given twice is fine, two different ones are not)."""
+        a = (alias_value or "").strip() or None
+        v = (value or "").strip() or None
+        if v and a and v != a:
+            raise ValueError(f"conflicting values for {canonical} and its alias {alias_name}: give only {canonical}")
+        return v or a
+
     def forget_memory(
         self,
         episode_id: str | None = None,
@@ -207,35 +227,60 @@ class MemoryTools:
         channel: str | None = None,
         dry_run: bool = False,
         group_id: str | None = None,
+        *,
+        episode: str | None = None,
+        fact: str | None = None,
+        entity_id: str | None = None,
+        name: str | None = None,
+        source_ref: str | None = None,
+        source: str | None = None,
     ) -> dict[str, Any]:
-        """Permanently delete memory; exactly one selector: ``episode_id`` | ``fact_id`` | ``entity`` | a
-        ``since`` / ``until`` / ``channel`` range. Disabled on read-only servers and with ``--allowed-channels``."""
+        """Permanently delete memory; exactly one selector: ``episode_id`` (alias ``episode``) | ``fact_id`` (alias
+        ``fact``) | ``entity`` (aliases ``entity_id``, ``name``) | ``source_ref`` (optionally with ``source``) | a
+        ``since`` / ``until`` / ``channel`` range (optionally with ``source``). Disabled on read-only servers and with
+        ``--allowed-channels``."""
         if self.read_only:
             raise PermissionError("this server is read-only (forget_memory is disabled)")
         if self.allowed is not None:
             raise PermissionError("forget_memory is not available with a channel restriction (--allowed-channels)")
-        selectors = [
-            name
-            for name, given in (
-                ("episode_id", episode_id),
-                ("fact_id", fact_id),
-                ("entity", entity),
-                ("since/until/channel", since or until or channel),
+        episode_id = self._alias("episode_id", episode_id, "episode", episode)
+        fact_id = self._alias("fact_id", fact_id, "fact", fact)
+        entity = self._alias("entity", entity, "entity_id", entity_id)
+        entity = self._alias("entity", entity, "name", name)
+        source_ref = (source_ref or "").strip() or None
+        source = (source or "").strip() or None
+        has_range = bool(since or until or channel)
+        given = [
+            label
+            for label, present in (
+                ("episode_id", bool(episode_id)),
+                ("fact_id", bool(fact_id)),
+                ("entity", bool(entity)),
+                ("source_ref", bool(source_ref)),
+                ("since/until/channel", has_range),
             )
-            if given
+            if present
         ]
-        if len(selectors) != 1:
-            raise ValueError("give exactly one of: episode_id, fact_id, entity, or a since/until/channel range")
+        if not given and source:  # `source` alone selects everything from that source (a range, like the CLI)
+            given = ["source"]
+        if len(given) != 1:
+            raise ValueError(
+                f"forget_memory needs exactly one selector, got {', '.join(given) if given else 'none'}. " + FORGET_USAGE
+            )
+        if source and given[0] in ("episode_id", "fact_id", "entity"):
+            raise ValueError(f"`source` only qualifies `source_ref` or a since/until/channel range, not {given[0]}. " + FORGET_USAGE)
         group = self._group(group_id)
         if episode_id:
             res = self.memory.forget_episode(episode_id, group_id=group, dry_run=dry_run)
+        elif source_ref:
+            res = self.memory.forget_episode(source=source, source_ref=source_ref, group_id=group, dry_run=dry_run)
         elif fact_id:
             res = self.memory.forget_fact(fact_id, group_id=group, dry_run=dry_run)
         elif entity:
             res = self.memory.forget_entity(entity, group_id=group, dry_run=dry_run)
         else:
             res = self.memory.forget_range(
-                since=since or None, until=until or None, channel=channel or None, group_id=group, dry_run=dry_run
+                since=since or None, until=until or None, channel=channel or None, source=source, group_id=group, dry_run=dry_run
             )
         return {"group_id": group, **res.to_dict()}
 
@@ -249,6 +294,7 @@ class MemoryTools:
         limit: int = 10,
         include_invalid: bool = False,
         include_planned: bool = True,
+        min_similarity: float | None = None,
     ) -> dict[str, Any]:
         group = self._group(group_id)
         hits = self.memory.search(
@@ -260,8 +306,18 @@ class MemoryTools:
             limit=max(1, min(limit, 50)),
             include_invalid=include_invalid,
             include_future=include_planned and as_of is None,
+            min_similarity=min_similarity,
         )
-        return {"group_id": group, "as_of": as_of, "count": len(hits), "facts": [h.to_dict() for h in hits]}
+        out: dict[str, Any] = {
+            "group_id": group,
+            "as_of": as_of,
+            "min_similarity": round(self.memory.effective_min_similarity(min_similarity), 4),
+            "count": len(hits),
+            "facts": [h.to_dict() for h in hits],
+        }
+        if not hits:
+            out["hint"] = NO_HITS_HINT
+        return out
 
     def search_entities(
         self,
@@ -431,10 +487,11 @@ TOOL_DOCS = {
         "just stores the note. Not available on read-only servers."
     ),
     "forget_memory": (
+        "Example: forget_memory(episode_id=\"ep_...\", dry_run=True). "
         "PERMANENTLY delete memory, only when the user explicitly asks to forget something. Give exactly one of: "
-        "episode_id (one stored message/note), fact_id, entity (id or exact name: the entity, all its facts and the "
-        "episodes mentioning it) or a time/channel range (since / until / channel: episodes with since <= occurred_at "
-        "< until). Facts that only the deleted episodes supported go too; facts they had superseded become valid "
+        "episode_id (one stored message/note; alias episode), fact_id (alias fact), entity (id or exact name: the entity, "
+        "all its facts and the episodes mentioning it; aliases entity_id, name), source_ref (+ optional source) or a "
+        "time/channel range (since / until / channel: episodes with since <= occurred_at < until). Facts that only the deleted episodes supported go too; facts they had superseded become valid "
         "again; entities left without any mention are removed. Use dry_run=true first to preview what would be "
         "deleted (ids returned), and confirm with the user. Returns the ids deleted / restored / updated. Not "
         "available on read-only servers or with --allowed-channels (forgetting across channel ACLs is unsupported)."
@@ -445,7 +502,11 @@ TOOL_DOCS = {
         "status of Y?', 'what was decided about Z?'. Returns facts with validity intervals, status (valid / ended / "
         "scheduled) and source episodes (author, time, channel, source_ref) that you should cite. as_of='2026-07-20' "
         "answers as of a past date; include_invalid=true also returns superseded/ended facts (history, 'how did it "
-        "change?'); center_entity ranks facts near a person/service first."
+        "change?'); center_entity ranks facts near a person/service first. Only facts that look relevant to the query "
+        "are returned (a keyword hit, a named entity, or semantic `similarity` >= min_similarity), so an unrelated "
+        "query returns nothing: that means the memory has nothing on it. Each fact carries its cosine `similarity` "
+        "to the query. If you expect a memory but get none, retry with other keywords / names or a lower "
+        "min_similarity (the value in force is returned as `min_similarity`)."
     ),
     "search_entities": (
         "Find entities (people, services, repos, teams, tickets, projects, events, concepts) by name, alias or "
@@ -472,9 +533,23 @@ TOOL_DOCS = {
 }
 
 
+_EXPECTED_ERRORS = (ValueError, PermissionError, RuntimeError, TimeoutError, SqgraphError)
+
+
+def _tool_error_class() -> Any:
+    """The SDK's ``ToolError`` (an exception whose message is shown to the client), or ``None``."""
+    for mod in ("mcp.server.mcpserver.exceptions", "mcp.server.fastmcp.exceptions"):
+        try:
+            return __import__(mod, fromlist=["ToolError"]).ToolError
+        except (ImportError, AttributeError):
+            continue
+    return None
+
+
 def build_server(tools: MemoryTools, name: str = "sqgraph-memory") -> Any:
     """Register ``tools`` with the MCP SDK and return the server object (``.run(transport)``)."""
     import anyio
+    from pydantic import Field
 
     try:  # mcp >= 2
         from mcp.server.mcpserver import MCPServer as _Server
@@ -482,11 +557,19 @@ def build_server(tools: MemoryTools, name: str = "sqgraph-memory") -> Any:
         from mcp.server.fastmcp import FastMCP as _Server  # type: ignore[no-redef]
 
     server = _Server(name, instructions=INSTRUCTIONS)
+    tool_error = _tool_error_class()
 
     def wrap(fn: Any) -> Any:
         @functools.wraps(fn)
         async def run(**kwargs: Any) -> dict[str, Any]:
-            return await anyio.to_thread.run_sync(functools.partial(fn, **kwargs))
+            try:
+                return await anyio.to_thread.run_sync(functools.partial(fn, **kwargs))
+            except _EXPECTED_ERRORS as exc:
+                # mcp >= 2 shows the client only "Error executing tool X" for an exception that is not a ToolError:
+                # an anticipated error (bad argument, permission, read-only, ...) must say what is wrong
+                if tool_error is None:
+                    raise
+                raise tool_error(str(exc)) from exc
 
         return run
 
@@ -533,6 +616,12 @@ def build_server(tools: MemoryTools, name: str = "sqgraph-memory") -> Any:
             channel: str | None = None,
             dry_run: bool = False,
             group_id: str | None = None,
+            episode: Annotated[str | None, Field(description="alias of episode_id")] = None,
+            fact: Annotated[str | None, Field(description="alias of fact_id")] = None,
+            entity_id: Annotated[str | None, Field(description="alias of entity (an entity id)")] = None,
+            name: Annotated[str | None, Field(description="alias of entity (an exact entity name)")] = None,
+            source_ref: Annotated[str | None, Field(description="select the note stored with this source_ref")] = None,
+            source: Annotated[str | None, Field(description="with source_ref, or with since/until/channel: only notes of this source")] = None,
         ) -> dict[str, Any]:
             return await wrap(tools.forget_memory)(
                 episode_id=episode_id,
@@ -543,6 +632,12 @@ def build_server(tools: MemoryTools, name: str = "sqgraph-memory") -> Any:
                 channel=channel,
                 dry_run=dry_run,
                 group_id=group_id,
+                episode=episode,
+                fact=fact,
+                entity_id=entity_id,
+                name=name,
+                source_ref=source_ref,
+                source=source,
             )
 
     @server.tool(name="search_memory", description=TOOL_DOCS["search_memory"])
@@ -555,6 +650,10 @@ def build_server(tools: MemoryTools, name: str = "sqgraph-memory") -> Any:
         include_planned: bool = True,
         channels: list[str] | None = None,
         group_id: str | None = None,
+        min_similarity: Annotated[
+            float | None,
+            Field(description="minimum cosine similarity (-1..1) of a semantic match; default: per embedding model. Lower it to see weaker matches"),
+        ] = None,
     ) -> dict[str, Any]:
         return await wrap(tools.search_memory)(
             query=query,
@@ -565,6 +664,7 @@ def build_server(tools: MemoryTools, name: str = "sqgraph-memory") -> Any:
             limit=limit,
             include_invalid=include_invalid,
             include_planned=include_planned,
+            min_similarity=min_similarity,
         )
 
     @server.tool(name="search_entities", description=TOOL_DOCS["search_entities"])
@@ -678,6 +778,12 @@ def main(argv: list[str] | None = None) -> None:
         default="SQGRAPH_EMBED_API_KEY",
         help="environment variable (or .env key) holding an optional API key for --embed-base-url",
     )
+    ap.add_argument(
+        "--min-similarity",
+        type=float,
+        help="relevance gate of search_memory: minimum cosine similarity (-1..1) of a semantic match "
+        "(default: per embedding model, e.g. 0.34 for text-embedding-3-small, 0.72 for nomic-embed-text)",
+    )
     ap.add_argument("--tz", default="Asia/Tokyo", help="timezone for naive timestamps / displayed times")
     ap.add_argument("--max-rows", type=int, default=100)
     ap.add_argument("--query-timeout", type=float, default=10.0)
@@ -713,7 +819,15 @@ def main(argv: list[str] | None = None) -> None:
             llm = OpenAILLM(args.llm_model, tracker=tracker)
         else:
             write_blocker = "OPENAI_API_KEY is not set: add_memory needs the OpenAI API (run `sqgraph-memory init`), or use --extractor agent"
-    memory = Memory(args.db, llm, embedder, default_group_id=args.group_id, tz=args.tz, read_only=args.read_only)
+    memory = Memory(
+        args.db,
+        llm,
+        embedder,
+        default_group_id=args.group_id,
+        tz=args.tz,
+        read_only=args.read_only,
+        min_similarity=args.min_similarity,
+    )
     tools = MemoryTools(
         memory,
         group_id=args.group_id,

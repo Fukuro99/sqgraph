@@ -272,7 +272,9 @@ def test_search_group_isolation_and_center_entity():
 
 
 def test_entity_expansion_finds_multi_hop_facts():
-    mem, _ = make()
+    # the relevance gate is switched off here (min_similarity=-1, no relative cut): this is about the graph expansion;
+    # the gate itself is tested in test_memory_relevance.py (2-hop facts then need semantic evidence)
+    mem, _ = make(min_similarity=-1.0, relative_margin=2.0)
     ep(mem, "[[alice|Person]] [[Rails|Service]] {{alice|WORKS_ON|Rails}}")
     ep(mem, "[[Rails|Service]] [[Postgres|Service]] {{Rails|DEPENDS_ON|Postgres}}", at="2026-07-02 10:00")
     hits = mem.search("alice", channels=["backend"], limit=10)

@@ -27,6 +27,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import logging
 import os
 import re
 import threading
@@ -63,6 +64,8 @@ from .util import (
     clean_message,
 )
 
+log = logging.getLogger("sqgraph.memory.core")
+
 ENTITY_INDEX = "entity_emb"
 FACT_INDEX = "fact_emb"
 ENTITY_FT = "entity_ft"
@@ -84,6 +87,50 @@ _MIGRATIONS: dict[int, Callable[["Memory"], None]] = {}
 META_EMBED_MODEL = "embed_model"
 META_EMBED_DIMS = "embed_dimensions"
 META_EMBED_ENDPOINT = "embed_endpoint"
+
+# --- relevance gate of :meth:`Memory.search` -----------------------------------------------------------------------
+# Cosine similarity between the query and a fact below which a candidate has no semantic evidence. Embedding models
+# differ a lot in how similarities are scaled (text-embedding-3-small: related ~0.3-0.7, unrelated ~0.0-0.3; nomic-embed
+# without task prefixes: related ~0.6-0.8, unrelated ~0.45-0.7), so the default depends on the model name (substring
+# match on the case-folded model id). Values marked "measured" come from a calibration on ~40 Japanese personal facts
+# and ~30 queries (see the commit notes); "estimate" ones are typical ranges, not measured here.
+MIN_SIMILARITY_BY_MODEL: tuple[tuple[str, float], ...] = (
+    ("text-embedding-3-small", 0.34),  # measured
+    ("text-embedding-3-large", 0.32),  # estimate (3-large is scaled like 3-small, slightly lower)
+    ("text-embedding-ada-002", 0.78),  # estimate (ada-002 cosines rarely fall below ~0.7)
+    ("nomic-embed-text", 0.72),  # measured (LM Studio id text-embedding-nomic-embed-text-v1.5, Ollama nomic-embed-text)
+    ("bge-m3", 0.45),  # estimate
+)
+MIN_SIMILARITY_UNKNOWN_MODEL = 0.30  # an embedder with an unrecognised model name: low, so it only trims the clearly unrelated
+MIN_SIMILARITY_NO_MODEL = 0.25  # embedders that do not name a model (FakeEmbedder: hashed character trigrams)
+EXPAND_SLACK = 0.05  # facts reached through the graph (weakly) need only ``min_similarity - EXPAND_SLACK``
+RELATIVE_MARGIN = 0.08  # vector-only candidates must be within this of the best candidate's similarity
+# prepare_episode (agent extraction) is more permissive than search: a missed fact may be a missed contradiction
+PREPARE_ENTITY_SLACK = 0.05  # candidate entities (vector match): min_similarity - this
+PREPARE_FACT_SLACK = 0.10  # related facts: min_similarity - this ...
+PREPARE_MIN_RELATED = 6  # ... but the best this-many facts around the message are always offered
+HUB_MIN_FACTS = 5  # an entity with >= this many facts that make up >= half of all facts is a "hub" (e.g. the user)
+# Words that stand for "the user" in personal memory: they occur in nearly every fact, so they are no evidence
+PERSONA_TERMS = frozenset(
+    {"ユーザー", "ユーザ", "user", "users", "the user", "me", "my", "私", "わたし", "僕", "ぼく", "俺", "おれ", "自分", "あなた", "本人"}
+)
+
+
+NO_HITS_HINT = (
+    "nothing passed the relevance gate (a fact needs a keyword hit, a named entity or similarity >= min_similarity): "
+    "try other keywords or names, or lower min_similarity"
+)
+
+
+def default_min_similarity(model: str | None) -> float:
+    """Default relevance threshold (cosine) for an embedding ``model`` name (``None``: an embedder without a model name)."""
+    if not model:
+        return MIN_SIMILARITY_NO_MODEL
+    m = str(model).casefold()
+    for key, value in MIN_SIMILARITY_BY_MODEL:
+        if key in m:
+            return value
+    return MIN_SIMILARITY_UNKNOWN_MODEL
 
 
 # --------------------------------------------------------------------------- result types
@@ -124,11 +171,13 @@ class FactHit:
     episodes: list[EpisodeRef] = field(default_factory=list)
     superseded_by: str | None = None
     supersedes: list[str] = field(default_factory=list)
+    similarity: float | None = None  # cosine similarity of the fact to the query (None: no vector evidence)
 
     def to_dict(self) -> dict[str, Any]:
         d = dict(self.__dict__)
         d["episodes"] = [e.to_dict() for e in self.episodes]
         d["score"] = round(self.score, 5)
+        d["similarity"] = None if self.similarity is None else round(self.similarity, 4)
         return d
 
 
@@ -332,6 +381,12 @@ class Memory:
         Skip the embedding identity / dimension check (for :meth:`reembed`, which replaces every vector).
         Otherwise a database built with another embedding model or dimension is refused (``SqgraphError``).
 
+    min_similarity:
+        Cosine similarity a fact needs to count as semantically related to a query (the relevance gate of
+        :meth:`search`). ``None`` = a default for the embedding model of the database (:func:`default_min_similarity`).
+        ``expand_slack`` lowers that bar for facts reached through the entity graph; ``relative_margin`` drops
+        vector-only candidates that are further than this below the best candidate.
+
     A database opened here has ``PRAGMA secure_delete=ON``: forgotten data is overwritten, not left in free pages.
     """
 
@@ -349,8 +404,14 @@ class Memory:
         clock: Callable[[], datetime] | None = None,
         lock_timeout: float = 300.0,
         allow_embedder_change: bool = False,
+        min_similarity: float | None = None,
+        expand_slack: float = EXPAND_SLACK,
+        relative_margin: float = RELATIVE_MARGIN,
     ) -> None:
         self._allow_embedder_change = allow_embedder_change
+        self.min_similarity = self._check_similarity(min_similarity)
+        self.expand_slack = float(expand_slack)
+        self.relative_margin = float(relative_margin)
         self._owns_db = not isinstance(db, GraphDB)
         self.db = db if isinstance(db, GraphDB) else GraphDB(db, read_only=read_only, secure_delete=True)
         self.llm = llm
@@ -618,6 +679,70 @@ class Memory:
             return None
         return self.embedder.embed([text])[0]
 
+    def _embed_query_or_none(self, text: str) -> list[float] | None:
+        """Like :meth:`_embed_query`, but an embedder that fails (endpoint down) means "no vector evidence"."""
+        try:
+            return self._embed_query(text)
+        except Exception as exc:  # noqa: BLE001 - any provider error: degrade to fulltext + entity search
+            log.warning("query embedding failed (%s: %s): searching without vectors", type(exc).__name__, str(exc)[:200])
+            return None
+
+    # -- relevance gate helpers ----------------------------------------------------------------------
+
+    @staticmethod
+    def _check_similarity(value: float | None) -> float | None:
+        if value is None:
+            return None
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not -1.0 <= float(value) <= 1.0:
+            raise ValueError(f"min_similarity must be a number between -1 and 1 (cosine similarity), got {value!r}")
+        return float(value)
+
+    def effective_min_similarity(self, override: float | None = None) -> float:
+        """The relevance threshold in force: the per-call ``override``, else the constructor value, else the default of the
+        embedding model recorded in the database (or of the configured embedder)."""
+        v = self._check_similarity(override)
+        if v is None:
+            v = self.min_similarity
+        if v is not None:
+            return v
+        if self.embedder is None:
+            return MIN_SIMILARITY_UNKNOWN_MODEL
+        if not getattr(self.embedder, "model", None):
+            return MIN_SIMILARITY_NO_MODEL
+        ident = self.embedding_identity()
+        return default_min_similarity((ident or {}).get("model") or getattr(self.embedder, "model", None))
+
+    def _fact_total(self, group: str) -> int:
+        rows = self.db.query("MATCH ()-[f:FACT {group_id:$g}]->() RETURN count(f) AS n", {"g": group})
+        return int(rows[0]["n"]) if rows else 0
+
+    def _generic_terms(self, group: str, terms: Sequence[str], total: int) -> set[str]:
+        """Query terms that carry no evidence: persona words ("ユーザー", "user", ...) and terms occurring in at least half
+        of all facts (>= 3 facts). In a personal memory nearly every fact mentions the user, so a fulltext hit on such a
+        term says nothing about relevance."""
+        generic = {t for t in terms if t in PERSONA_TERMS}
+        if total >= 4:
+            for t in [t for t in terms if t not in generic and len(t) >= 3][:20]:
+                rows = self.db.query(
+                    "MATCH ()-[f:FACT {group_id:$g}]->() WHERE f.text_norm CONTAINS $t RETURN count(f) AS n", {"g": group, "t": t}
+                )
+                df = int(rows[0]["n"]) if rows else 0
+                if df >= 3 and df * 2 >= total:
+                    generic.add(t)
+        return generic
+
+    def _fact_sims(self, facts: Iterable[Relationship], qvec: list[float] | None) -> dict[str, float | None]:
+        """Cosine similarity of the stored fact vectors to ``qvec`` (``None`` for a fact without a vector / no ``qvec``)."""
+        facts = list(facts)
+        if qvec is None or not facts:
+            return {f["id"]: None for f in facts}
+        ix = next(i for i in self.db.vector_indexes() if i.name == FACT_INDEX)
+        out: dict[str, float | None] = {}
+        for f in facts:
+            v = self.db._vec_read(ix, f.id)
+            out[f["id"]] = cosine(qvec, v) if v else None
+        return out
+
     # ================================================================== INGESTION
 
     def add_episode(
@@ -848,12 +973,16 @@ class Memory:
         if q:
             for rank, (n, _) in enumerate(self.db.fulltext_search(ENTITY_FT, q, k=max(limit, 5) * 2)):
                 add(n, 50.0 - rank * 0.1)
-        for rank, n in enumerate(self._match_entities(group, allowed, text, terms, qvec, None, limit=max(limit, 5))):
+        # entity vectors: more permissive than search (a missed candidate may hide a contradiction), but not "any entity"
+        floor = self.effective_min_similarity() - PREPARE_ENTITY_SLACK
+        for rank, n in enumerate(
+            self._match_entities(group, allowed, text, terms, qvec, None, limit=max(limit, 5), min_similarity=floor)
+        ):
             add(n, 40.0 - rank * 0.1)
         if qvec is not None:
             for n, s in self.db.vector_search(ENTITY_INDEX, qvec, k=max(limit, 5)):
                 # an entity embedding encodes its summaries: only trust it when every source channel is visible here
-                if s >= 0.5 and set(n.get("summary_channels", [])) <= allowed:
+                if (2.0 * s - 1.0) >= floor and set(n.get("summary_channels", [])) <= allowed:
                     add(n, 20.0 * s)
         ranked = sorted(scored.items(), key=lambda kv: -kv[1])[:limit]
         return [nodes[i] for i, _ in ranked]
@@ -868,8 +997,8 @@ class Memory:
         entities: list[Node],
         limit: int,
     ) -> list[dict[str, Any]]:
-        """Facts valid / scheduled at ``occurred_iso`` and visible in ``channel``: those touching ``entities`` plus
-        vector / fulltext matches of the message, fused with RRF."""
+        """Facts valid / scheduled at ``occurred_iso`` and visible in ``channel``: those touching ``entities`` (when
+        they have some evidence of relevance, see below) plus vector / fulltext matches of the message, fused with RRF."""
         if limit <= 0:
             return []
         allowed = {channel}
@@ -881,31 +1010,64 @@ class Memory:
                 and _fact_status(f.properties, occurred_iso) in ("valid", "scheduled")
             )
 
+        # Not every fact touching the author / a hub entity (the user) is related to the message: those need evidence
+        # (similarity above a permissive floor, or a fulltext hit on an informative term). Facts of an entity the
+        # message names stay. Deliberately more permissive than search: a missed fact may be a missed contradiction.
+        floor = self.effective_min_similarity() - PREPARE_FACT_SLACK
+        total = self._fact_total(group)
+        terms = query_terms(text)[:60]
+        generic = self._generic_terms(group, terms, total)
+        ckey = _content_key(text)
         pool: dict[str, Relationship] = {}
         touching: dict[str, Relationship] = {}
+        named: set[str] = set()
         for n in entities:
-            for f in self._facts_of_entity(n["id"], group):
+            allf = self._facts_of_entity(n["id"], group)
+            nm, als = self._visible_forms(n.properties, allowed)
+            forms = [norm_key(f) for f in [nm, *als]]
+            literal = any(k and k in ckey and k not in PERSONA_TERMS and (len(k) >= 3 or not k.isascii()) for k in forms)
+            hub = len(allf) >= HUB_MIN_FACTS and len(allf) * 2 >= total
+            for f in allf:
                 if ok(f):
                     touching[f["id"]] = f
-        around = list(touching.values())
-        self._rank_by_similarity(around, qvec)
+                    if literal and not hub:
+                        named.add(f["id"])
+        sims: dict[str, float | None] = self._fact_sims(touching.values(), qvec)
         pool.update(touching)
-        lists: list[tuple[float, list[str]]] = [(1.0, [f["id"] for f in around[: limit * 2]])]
+        vec_ids: list[str] = []
         if qvec is not None:
-            ids = []
-            for f, _ in self.db.vector_search(FACT_INDEX, qvec, k=max(40, limit * 3)):
+            for f, sc in self.db.vector_search(FACT_INDEX, qvec, k=max(40, limit * 3)):
                 if ok(f):
-                    pool[f["id"]] = f
-                    ids.append(f["id"])
-            lists.append((0.8, ids))
-        q = fts_or_query(query_terms(text)[:60])
+                    sims[f["id"]] = 2.0 * sc - 1.0
+                    if len(vec_ids) < PREPARE_MIN_RELATED or sims[f["id"]] >= floor:
+                        pool[f["id"]] = f
+                        vec_ids.append(f["id"])
+        ft_ids: list[str] = []
+        q = fts_or_query([t for t in terms if t not in generic])
         if q:
-            ids = []
             for f, _ in self.db.fulltext_search(FACT_FT, q, k=max(40, limit * 3)):
                 if ok(f):
                     pool[f["id"]] = f
-                    ids.append(f["id"])
-            lists.append((0.8, ids))
+                    ft_ids.append(f["id"])
+        ftset = set(ft_ids)
+        if qvec is None:
+            ranked_touch = sorted(touching.values(), key=lambda f: f.get("valid_at", ""), reverse=True)
+        else:
+            ranked_touch = sorted(touching.values(), key=lambda f: -(sims[f["id"]] if sims.get(f["id"]) is not None else -2.0))  # type: ignore[operator]
+        around = [
+            f
+            for i, f in enumerate(ranked_touch)
+            if f["id"] in named
+            or f["id"] in ftset
+            or sims.get(f["id"]) is None
+            or sims[f["id"]] >= floor  # type: ignore[operator]
+            or i < PREPARE_MIN_RELATED
+        ]
+        lists: list[tuple[float, list[str]]] = [(1.0, [f["id"] for f in around[: limit * 2]])]
+        if vec_ids:
+            lists.append((0.8, vec_ids))
+        if ft_ids:
+            lists.append((0.8, ft_ids))
         ranked = sorted(_rrf(lists).items(), key=lambda kv: -kv[1])[:limit]
         facts = [pool[i] for i, _ in ranked]
         ents = self._nodes("Entity", {x for f in facts for x in (f.get("subject_id"), f.get("object_id")) if x}, group)
@@ -1942,6 +2104,7 @@ class Memory:
         allowed: set[str] | None,
         at: str,
         max_episodes: int = 3,
+        sims: dict[str, float | None] | None = None,
     ) -> list[FactHit]:
         if not facts:
             return []
@@ -1984,6 +2147,7 @@ class Memory:
                     episodes=[eps[e] for e in f.get("episode_ids", []) if e in eps][:max_episodes],
                     superseded_by=f.get("superseded_by") if link_visible(f.get("superseded_by")) else None,
                     supersedes=[i for i in f.get("supersedes", []) if link_visible(i)],
+                    similarity=(sims or {}).get(f["id"]),
                 )
             )
         return out
@@ -2001,13 +2165,32 @@ class Memory:
         limit: int = 10,
         include_invalid: bool = False,
         include_future: bool = False,
+        min_similarity: float | None = None,
     ) -> list[FactHit]:
         """Hybrid temporal fact search.
 
         Candidates come from (1) vector search over fact sentences, (2) trigram fulltext over facts,
-        (3) entity matching (name / alias / vector) followed by 1-2 hop graph expansion over facts;
-        they are fused with reciprocal-rank fusion and optionally re-ranked by graph distance to
-        ``center_entity``.
+        (3) entity matching (name / alias / vector) followed by 1-2 hop graph expansion over facts.
+        A relevance gate then keeps only candidates with evidence (see below) and the survivors are fused with
+        reciprocal-rank fusion (``score``) and optionally re-ranked by graph distance to ``center_entity``. A query
+        nothing relates to returns ``[]`` (or very few facts) instead of every fact in the memory.
+
+        Relevance gate. For every candidate the cosine ``similarity`` to the query is computed from the stored fact
+        vector (``None`` without an embedder / vector); ``min_similarity`` (default: per embedding model, see
+        :func:`default_min_similarity`; per-call override) is its threshold. A candidate is kept if
+
+        * (a) it is a fulltext hit on an informative query term (persona words such as "ユーザー" and terms in half of
+          all facts do not count), or
+        * (b) ``similarity >= min_similarity``, or
+        * (c) it is a fact of an entity the query names (an entity name / alias occurs in the query, or ``center_entity``;
+          an entity that is a "hub" of the memory, e.g. the user, only counts as a weak match), or
+        * (d) it is a fact of a weakly matched entity (fulltext fragment / entity vector similarity), or one hop
+          further from a named entity, and ``similarity >= min_similarity - expand_slack``. Two hops from a weak
+          match only count through (a) / (b).
+
+        Candidates that survive only through (b) / (d) are also dropped when ``similarity`` is more than
+        ``relative_margin`` below the best candidate. Without a query vector (no embedder, endpoint down, fact without
+        a vector) only (a), (c) and the facts of weakly matched entities remain.
 
         * ``channels``: allowed source channels (``None`` = all, ``[]`` = nothing). A fact is returned only
           if at least one of the episodes asserting it comes from an allowed channel; episode citations
@@ -2018,7 +2201,7 @@ class Memory:
           (``status="scheduled"``).
         """
         hits, _ = self._search(
-            query, group_id, channels, as_of, center_entity, limit, include_invalid, include_future
+            query, group_id, channels, as_of, center_entity, limit, include_invalid, include_future, min_similarity
         )
         return hits
 
@@ -2032,14 +2215,18 @@ class Memory:
         limit: int,
         include_invalid: bool,
         include_future: bool,
+        min_similarity: float | None = None,
     ) -> tuple[list[FactHit], list[Node]]:
         group = self._group(group_id)
         allowed = _channel_set(channels)
         if allowed is not None and not allowed:
             return [], []
         at = self._as_of(as_of)
-        qvec = self._embed_query(query)
+        thr = self.effective_min_similarity(min_similarity)
+        qvec = self._embed_query_or_none(query)
         terms = query_terms(query)
+        total = self._fact_total(group)
+        generic = self._generic_terms(group, terms, total)
 
         def ok(f: Relationship) -> bool:
             if f.get("group_id") != group or not self._fact_visible(f.properties, allowed):
@@ -2048,38 +2235,89 @@ class Memory:
             return st == "valid" or (st == "ended" and include_invalid) or (st == "scheduled" and include_future)
 
         pool: dict[str, Relationship] = {}
+        sims: dict[str, float | None] = {}  # cosine similarity to the query (None: no vector evidence)
+        ft_hits: set[str] = set()  # fulltext hits on informative terms
+        # how a fact was reached through entities: 1 strong hop-1, 2 weak hop-1, 3 strong hop-2, 4 weak hop-2
+        tier: dict[str, int] = {}
         lists: list[tuple[float, list[str]]] = []
         # (1) vector over facts
         if qvec is not None:
             k = max(60, limit * 6)
             ids = []
-            for n, _ in self.db.vector_search(FACT_INDEX, qvec, k=k):
+            for n, s in self.db.vector_search(FACT_INDEX, qvec, k=k):
                 if ok(n):
                     pool[n["id"]] = n
                     ids.append(n["id"])
+                    sims[n["id"]] = 2.0 * s - 1.0  # cosine index: score = (1 + cos) / 2
             lists.append((1.0, ids))
-        # (2) fulltext over facts
-        q = fts_or_query(terms)
+        # (2) fulltext over facts (informative terms only)
+        q = fts_or_query([t for t in terms if t not in generic])
         if q:
             ids = []
             for n, _ in self.db.fulltext_search(FACT_FT, q, k=max(40, limit * 4)):
                 if ok(n):
                     pool[n["id"]] = n
                     ids.append(n["id"])
+                    ft_hits.add(n["id"])
             lists.append((0.8, ids))
         # (3) entity match + graph expansion
-        matched = self._match_entities(group, allowed, query, terms, qvec, center_entity, limit=5)
+        matched = self._match_entities_ex(
+            group, allowed, query, terms, qvec, center_entity, limit=5, min_similarity=thr, hub_total=total
+        )
+        hop1_ids: list[str] = []
+        hop2_ids: list[str] = []
         if matched:
-            hop1_ids, hop1_facts, neighbour_ids = self._expand(group, [m.get("id") for m in matched], ok)
-            self._rank_by_similarity(hop1_facts, qvec)
-            pool.update({f["id"]: f for f in hop1_facts})
-            lists.append((0.9, [f["id"] for f in hop1_facts]))
-            if neighbour_ids:
-                _, hop2_facts, _ = self._expand(group, neighbour_ids[:8], ok, skip=set(hop1_ids))
-                self._rank_by_similarity(hop2_facts, qvec)
-                pool.update({f["id"]: f for f in hop2_facts})
-                lists.append((0.5, [f["id"] for f in hop2_facts]))
-        scores = _rrf(lists)
+            strong = [n["id"] for n, st in matched if st == "strong"]
+            weak = [n["id"] for n, st in matched if st != "strong"]
+            _, facts1s, neigh_s = self._expand(group, strong, ok)
+            _, facts1w, neigh_w = self._expand(group, weak, ok)
+            hop1 = {f["id"]: f for f in [*facts1w, *facts1s]}
+            for f in facts1w:
+                tier[f["id"]] = 2
+            for f in facts1s:
+                tier[f["id"]] = 1
+            skip = set(hop1)
+            _, facts2s, _ = self._expand(group, neigh_s[:8], ok, skip=skip)
+            _, facts2w, _ = self._expand(group, neigh_w[:8], ok, skip=skip)
+            hop2 = {f["id"]: f for f in [*facts2w, *facts2s]}
+            for f in facts2w:
+                tier[f["id"]] = 4
+            for f in facts2s:
+                tier[f["id"]] = 3
+            pool.update(hop1)
+            pool.update(hop2)
+            hop1_ids, hop2_ids = list(hop1), list(hop2)
+        # similarity of every candidate to the query
+        sims.update(self._fact_sims([f for i, f in pool.items() if i not in sims], qvec))
+
+        def ordered(ids: list[str]) -> list[str]:
+            if qvec is None:
+                return sorted(ids, key=lambda i: pool[i].get("valid_at", ""), reverse=True)
+            return sorted(ids, key=lambda i: -(sims[i] if sims.get(i) is not None else -2.0))
+
+        if hop1_ids:
+            lists.append((0.9, ordered(hop1_ids)))
+        if hop2_ids:
+            lists.append((0.5, ordered(hop2_ids)))
+
+        # relevance gate: keep a candidate only with evidence (see search())
+        known = [v for v in sims.values() if v is not None]
+        rel_floor = max(known) - self.relative_margin if known else None
+        slack = self.expand_slack
+        survivors: set[str] = set()
+        for fid in pool:
+            if fid in ft_hits or tier.get(fid) == 1:  # (a) fulltext, (c) fact of a named entity
+                survivors.add(fid)
+                continue
+            sv = sims.get(fid)
+            if sv is None:  # no vector evidence: the facts of a (fulltext-)matched entity are all there is
+                if tier.get(fid) == 2:
+                    survivors.add(fid)
+                continue
+            if sv >= thr or (tier.get(fid) in (2, 3) and sv >= thr - slack):  # (b) / (d)
+                if rel_floor is None or sv >= rel_floor:
+                    survivors.add(fid)
+        scores = _rrf([(w, [i for i in ids if i in survivors]) for w, ids in lists])
         if center_entity:
             center = self._resolve_entity_ref(group, allowed, center_entity)
             if center is not None:
@@ -2090,8 +2328,8 @@ class Memory:
                     if d < 99:
                         scores[fid] = s + 0.02 / (1 + d)
         ranked = sorted(scores.items(), key=lambda kv: -kv[1])[:limit]
-        hits = self._to_hits(group, [(pool[i], s) for i, s in ranked], allowed, at)
-        return hits, matched
+        hits = self._to_hits(group, [(pool[i], s) for i, s in ranked], allowed, at, sims=sims)
+        return hits, [n for n, _ in matched]
 
     def _as_of(self, as_of: str | datetime | None) -> str:
         if as_of is None:
@@ -2164,10 +2402,43 @@ class Memory:
         qvec: list[float] | None,
         center: str | None,
         limit: int = 5,
+        *,
+        min_similarity: float | None = None,
     ) -> list[Node]:
         """Entities the query is about: name/alias mention, trigram FTS and vector similarity."""
+        return [
+            n
+            for n, _ in self._match_entities_ex(
+                group, allowed, query, terms, qvec, center, limit=limit, min_similarity=min_similarity
+            )
+        ]
+
+    def _match_entities_ex(
+        self,
+        group: str,
+        allowed: set[str] | None,
+        query: str,
+        terms: list[str],
+        qvec: list[float] | None,
+        center: str | None,
+        limit: int = 5,
+        *,
+        min_similarity: float | None = None,
+        hub_total: int | None = None,
+    ) -> list[tuple[Node, str]]:
+        """Like :meth:`_match_entities`, with the strength of each match, best first: ``"strong"`` (an entity name /
+        alias literally occurs in the query, or it is the ``center``) or ``"weak"`` (only a trigram-fulltext fragment
+        or the similarity of the entity vector).
+
+        ``min_similarity``: cosine threshold of the entity vector (``None``: the legacy ``(1 + cos) / 2 >= 0.66``).
+        ``hub_total`` (number of facts of the group): a literal mention of a persona word ("ユーザー", "user") or of a
+        hub entity (>= ``HUB_MIN_FACTS`` facts and half of all facts, typically the user) counts only as ``"weak"``,
+        since all its facts would otherwise come back for any question that says "the user".
+        """
         scored: dict[str, float] = defaultdict(float)
         nodes: dict[str, Node] = {}
+        strong: set[str] = set()
+        persona: set[str] = set()
         qn = nfkc(query).casefold()
         if terms:
             for r in self.db.query(
@@ -2184,8 +2455,12 @@ class Memory:
                     continue
                 if any(len(f) >= 3 and f in qn for f in forms):  # the query literally names this entity
                     score += 10
+                    strong.add(e["id"])
                 elif any(f in terms for f in forms):
                     score += 5
+                    strong.add(e["id"])
+                if any(f in PERSONA_TERMS for f in forms):
+                    persona.add(e["id"])
                 scored[e["id"]] += float(score)
                 nodes[e["id"]] = e
         if qvec is not None:
@@ -2195,17 +2470,33 @@ class Memory:
                     e.get("group_id") == group
                     and self._entity_visible(e.properties, allowed)
                     and (allowed is None or set(e.get("summary_channels", [])) <= allowed)
-                    and s >= 0.66
+                    and ((2.0 * s - 1.0) >= min_similarity if min_similarity is not None else s >= 0.66)
                 ):
                     scored[e["id"]] += 2.0 * s
                     nodes.setdefault(e["id"], e)
+        center_id = None
         if center:
             c = self._resolve_entity_ref(group, allowed, center)
             if c is not None:
+                center_id = c["id"]
                 scored[c["id"]] += 20.0
                 nodes.setdefault(c["id"], c)
+                strong.add(c["id"])
+        if hub_total is not None:
+            for eid in list(strong):
+                if eid == center_id:
+                    continue
+                hub = eid in persona
+                if not hub and hub_total >= HUB_MIN_FACTS:
+                    rows = self.db.query(
+                        "MATCH (e:Entity {id:$id})-[f:FACT]-() RETURN count(DISTINCT f.id) AS n", {"id": eid}
+                    )
+                    n = int(rows[0]["n"]) if rows else 0
+                    hub = n >= HUB_MIN_FACTS and n * 2 >= hub_total
+                if hub:
+                    strong.discard(eid)
         ranked = sorted(scored.items(), key=lambda kv: -kv[1])[:limit]
-        return [nodes[i] for i, _ in ranked]
+        return [(nodes[i], "strong" if i in strong else "weak") for i, _ in ranked]
 
     def _resolve_entity_ref(self, group: str, allowed: set[str] | None, ref: str) -> Node | None:
         """Entity by id, exact name/alias, or best fuzzy match; ``None`` if not found / not visible."""
@@ -2373,6 +2664,7 @@ class Memory:
         as_of: str | datetime | None = None,
         center_entity: str | None = None,
         limit: int = 20,
+        min_similarity: float | None = None,
     ) -> Answer:
         """Retrieve facts for ``question`` and let the LLM answer in Japanese, citing sources and validity.
 
@@ -2383,7 +2675,15 @@ class Memory:
         group = self._group(group_id)
         allowed = _channel_set(channels)
         hits, ents = self._search(
-            question, group, channels, as_of, center_entity, limit, include_invalid=True, include_future=as_of is None
+            question,
+            group,
+            channels,
+            as_of,
+            center_entity,
+            limit,
+            include_invalid=True,
+            include_future=as_of is None,
+            min_similarity=min_similarity,
         )
         if not hits:
             return Answer(question, "該当する記憶が見つかりませんでした。", [], [], self._local(self._as_of(as_of)) if as_of else None)

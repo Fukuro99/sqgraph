@@ -70,13 +70,18 @@ after they confirm. Forgetting is permanent (the text is also removed from the d
 
 Prefer the MCP tools when the `sqgraph-memory` MCP server is connected:
 
-- `search_memory(query, as_of?, include_invalid?, center_entity?)` -- facts with validity, status and sources
+- `search_memory(query, as_of?, include_invalid?, center_entity?, min_similarity?)` -- facts with validity, status,
+  sources and their `similarity` to the query. Only facts that look relevant come back: an empty result means the memory
+  has nothing on that; retry with other keywords / names, or a lower `min_similarity`, before concluding that
 - `get_entity(name_or_id)` -- full timeline of one person/project/thing; `search_entities(query)` to resolve a name
 - `get_episodes(entity?, query?)` -- the original stored notes
 - `add_memory(content, source="<your agent name>", author="user")` then `commit_memory(token, extraction)` -- see
   above; `source` is `claude-code`, `codex`, `cursor`, ...; `author` defaults to "claude", so pass `author="user"`
   when recording what the user said or decided
-- `forget_memory(..., dry_run=true)` first, then again without `dry_run` after the user confirms
+- `forget_memory(episode_id="ep_...", dry_run=True)` first, then again without `dry_run` after the user confirms.
+  Give exactly one selector, with these exact names: `episode_id` (alias `episode`), `fact_id` (alias `fact`), `entity`
+  (aliases `entity_id`, `name`), `source_ref`, or a `since` / `until` / `channel` range. Ids come from search results
+  (`id` of a fact, `episodes[].id`)
 
 Otherwise use the CLI (JSON on stdout; `--compact` for one line):
 
@@ -85,8 +90,8 @@ sqgraph-memory search "preferred package manager" [--history] [--as-of 2026-07-0
 sqgraph-memory entity "Taro"
 sqgraph-memory add --source <agent-name> "ユーザーは Python のパッケージ管理に uv を使う"   # prints token + context
 sqgraph-memory commit --token <token> < extraction.json      # or pipe {"token": ..., "extraction": {...}} on stdin
-sqgraph-memory forget --fact <id> --dry-run        # also: --episode ID, --entity NAME, --since/--until
-sqgraph-memory forget --fact <id>                  # after the user confirmed
+sqgraph-memory forget --fact-id <id> --dry-run     # also: --episode-id ID, --entity NAME, --since/--until
+sqgraph-memory forget --fact-id <id>              # after the user confirmed
 ```
 
 If neither works, run `sqgraph-memory doctor` and tell the user what it reports.

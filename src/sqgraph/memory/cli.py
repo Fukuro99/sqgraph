@@ -3,13 +3,15 @@
 All output is JSON on stdout (UTF-8); errors are ``{"error": ...}`` on stderr with a non-zero exit code.
 
     sqgraph-memory init [--extractor agent|openai] [--api-key-stdin] [--group-id G] [--tz TZ] [--embed-base-url URL] ...
-    sqgraph-memory config [--extractor agent|openai] [--embed-base-url URL|openai] [--embed-model M] [--llm-model M] ...
+    sqgraph-memory config [--extractor agent|openai] [--embed-base-url URL|openai] [--embed-model M] [--llm-model M]
+                          [--search-min-similarity X|default] ...
     sqgraph-memory reembed [--yes]
     sqgraph-memory add TEXT|- [--source claude-code] [--channel personal] ...      (agent mode: prints what to extract)
     sqgraph-memory commit [--token T] [--extraction FILE|-]                          (agent mode: stores the extraction)
-    sqgraph-memory search QUERY [--limit 10] [--as-of DATE] [--history] [--center ENTITY]
+    sqgraph-memory search QUERY [--limit 10] [--as-of DATE] [--history] [--center ENTITY] [--min-similarity X]
     sqgraph-memory entity NAME | entities QUERY | episodes | stats
     sqgraph-memory forget (--episode ID | --source-ref REF | --fact ID | --entity NAME | --since/--until/--channel) [--dry-run]
+                          (--episode-id / --fact-id are aliases of --episode / --fact)
     sqgraph-memory purge --yes [--dry-run]
     sqgraph-memory mcp [--transport stdio|streamable-http] [--read-only] [--extractor agent|openai]
     sqgraph-memory setup [--agents ...] [--uninstall] | doctor [--online]
@@ -39,7 +41,15 @@ from typing import Any, Iterator, NoReturn, Sequence
 
 from . import setup_agents
 from .config import EXTRACTORS, KEY_NAME, MemoryConfig, ensure_private_dir
-from .core import FACT_INDEX, META_EMBED_DIMS, META_EMBED_ENDPOINT, META_EMBED_MODEL, Memory
+from .core import (
+    FACT_INDEX,
+    META_EMBED_DIMS,
+    META_EMBED_ENDPOINT,
+    META_EMBED_MODEL,
+    NO_HITS_HINT,
+    Memory,
+    default_min_similarity,
+)
 from .providers import (
     DEFAULT_EMBED_DIMS,
     Embedder,
@@ -234,7 +244,13 @@ def open_memory(
     cfg.db_path.parent.mkdir(parents=True, exist_ok=True)
     llm, embedder, warnings = make_providers(cfg, need_llm=need_llm, need_embedder=need_embedder)
     mem = Memory(
-        cfg.db_path, llm, embedder, default_group_id=cfg.group_id, tz=cfg.tz, allow_embedder_change=allow_embedder_change
+        cfg.db_path,
+        llm,
+        embedder,
+        default_group_id=cfg.group_id,
+        tz=cfg.tz,
+        allow_embedder_change=allow_embedder_change,
+        min_similarity=cfg.search_min_similarity,
     )
     try:
         yield mem, warnings
@@ -300,7 +316,23 @@ def _apply_settings(cfg: MemoryConfig, args: argparse.Namespace) -> list[str]:
         if args.embed_dimensions < 1:
             raise CliError("--embed-dimensions must be a positive integer", 2)
         put("embed_dimensions", args.embed_dimensions)
+    if getattr(args, "search_min_similarity", None) is not None:
+        put("search_min_similarity", _parse_similarity(args.search_min_similarity, "--search-min-similarity", allow_default=True))
     return changed
+
+
+def _parse_similarity(raw: Any, flag: str, *, allow_default: bool = False) -> float | None:
+    """A cosine similarity threshold in [-1, 1]; ``default`` / ``auto`` / ``none`` (config only) mean "per embedding model"."""
+    if allow_default and str(raw).strip().lower() in ("default", "auto", "none", ""):
+        return None
+    suffix = " or `default`" if allow_default else ""
+    try:
+        v = float(raw)
+    except (TypeError, ValueError):
+        raise CliError(f"{flag} must be a number between -1 and 1 (cosine similarity){suffix}, got {raw!r}", 2) from None
+    if not -1.0 <= v <= 1.0:
+        raise CliError(f"{flag} must be between -1 and 1 (cosine similarity), got {raw!r}", 2)
+    return v
 
 
 def _probe_embedder(cfg: MemoryConfig, args: argparse.Namespace, changed: list[str]) -> dict[str, Any] | None:
@@ -411,6 +443,15 @@ def cmd_init(args: argparse.Namespace, cfg: MemoryConfig) -> dict[str, Any]:
     return out
 
 
+def _effective_similarity(cfg: MemoryConfig) -> float:
+    """The relevance threshold search really uses: the configured one, else the default of the model of the database
+    (the embedder the vectors were built with), else of the configured embedding model."""
+    if cfg.search_min_similarity is not None:
+        return cfg.search_min_similarity
+    stored = _stored_identity(cfg.db_path)
+    return default_min_similarity((stored or {}).get("model") or cfg.embed_model)
+
+
 def cmd_config(args: argparse.Namespace, cfg: MemoryConfig) -> dict[str, Any]:
     stored = MemoryConfig.load(cfg.home, apply_env=False)
     changed = _apply_settings(stored, args)
@@ -427,6 +468,8 @@ def cmd_config(args: argparse.Namespace, cfg: MemoryConfig) -> dict[str, Any]:
         "extractor": eff.extractor,
         "llm_model": eff.llm_model,
         "embedder": _embedder_report(eff),
+        "search_min_similarity": eff.search_min_similarity,
+        "search_min_similarity_effective": _effective_similarity(eff),
         "openai_api_key": "configured" if eff.has_api_key() else "missing",
         "db_embedding": _stored_identity(eff.db_path),
     }
@@ -582,6 +625,7 @@ def cmd_commit(args: argparse.Namespace, cfg: MemoryConfig) -> dict[str, Any]:
 
 
 def cmd_search(args: argparse.Namespace, cfg: MemoryConfig) -> dict[str, Any]:
+    min_sim = _parse_similarity(args.min_similarity, "--min-similarity") if args.min_similarity is not None else None
     with open_memory(cfg, need_embedder=True) as (mem, warnings):
         hits = mem.search(
             args.query,
@@ -591,8 +635,18 @@ def cmd_search(args: argparse.Namespace, cfg: MemoryConfig) -> dict[str, Any]:
             limit=max(1, min(args.limit, 50)),
             include_invalid=args.history,
             include_future=args.as_of is None,  # scheduled facts too, like the MCP tool
+            min_similarity=min_sim,
         )
-    out = {"group_id": cfg.group_id, "as_of": args.as_of, "count": len(hits), "facts": [h.to_dict() for h in hits]}
+        threshold = mem.effective_min_similarity(min_sim)
+    out: dict[str, Any] = {
+        "group_id": cfg.group_id,
+        "as_of": args.as_of,
+        "min_similarity": round(threshold, 4),
+        "count": len(hits),
+        "facts": [h.to_dict() for h in hits],
+    }
+    if not hits:
+        out["hint"] = NO_HITS_HINT
     return _with_warning(out, warnings)
 
 
@@ -644,8 +698,10 @@ def cmd_forget(args: argparse.Namespace, cfg: MemoryConfig) -> dict[str, Any]:
     ]
     if len(kinds) != 1:
         raise CliError(
-            "specify exactly one forget target: --episode ID | --source-ref REF [--source S] | --fact ID | "
-            f"--entity NAME [--keep-episodes] | --since/--until/--channel [--source S] (got: {', '.join(kinds) or 'none'})",
+            "specify exactly one forget target: --episode ID (alias --episode-id) | --source-ref REF [--source S] | "
+            "--fact ID (alias --fact-id) | --entity NAME|ID (alias --entity-id) [--keep-episodes] | "
+            f"--since/--until/--channel [--source S] (got: {', '.join(kinds) or 'none'}); "
+            "example: sqgraph-memory forget --episode-id ep_... --dry-run",
             2,
         )
     if args.keep_episodes and args.entity is None:
@@ -700,6 +756,8 @@ def mcp_argv(cfg: MemoryConfig, args: argparse.Namespace) -> list[str]:
         argv += ["--embed-base-url", cfg.embed_base_url, "--embed-api-key-env", cfg.embed_api_key_env]
     if cfg.embed_dimensions:
         argv += ["--embed-dimensions", str(cfg.embed_dimensions)]
+    if cfg.search_min_similarity is not None:
+        argv += ["--min-similarity", str(cfg.search_min_similarity)]
     if args.transport != "stdio":
         argv += ["--host", args.host, "--port", str(args.port)]
     if args.read_only:
@@ -906,6 +964,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--tz")
     extractor_option(p)
     p.add_argument("--llm-model", metavar="NAME", help="chat model used by `add` with --extractor openai")
+    p.add_argument("--search-min-similarity", metavar="X|default", help="relevance gate of search: minimum cosine similarity (-1..1) for a fact to count as related; 'default' = per embedding model")  # fmt: skip
     embed_options(p)
     p.set_defaults(fn=cmd_config)
 
@@ -935,6 +994,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--as-of", help="answer as of this date/time")
     p.add_argument("--history", action="store_true", help="include superseded / ended facts")
     p.add_argument("--center", metavar="ENTITY", help="rank facts near this entity first")
+    p.add_argument("--min-similarity", metavar="X", help="minimum cosine similarity (-1..1) for a semantic match (default: per embedding model, see `config`); lower it to see weaker matches")  # fmt: skip
     p.set_defaults(fn=cmd_search)
 
     p = sub.add_parser("entity", parents=[common], help="one entity's profile and full fact timeline")
@@ -957,11 +1017,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(fn=cmd_stats)
 
     p = sub.add_parser("forget", parents=[common], help="delete memories (exactly one target kind)")
-    p.add_argument("--episode", metavar="ID")
+    p.add_argument("--episode", "--episode-id", dest="episode", metavar="ID", help="one stored note (--episode-id is an alias)")
     p.add_argument("--source-ref", metavar="REF")
     p.add_argument("--source", help="with --source-ref, or alone / with a range to forget everything from that source")
-    p.add_argument("--fact", metavar="ID")
-    p.add_argument("--entity", metavar="NAME")
+    p.add_argument("--fact", "--fact-id", dest="fact", metavar="ID", help="one fact (--fact-id is an alias)")
+    p.add_argument("--entity", "--entity-id", dest="entity", metavar="NAME", help="an entity id or exact name (--entity-id is an alias)")
     p.add_argument("--keep-episodes", action="store_true", help="with --entity: keep the source notes")
     p.add_argument("--since")
     p.add_argument("--until")
