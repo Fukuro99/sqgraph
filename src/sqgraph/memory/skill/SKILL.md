@@ -5,7 +5,7 @@ description: Personal long-term memory shared by all agents on this machine (tem
 
 # sqgraph-memory: the user's personal long-term memory
 
-A temporal knowledge graph on one local SQLite file, shared by every agent on this machine (Claude Code, Codex,
+A temporal knowledge graph on one local SQLite file, shared by every agent on this machine (Claude Code, Codex, OpenCode,
 Cursor, Claude Desktop, ...). When you add something, YOU turn it into entities and facts (there is no LLM on the
 server and no API key to set up). Facts have validity periods: when something changes ("I moved to Osaka"), the old fact is marked as superseded (kept as history), not
 overwritten. Anything one agent stores is visible to all the others.

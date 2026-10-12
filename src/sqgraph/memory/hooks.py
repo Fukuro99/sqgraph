@@ -1,5 +1,8 @@
 """Claude Code hooks: bring relevant memories into a session without the agent having to ask.
 
+The same commands serve Claude Code and Codex (both run command hooks with this JSON contract) and the OpenCode plugin
+written by ``setup`` (which calls them and puts the text into the system prompt / the user's message).
+
 ``sqgraph-memory hook session-start`` (SessionStart: startup / resume / clear / compact) adds, as context:
 
 * the facts about the user that hold now (preferences, standing instructions; the entity the user's notes are
@@ -176,7 +179,7 @@ def fast_embedder(mem: Memory) -> None:
 # --------------------------------------------------------------------------- events
 
 
-def session_start(mem: Memory, payload: dict[str, Any], state: SessionState, *, days: float = 7) -> str | None:
+def session_start(mem: Memory, payload: dict[str, Any], state: SessionState, *, agent: str = "claude-code", days: float = 7) -> str | None:
     sections: list[str] = []
     shown: set[str] = set()
     user = mem.get_entity(USER_ENTITY, max_facts=200)
@@ -201,7 +204,7 @@ def session_start(mem: Memory, payload: dict[str, Any], state: SessionState, *, 
     return _fit([HEADER, *sections, FOOTER])
 
 
-def user_prompt(mem: Memory, payload: dict[str, Any], state: SessionState, *, limit: int = 5) -> str | None:
+def user_prompt(mem: Memory, payload: dict[str, Any], state: SessionState, *, agent: str = "claude-code", limit: int = 5) -> str | None:
     prompt = (payload.get("prompt") or "").strip()
     if not prompt or prompt.startswith("/"):
         return None
@@ -216,12 +219,12 @@ def user_prompt(mem: Memory, payload: dict[str, Any], state: SessionState, *, li
     if REMEMBER_RE.search(prompt):
         parts.append(
             "[sqgraph-memory] The user asks you to remember something: store it in long-term memory with add_memory "
-            "(source=\"claude-code\", author=\"user\") and then commit_memory, as the sqgraph-memory skill describes."
+            f"(source=\"{agent}\", author=\"user\") and then commit_memory, as the sqgraph-memory skill describes."
         )
     return _fit(parts) if parts else None
 
 
-HANDLERS: dict[str, Callable[[Memory, dict[str, Any], SessionState], str | None]] = {
+HANDLERS: dict[str, Callable[..., str | None]] = {
     "session-start": session_start,
     "user-prompt": user_prompt,
 }
@@ -232,8 +235,11 @@ def run(
     payload: dict[str, Any],
     home: Path,
     open_memory: Callable[[], ContextManager[Memory]],
+    *,
+    agent: str = "claude-code",
 ) -> dict[str, Any] | None:
-    """Run one hook; returns the JSON to print (``None``: print nothing). Never raises."""
+    """Run one hook for ``agent`` (the client name used as ``source`` when it stores memories); returns the JSON to
+    print (``None``: print nothing). Never raises."""
     if event not in HANDLERS:
         raise ValueError(f"unknown hook event {event!r} (choose from {', '.join(EVENTS)})")
     try:
@@ -242,7 +248,7 @@ def run(
         state = SessionState(home, payload.get("session_id"))
         with open_memory() as mem:
             fast_embedder(mem)
-            text = HANDLERS[event](mem, payload, state)
+            text = HANDLERS[event](mem, payload, state, agent=agent)
         state.save()
     except Exception as exc:  # noqa: BLE001 - a hook must never break the user's turn
         _log_error(home, event, exc)

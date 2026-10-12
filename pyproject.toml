@@ -24,7 +24,7 @@ where = ["src"]
 [tool.setuptools.package-data]
 "sqgraph.cypher" = ["grammar.lark"]
 "sqgraph.viewer" = ["static/*.html"]
-"sqgraph.memory" = ["skill/*.md"]
+"sqgraph.memory" = ["skill/*.md", "opencode/*.js"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

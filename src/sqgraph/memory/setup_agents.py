@@ -8,7 +8,13 @@ Targets and the formats written (verified against each product's documentation):
   (https://code.claude.com/docs/en/hooks).
 * **Codex CLI** -- ``~/.codex/config.toml``, a ``[mcp_servers.sqgraph-memory]`` table with ``command`` / ``args``
   (https://developers.openai.com/codex/mcp); skill: ``~/.agents/skills/sqgraph-memory/SKILL.md``
-  (https://developers.openai.com/codex/skills).
+  (https://developers.openai.com/codex/skills); hooks (the same two as Claude Code) in ``~/.codex/hooks.json``
+  (https://learn.chatgpt.com/docs/hooks; Codex asks the user to trust new hooks once, with ``/hooks``).
+* **OpenCode** -- ``mcp.sqgraph-memory`` (``type: local``, ``command`` array) in ``~/.config/opencode/opencode.json``.
+  OpenCode merges ``config.json``, ``opencode.json`` and ``opencode.jsonc`` of that directory, so a commented
+  ``opencode.jsonc`` is never rewritten; skill: the shared ``~/.agents/skills/sqgraph-memory/SKILL.md`` (OpenCode reads
+  it, https://opencode.ai/docs/skills/); plugin ``~/.config/opencode/plugins/sqgraph-memory.js`` running the hooks
+  (https://opencode.ai/docs/plugins/).
 * **Cursor** -- ``~/.cursor/mcp.json`` ``mcpServers`` (https://cursor.com/docs/context/mcp); skill:
   ``~/.cursor/skills/sqgraph-memory/SKILL.md`` (https://cursor.com/docs/context/skills).
 * **Claude Desktop** -- ``claude_desktop_config.json`` ``mcpServers`` (``%APPDATA%\\Claude`` on Windows,
@@ -33,8 +39,9 @@ from typing import Any, Callable, Sequence
 
 SERVER_NAME = "sqgraph-memory"
 EXE_NAME = "sqgraph-memory"
-AGENTS = ("claude-code", "codex", "cursor", "claude-desktop")
+AGENTS = ("claude-code", "codex", "opencode", "cursor", "claude-desktop")
 STARTUP_TIMEOUT_SEC = 30  # Codex default is 10s; the first start imports sqlite-vec / openai / mcp
+OPENCODE_PLUGIN = "sqgraph-memory.js"
 
 Runner = Callable[[list[str]], "tuple[int, str, str]"]
 
@@ -277,6 +284,9 @@ class Target:
         """Our hook events installed for this agent (``None``: the agent has no hooks)."""
         return None
 
+    def uninstall_skill(self) -> dict[str, Any]:
+        return _uninstall_skill(self.ctx, self.skill_dir())
+
     def install(self) -> dict[str, Any]:
         report: dict[str, Any] = {"agent": self.name, "detected": self.detected(), "config": str(self.config_path()) if self.config_path() else None}
         if self.ctx.env:
@@ -298,7 +308,7 @@ class Target:
         except Exception as exc:
             report.update(action="failed", error=f"{type(exc).__name__}: {exc}")
         try:
-            report["skill"] = _uninstall_skill(self.ctx, self.skill_dir())
+            report["skill"] = self.uninstall_skill()
         except Exception as exc:
             report["skill"] = {"action": "failed", "error": str(exc)}
         return report
@@ -413,7 +423,64 @@ class DesktopTarget(JsonTarget):
 # --------------------------------------------------------------------------- Claude Code
 
 
-class ClaudeCodeTarget(Target):
+class CommandHooks:
+    """Command hooks in a JSON file shaped like Claude Code's settings (``{"hooks": {Event: [{"hooks": [...]}]}}``),
+    which Codex's ``hooks.json`` shares. Mixed into a :class:`Target` that defines :meth:`hooks_file`."""
+
+    ctx: Context
+    name: str
+
+    def hooks_file(self) -> Path:
+        raise NotImplementedError
+
+    def hook_handler(self, event: str) -> dict[str, Any]:
+        command = hook_command(self.ctx.command, event, self.ctx.env, self.ctx.platform, agent=self.name)
+        return {"type": "command", "command": command, "timeout": HOOKS[event][1]}
+
+    def hooks_status(self) -> list[str] | None:
+        try:
+            return sorted(installed_hooks(_read_json_object(self.hooks_file())))
+        except Exception:  # noqa: BLE001 - unreadable file: nothing of ours is known to be there
+            return []
+
+    def install(self) -> dict[str, Any]:
+        report = super().install()  # type: ignore[misc]
+        report["hooks"] = self._set_hooks(self.ctx.hooks) if self.ctx.hooks else {"action": "skipped"}
+        return report
+
+    def uninstall(self) -> dict[str, Any]:
+        report = super().uninstall()  # type: ignore[misc]
+        report["hooks"] = self._set_hooks(())
+        return report
+
+    def _set_hooks(self, events: tuple[str, ...]) -> dict[str, Any]:
+        p = self.hooks_file()
+        try:
+            data = _read_json_object(p)  # raises on invalid JSON: the file is left untouched
+            want = {ev: self.hook_handler(ev) for ev in events}
+            new = set_hooks(data, want)
+            if new is None:
+                return {"action": "unchanged" if want else "not-installed", "path": str(p), "events": sorted(want)}
+            if self.ctx.dry_run:
+                action = "would-install" if want else "would-remove"
+            else:
+                action = "installed" if want else "removed"
+            res: dict[str, Any] = {"action": action, "path": str(p), "events": sorted(want)}
+            if not self.ctx.dry_run:
+                res["backup"] = _backup(p)
+                _atomic_write(p, json.dumps(new, ensure_ascii=False, indent=2) + "\n")
+            note = self.hooks_note(bool(want))
+            if note:
+                res["note"] = note
+            return res
+        except Exception as exc:  # noqa: BLE001
+            return {"action": "failed", "path": str(p), "error": f"{type(exc).__name__}: {exc}"}
+
+    def hooks_note(self, installing: bool) -> str | None:
+        return None
+
+
+class ClaudeCodeTarget(CommandHooks, Target):
     name = "claude-code"
 
     def detected(self) -> bool:
@@ -460,53 +527,8 @@ class ClaudeCodeTarget(Target):
         else:
             report["action"] = "updated" if cur is not None else "registered"
 
-    # -- hooks (~/.claude/settings.json) ----------------------------------------------------------
-
-    def settings_path(self) -> Path:
+    def hooks_file(self) -> Path:
         return self.ctx.home / ".claude" / "settings.json"
-
-    def hook_handler(self, event: str) -> dict[str, Any]:
-        command = hook_command(self.ctx.command, event, self.ctx.env, self.ctx.platform)
-        return {"type": "command", "command": command, "timeout": HOOKS[event][1]}
-
-    def hooks_status(self) -> list[str] | None:
-        try:
-            return sorted(installed_hooks(_read_json_object(self.settings_path())))
-        except Exception:  # noqa: BLE001 - unreadable settings: nothing of ours is known to be there
-            return []
-
-    def install(self) -> dict[str, Any]:
-        report = super().install()
-        if self.ctx.hooks:
-            report["hooks"] = self._set_hooks(self.ctx.hooks)
-        else:
-            report["hooks"] = {"action": "skipped"}
-        return report
-
-    def uninstall(self) -> dict[str, Any]:
-        report = super().uninstall()
-        report["hooks"] = self._set_hooks(())
-        return report
-
-    def _set_hooks(self, events: tuple[str, ...]) -> dict[str, Any]:
-        p = self.settings_path()
-        try:
-            data = _read_json_object(p)  # raises on invalid JSON: the file is left untouched
-            want = {ev: self.hook_handler(ev) for ev in events}
-            new = set_hooks(data, want)
-            if new is None:
-                return {"action": "unchanged" if want else "not-installed", "path": str(p), "events": sorted(want)}
-            if self.ctx.dry_run:
-                action = "would-install" if want else "would-remove"
-            else:
-                action = "installed" if want else "removed"
-            res: dict[str, Any] = {"action": action, "path": str(p), "events": sorted(want)}
-            if not self.ctx.dry_run:
-                res["backup"] = _backup(p)
-                _atomic_write(p, json.dumps(new, ensure_ascii=False, indent=2) + "\n")
-            return res
-        except Exception as exc:  # noqa: BLE001
-            return {"action": "failed", "path": str(p), "error": f"{type(exc).__name__}: {exc}"}
 
     def _unregister(self, report: dict[str, Any]) -> None:
         cur = self.current()
@@ -528,13 +550,21 @@ class ClaudeCodeTarget(Target):
             report["action"] = "removed"
 
 
-def hook_command(command: list[str], event: str, env: dict[str, str] | None = None, platform: str | None = None) -> str:
-    """The shell command a Claude Code hook runs: the server launch command with ``hook <event>`` instead of ``mcp``.
+def hook_argv(command: list[str], event: str, env: dict[str, str] | None = None, agent: str | None = None) -> list[str]:
+    """The server launch command with ``hook <event> [--agent A] [--env K=V ...]`` instead of ``mcp``."""
+    base = command[:-1] if command and command[-1] == "mcp" else list(command)
+    tail = ["--agent", agent] if agent and agent != "claude-code" else []
+    return [*base, "hook", event, *tail, *[x for k, v in (env or {}).items() for x in ("--env", f"{k}={v}")]]
+
+
+def hook_command(
+    command: list[str], event: str, env: dict[str, str] | None = None, platform: str | None = None, agent: str | None = None
+) -> str:
+    """The shell command an agent's hook runs (:func:`hook_argv` as one command line).
 
     On Windows, drive paths use forward slashes (valid for both Git Bash and cmd.exe, either of which may run hooks)."""
     plat = platform or sys.platform
-    base = command[:-1] if command and command[-1] == "mcp" else list(command)
-    argv = [*base, "hook", event, *[x for k, v in (env or {}).items() for x in ("--env", f"{k}={v}")]]
+    argv = hook_argv(command, event, env, agent)
     if plat == "win32":
         argv = [a.replace("\\", "/") if re.match(r"^[A-Za-z]:[\\/]", a) else a for a in argv]
     return format_command(argv, plat)
@@ -761,8 +791,16 @@ def _unquote_toml(v: str) -> str:
         return v.strip("\"'")
 
 
-class CodexTarget(Target):
+class CodexTarget(CommandHooks, Target):
     name = "codex"
+
+    def hooks_file(self) -> Path:
+        return self.ctx.home / ".codex" / "hooks.json"
+
+    def hooks_note(self, installing: bool) -> str | None:
+        if installing and not self.ctx.dry_run:
+            return "Codex runs new hooks only after you trust them: start Codex, run /hooks and trust the sqgraph-memory hooks"
+        return None
 
     def detected(self) -> bool:
         return (self.ctx.home / ".codex").is_dir() or bool(self.ctx.which("codex"))
@@ -803,11 +841,217 @@ class CodexTarget(Target):
             _atomic_write(self.config_path(), codex_remove(text))
 
 
+# --------------------------------------------------------------------------- OpenCode
+
+
+def strip_jsonc(text: str) -> str:
+    """JSON text from JSONC: ``//`` and ``/* */`` comments and trailing commas removed (strings are kept intact)."""
+    out: list[str] = []
+    i, n = 0, len(text)
+    while i < n:
+        c = text[i]
+        if c == '"':
+            j = i + 1
+            while j < n and text[j] != '"':
+                j += 2 if text[j] == "\\" else 1
+            out.append(text[i : j + 1])
+            i = j + 1
+        elif text.startswith("//", i):
+            while i < n and text[i] not in "\r\n":
+                i += 1
+        elif text.startswith("/*", i):
+            end = text.find("*/", i + 2)
+            i = n if end < 0 else end + 2
+        else:
+            out.append(c)
+            i += 1
+    return re.sub(r",(\s*[}\]])", r"\1", "".join(out))
+
+
+def has_jsonc_comments(text: str) -> bool:
+    return strip_jsonc(text) != re.sub(r",(\s*[}\]])", r"\1", text)
+
+
+def _read_jsonc_object(path: Path) -> dict[str, Any]:
+    if not path.is_file():
+        return {}
+    raw = path.read_text(encoding="utf-8-sig")
+    if not raw.strip():
+        return {}
+    data = json.loads(strip_jsonc(raw))
+    if not isinstance(data, dict):
+        raise ValueError(f"{path} does not contain a JSON object")
+    return data
+
+
+def opencode_plugin_text(command: list[str], env: dict[str, str] | None = None) -> str:
+    """The packaged OpenCode plugin with the launch command (and forwarded environment) filled in."""
+    from importlib import resources
+
+    base = command[:-1] if command and command[-1] == "mcp" else list(command)
+    text = resources.files("sqgraph.memory").joinpath("opencode", OPENCODE_PLUGIN).read_text(encoding="utf-8")
+    text = text.replace("__SQGRAPH_COMMAND__", json.dumps(base, ensure_ascii=False))
+    return text.replace("__SQGRAPH_ENV__", json.dumps(env or {}, ensure_ascii=False))
+
+
+class OpenCodeTarget(Target):
+    """MCP in ``opencode.json`` (our own file: a commented ``opencode.jsonc`` is merged by OpenCode, never rewritten),
+    the Skill shared with Codex in ``~/.agents/skills``, and the hooks as a plugin."""
+
+    name = "opencode"
+    CONFIG_FILES = ("config.json", "opencode.json", "opencode.jsonc")  # the order OpenCode merges them in
+
+    def config_dir(self) -> Path:
+        xdg = os.environ.get("XDG_CONFIG_HOME")
+        return (Path(xdg) if xdg and self.ctx.home == Path.home() else self.ctx.home / ".config") / "opencode"
+
+    def detected(self) -> bool:
+        return self.config_dir().is_dir() or bool(self.ctx.which("opencode"))
+
+    def config_path(self) -> Path:
+        return self.config_dir() / "opencode.json"
+
+    def skill_dir(self) -> Path:
+        return self.ctx.home / ".agents" / "skills" / SERVER_NAME
+
+    def plugin_path(self) -> Path:
+        return self.config_dir() / "plugins" / OPENCODE_PLUGIN
+
+    def _entry(self) -> dict[str, Any]:
+        entry: dict[str, Any] = {"type": "local", "command": list(self.ctx.command), "enabled": True, "timeout": STARTUP_TIMEOUT_SEC * 1000}
+        if self.ctx.env:
+            entry["environment"] = dict(self.ctx.env)
+        return entry
+
+    def _found(self) -> tuple[Path, dict[str, Any]] | None:
+        """The file that defines our server last (the effective one) and its entry."""
+        hit = None
+        for name in self.CONFIG_FILES:
+            p = self.config_dir() / name
+            mcp = _read_jsonc_object(p).get("mcp")
+            if isinstance(mcp, dict) and isinstance(mcp.get(SERVER_NAME), dict):
+                hit = (p, mcp[SERVER_NAME])
+        return hit
+
+    def current(self) -> dict[str, Any] | None:
+        found = self._found()
+        if found is None:
+            return None
+        e = found[1]
+        cmd = e.get("command") if isinstance(e.get("command"), list) else []
+        return {"command": cmd[0] if cmd else None, "args": cmd[1:], "env": e.get("environment") or {}, "file": str(found[0])}
+
+    def _register(self, report: dict[str, Any]) -> None:
+        p = self.config_path()
+        found = self._found()
+        if found is not None and found[0] != p:  # the user keeps it in another file (e.g. a commented opencode.jsonc)
+            if self._matches(self.current()):
+                report["action"] = "unchanged"
+                return
+            report.update(
+                action="manual",
+                note=f"{found[0]} defines mcp.{SERVER_NAME}; update it there (it overrides opencode.json)",
+                manual_entry={SERVER_NAME: self._entry()},
+            )
+            return
+        raw = p.read_text(encoding="utf-8-sig") if p.is_file() else ""
+        if raw.strip() and has_jsonc_comments(raw):
+            report.update(
+                action="manual",
+                note=f"{p} contains comments, which a rewrite would lose: add this under \"mcp\" yourself",
+                manual_entry={SERVER_NAME: self._entry()},
+            )
+            return
+        data = _read_jsonc_object(p) if raw.strip() else {"$schema": "https://opencode.ai/config.json"}
+        mcp = data.get("mcp")
+        if mcp is None:
+            mcp = data["mcp"] = {}
+        if not isinstance(mcp, dict):
+            raise ValueError("'mcp' is not an object")
+        cur = mcp.get(SERVER_NAME)
+        entry = {**(cur if isinstance(cur, dict) else {}), **self._entry()}
+        if self.ctx.env and isinstance(cur, dict) and isinstance(cur.get("environment"), dict):
+            entry["environment"] = {**cur["environment"], **self.ctx.env}
+        if cur == entry:
+            report["action"] = "unchanged"
+            return
+        mcp[SERVER_NAME] = entry
+        report["action"] = "would-register" if self.ctx.dry_run else ("updated" if cur is not None else "registered")
+        if not self.ctx.dry_run:
+            report["backup"] = _backup(p)
+            _atomic_write(p, json.dumps(data, ensure_ascii=False, indent=2) + "\n")
+
+    def _unregister(self, report: dict[str, Any]) -> None:
+        p = self.config_path()
+        found = self._found()
+        if found is None:
+            report["action"] = "not-registered"
+            return
+        if found[0] != p:
+            report.update(action="manual", note=f"remove mcp.{SERVER_NAME} from {found[0]} yourself")
+            return
+        raw = p.read_text(encoding="utf-8-sig")
+        if has_jsonc_comments(raw):
+            report.update(action="manual", note=f"{p} contains comments: remove mcp.{SERVER_NAME} yourself")
+            return
+        data = _read_jsonc_object(p)
+        report["action"] = "would-remove" if self.ctx.dry_run else "removed"
+        if not self.ctx.dry_run:
+            del data["mcp"][SERVER_NAME]
+            if not data["mcp"]:
+                del data["mcp"]
+            report["backup"] = _backup(p)
+            if set(data) <= {"$schema"}:  # nothing but ours was there: the file we created goes
+                p.unlink()
+            else:
+                _atomic_write(p, json.dumps(data, ensure_ascii=False, indent=2) + "\n")
+
+    def hooks_status(self) -> list[str] | None:
+        return sorted(HOOKS) if self.plugin_path().is_file() else []
+
+    def install(self) -> dict[str, Any]:
+        report = super().install()
+        report["hooks"] = self._install_plugin() if self.ctx.hooks else {"action": "skipped"}
+        return report
+
+    def uninstall_skill(self) -> dict[str, Any]:
+        if CodexTarget(self.ctx).current() is not None:  # the skill directory is shared: keep it while Codex uses it
+            return {"action": "kept", "path": str(_skill_path(self.skill_dir())), "note": "shared with Codex"}
+        return super().uninstall_skill()
+
+    def uninstall(self) -> dict[str, Any]:
+        report = super().uninstall()
+        p = self.plugin_path()
+        if not p.is_file():
+            report["hooks"] = {"action": "not-installed", "path": str(p)}
+        elif self.ctx.dry_run:
+            report["hooks"] = {"action": "would-remove", "path": str(p)}
+        else:
+            p.unlink()
+            report["hooks"] = {"action": "removed", "path": str(p)}
+        return report
+
+    def _install_plugin(self) -> dict[str, Any]:
+        p = self.plugin_path()
+        try:
+            text = opencode_plugin_text(self.ctx.command, self.ctx.env)
+            cur = p.read_text(encoding="utf-8") if p.is_file() else None
+            if cur == text:
+                return {"action": "unchanged", "path": str(p), "events": sorted(HOOKS)}
+            res: dict[str, Any] = {"action": "would-install" if self.ctx.dry_run else "installed", "path": str(p), "events": sorted(HOOKS)}
+            if not self.ctx.dry_run:
+                _atomic_write(p, text)
+            return res
+        except Exception as exc:  # noqa: BLE001
+            return {"action": "failed", "path": str(p), "error": f"{type(exc).__name__}: {exc}"}
+
+
 # --------------------------------------------------------------------------- public API
 
 TARGETS: dict[str, type[Target]] = {
     "claude-code": ClaudeCodeTarget,
     "codex": CodexTarget,
+    "opencode": OpenCodeTarget,
     "cursor": CursorTarget,
     "claude-desktop": DesktopTarget,
 }
@@ -877,7 +1121,7 @@ def run_setup(
     if warnings:
         out["warnings"] = list(warnings)
     if agents is None and not targets:
-        out["note"] = "no supported agent detected; pass --agents claude-code,codex,cursor,claude-desktop"
+        out["note"] = "no supported agent detected; pass --agents claude-code,codex,opencode,cursor,claude-desktop"
     return out
 
 

@@ -16,7 +16,7 @@ All output is JSON on stdout (UTF-8); errors are ``{"error": ...}`` on stderr wi
     sqgraph-memory merge KEEP MERGE [--dry-run] | invalidate FACT_ID [--at T] [--reason R]
     sqgraph-memory relations | rename-relation OLD NEW [--swap] [--fact ID] [--dry-run] | review | upcoming [--days 7]
     sqgraph-memory export FILE|- [--with-embeddings] | import FILE|- [--into-group G] [--dry-run] | backup [DEST] [--keep 10]
-    sqgraph-memory hook session-start|user-prompt     (Claude Code hooks, registered by `setup`)
+    sqgraph-memory hook session-start|user-prompt [--agent A]   (agent hooks, registered by `setup`)
     sqgraph-memory import-claude-memory [--limit 5] [--dry-run]
     sqgraph-memory mcp [--transport stdio|streamable-http] [--read-only] [--extractor agent|openai]
     sqgraph-memory setup [--agents ...] [--uninstall] | doctor [--online]
@@ -865,7 +865,7 @@ def cmd_hook(args: argparse.Namespace, cfg: MemoryConfig) -> None:
         with open_memory(cfg, need_embedder=True) as (mem, _):
             yield mem
 
-    out = hooks.run(args.event, payload, cfg.home, memory)
+    out = hooks.run(args.event, payload, cfg.home, memory, agent=args.agent)
     if out is not None:
         sys.stdout.write(json.dumps(out, ensure_ascii=False) + "\n")
         sys.stdout.flush()
@@ -1312,8 +1312,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--keep", type=int, default=10, help="snapshots kept in the default directory (default 10)")
     p.set_defaults(fn=cmd_backup)
 
-    p = sub.add_parser("hook", help="Claude Code hook (event JSON on stdin): session-start | user-prompt")
+    p = sub.add_parser("hook", help="agent hook (event JSON on stdin; Claude Code / Codex / the OpenCode plugin): session-start | user-prompt")
     p.add_argument("event", choices=["session-start", "user-prompt"])
+    p.add_argument("--agent", default="claude-code", help="the client running the hook (claude-code, codex, opencode)")
     p.add_argument("--env", action="append", metavar="KEY=VALUE", help="set an SQGRAPH_MEMORY_* variable first (repeatable)")
     p.set_defaults(fn=cmd_hook, raw=True)
 
@@ -1338,10 +1339,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(fn=cmd_mcp, raw=True)
 
     p = sub.add_parser("setup", parents=[common], help="register the MCP server and install the Skill for local agents")
-    p.add_argument("--agents", help="comma-separated: claude-code,codex,cursor,claude-desktop or all (default: detected)")
+    p.add_argument("--agents", help="comma-separated: claude-code,codex,opencode,cursor,claude-desktop or all (default: detected)")
     p.add_argument("--command", help='full launch command (e.g. "uvx --from sqgraph[mcp] sqgraph-memory mcp")')
     p.add_argument("--no-skill", action="store_true", help="do not install SKILL.md")
-    p.add_argument("--hooks", metavar="LIST", help="Claude Code hooks to install: session-start,user-prompt | all (default) | none")
+    p.add_argument("--hooks", metavar="LIST", help="hooks to install (Claude Code / Codex hooks, the OpenCode plugin): session-start,user-prompt | all (default) | none")
     p.add_argument("--no-hooks", action="store_true", help="same as --hooks none (existing hooks are left as they are)")
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--uninstall", action="store_true", help="remove the registration and the Skill")

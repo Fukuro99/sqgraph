@@ -414,7 +414,7 @@ claude mcp add sqgraph-memory-backend -- python -m sqgraph.memory.mcp --db /path
 
 ### 個人メモリとして使う (CLI / MCP / Skill)
 
-同じマシンのローカルエージェント (Claude Code / Codex CLI / Cursor / Claude Desktop) が **1 つの SQLite ファイルを共有する個人用の長期記憶**として使うための配布形態です。Python だけで入ります (Node / Docker は不要)。
+同じマシンのローカルエージェント (Claude Code / Codex CLI / OpenCode / Cursor / Claude Desktop) が **1 つの SQLite ファイルを共有する個人用の長期記憶**として使うための配布形態です。Python だけで入ります (Node / Docker は不要)。
 
 **抽出は呼び出したエージェント自身が行います (既定の `extractor: "agent"`)**: 記憶するとき、エージェントは `add_memory` (CLI は `add`) で `instructions` と `context` (既存の候補エンティティ・関連する有効ファクト) を受け取り、自分で `extraction` JSON を作って `commit_memory` (CLI は `commit`) で保存します。**OpenAI キーは不要**で、サーバー側に LLM はありません (埋め込みだけ LAN のサーバーなどに任せられます)。bot のように 1 回の呼び出しで OpenAI に抽出させたいときは `--extractor openai` を使います。
 
@@ -437,18 +437,23 @@ sqgraph-memory doctor [--online]    # 環境・DB・登録状況の診断 (失�
 | エージェント | MCP の登録先 | Skill |
 |---|---|---|
 | Claude Code | `claude mcp add --scope user sqgraph-memory -- <実行ファイル> mcp` (`claude` が PATH にないときは実行すべきコマンドを表示)。フックは `~/.claude/settings.json` (下記) | `~/.claude/skills/sqgraph-memory/SKILL.md` |
-| Codex CLI | `~/.codex/config.toml` の `[mcp_servers.sqgraph-memory]` (`command` / `args`) | `~/.agents/skills/sqgraph-memory/SKILL.md` |
+| Codex CLI | `~/.codex/config.toml` の `[mcp_servers.sqgraph-memory]` (`command` / `args`)。フックは `~/.codex/hooks.json` | `~/.agents/skills/sqgraph-memory/SKILL.md` |
+| OpenCode | `~/.config/opencode/opencode.json` の `mcp.sqgraph-memory` (`type: local`)。OpenCode は同じディレクトリの `config.json` / `opencode.json` / `opencode.jsonc` をマージするので、コメント入りの `opencode.jsonc` は書き換えません。フックはプラグイン `~/.config/opencode/plugins/sqgraph-memory.js` | `~/.agents/skills/sqgraph-memory/SKILL.md` (Codex と共用。OpenCode はこの場所も読む) |
 | Cursor | `~/.cursor/mcp.json` の `mcpServers` | `~/.cursor/skills/sqgraph-memory/SKILL.md` |
 | Claude Desktop | `claude_desktop_config.json` の `mcpServers` (Windows `%APPDATA%\Claude`、macOS `~/Library/Application Support/Claude`、Linux `~/.config/Claude`) | なし |
 
-`--agents claude-code,codex,cursor,claude-desktop|all` で対象を指定し (既定は検出できたもの)、`--command "uvx --from 'sqgraph[mcp]' sqgraph-memory mcp"` で起動コマンドを丸ごと差し替え、`--no-skill` で Skill を入れません。登録後はエージェントを再起動してください。Skill (`SKILL.md`) は、いつ検索し、いつ覚えさせ、いつ忘れるか (明示的に頼まれたときだけ、`dry_run` で確認してから) をエージェントに教えます。
+`--agents claude-code,codex,opencode,cursor,claude-desktop|all` で対象を指定し (既定は検出できたもの)、`--command "uvx --from 'sqgraph[mcp]' sqgraph-memory mcp"` で起動コマンドを丸ごと差し替え、`--no-skill` で Skill を入れません。登録後はエージェントを再起動してください。Skill (`SKILL.md`) は、いつ検索し、いつ覚えさせ、いつ忘れるか (明示的に頼まれたときだけ、`dry_run` で確認してから) をエージェントに教えます。
 
-**Claude Code のフック** (`setup` が `~/.claude/settings.json` に登録。`--hooks session-start,user-prompt` で選択、`--no-hooks` で触らない、`--uninstall` で削除。自分以外のフックはそのまま残します): エージェントが検索しようと思わなくても、関係のある記憶が会話に入ります。
+**フック (Claude Code / Codex / OpenCode)** (`setup` が登録。`--hooks session-start,user-prompt` で選択、`--no-hooks` で触らない、`--uninstall` で削除。自分以外のフックはそのまま残します): エージェントが検索しようと思わなくても、関係のある記憶が会話に入ります。
 
 | フック | Claude Code のイベント | 入れるもの |
 |---|---|---|
 | `sqgraph-memory hook session-start` | `SessionStart` (起動 / 再開 / `/clear` / コンパクション後) | ユーザー自身についての今有効なファクト (好み・指示)、作業ディレクトリ (git リポジトリ名・フォルダ名) に関係するファクト、7 日以内に始まる / 終わる予定 |
 | `sqgraph-memory hook user-prompt` | `UserPromptSubmit` | プロンプトで検索して関連性ゲートを通ったファクト (同じセッションでは同じファクトを 2 回出さない)。「覚えて」「remember this」があれば保存を促す一文 |
+
+- **Claude Code**: `~/.claude/settings.json` の `hooks`。
+- **Codex**: `~/.codex/hooks.json` (形式は Claude Code と同じで、コマンドに `--agent codex` が付く)。Codex は新しいフックを信頼するまで実行しないので、登録後に Codex で `/hooks` を開いて sqgraph-memory の 2 つを信頼してください。
+- **OpenCode**: プラグイン `~/.config/opencode/plugins/sqgraph-memory.js` が同じコマンド (`--agent opencode`) を呼びます。セッション開始時の内容はセッションごとに 1 回だけ取得して、システムプロンプトの最後のテキストに付け足します (システムメッセージを 2 つにすると Qwen などのチャットテンプレートが拒否するため。セッション中は変わらないのでプロンプトキャッシュも効きます)。プロンプトごとの記憶は、そのユーザーメッセージに合成 (`synthetic`) のテキストパートとして付けて保存するので、会話履歴は後から変わりません。
 
 フックは失敗してもユーザーの操作を止めません (エラーは `~/.sqgraph-memory/hooks.log`)。埋め込みの呼び出しは 3 秒で打ち切り、埋め込みサーバーが落ちていればキーワードとエンティティ名だけで検索します。1 回あたり約 1 秒 (Windows、ローカル DB、LAN の埋め込みサーバー) です。セッションごとの表示済みファクトは `~/.sqgraph-memory/hook-state/` に置き、7 日で消します。
 
