@@ -232,7 +232,11 @@ def test_same_entity_declared_twice_or_the_author_listed_merges():
     _, res = two_step(mem, "Redis と alice", ext, author="alice")
     assert len(res.entities) == 2 and len(res.new_entities) == 2  # Redis once, alice (author) once
     assert entity(mem, "Redis")["summary"] == "KV store" and len(facts(mem)) == 2
-    assert {f["subject_id"] for f in facts(mem)} == {entity(mem, "Redis")["id"]}
+    redis, alice = entity(mem, "Redis")["id"], entity(mem, "alice")["id"]
+    # OWNED_BY is stored in its active direction: alice OWNS Redis
+    assert {(f["subject_id"], f["relation"], f.get("object_id")) for f in facts(mem)} == {
+        (redis, "HAS_STATUS", None), (alice, "OWNS", redis)
+    }
 
 
 def test_duplicate_of_appends_the_episode_to_the_existing_fact():

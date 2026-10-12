@@ -35,7 +35,7 @@ import zlib
 from collections import Counter, defaultdict
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from datetime import datetime, timezone, tzinfo
+from datetime import datetime, timedelta, timezone, tzinfo
 from typing import Any, Callable, Iterable, Iterator, Sequence
 
 from ..db import GraphDB
@@ -115,6 +115,51 @@ HUB_MIN_FACTS = 5  # an entity with >= this many facts that make up >= half of a
 PERSONA_TERMS = frozenset(
     {"ユーザー", "ユーザ", "user", "users", "the user", "me", "my", "私", "わたし", "僕", "ぼく", "俺", "おれ", "自分", "あなた", "本人"}
 )
+
+
+# --- relation vocabulary ------------------------------------------------------------------------------------------
+# Passive relations are stored in their active direction (subject and object swapped), so one kind of link has one
+# name: "repo OWNED_BY Bob" is written "Bob OWNS repo". Only relations whose active form is unambiguous are listed.
+RELATION_INVERSES: dict[str, str] = {
+    "OWNED_BY": "OWNS",
+    "MANAGED_BY": "MANAGES",
+    "MAINTAINED_BY": "MAINTAINS",
+    "OPERATED_BY": "OPERATES",
+    "DEVELOPED_BY": "DEVELOPS",
+    "USED_BY": "USES",
+    "PREFERRED_BY": "PREFERS",
+    "REQUIRED_BY": "REQUIRES",
+    "LED_BY": "LEADS",
+    "EMPLOYED_BY": "EMPLOYS",
+    "HOSTED_BY": "HOSTS",
+    "FUNDED_BY": "FUNDS",
+    "SUPPORTED_BY": "SUPPORTS",
+    "CREATED_BY": "CREATED",
+    "BUILT_BY": "BUILT",
+    "WRITTEN_BY": "WROTE",
+    "REVIEWED_BY": "REVIEWED",
+    "REQUESTED_BY": "REQUESTED",
+    "APPROVED_BY": "APPROVED",
+    "DECIDED_BY": "DECIDED",
+}
+KNOWN_RELATIONS_IN_CONTEXT = 40  # relations offered to the extracting agent (most used first)
+STALE_PLAN_DAYS = 14  # review(): a planned / tentative fact this long past its start is worth confirming
+
+
+def normalize_relation(raw: str | None) -> str:
+    """``UPPER_SNAKE_CASE`` form of a relation name (``RELATES_TO`` when empty)."""
+    s = re.sub(r"\W+", "_", nfkc(raw or "").strip()).strip("_").upper()
+    s = re.sub(r"_+", "_", s)
+    return s or "RELATES_TO"
+
+
+def canonical_relation(raw: str | None, has_object: bool) -> tuple[str, bool]:
+    """``(relation, swap)``: the stored name of a relation and whether subject and object must be swapped for it
+    (a passive relation with an object is turned around, see ``RELATION_INVERSES``)."""
+    rel = normalize_relation(raw)
+    if has_object and rel in RELATION_INVERSES:
+        return RELATION_INVERSES[rel], True
+    return rel, False
 
 
 NO_HITS_HINT = (
@@ -287,7 +332,7 @@ def _channel_set(values: Iterable[str] | None) -> set[str] | None:
 
 def _fact_status(p: dict[str, Any], at: str) -> str:
     ia, va = p.get("invalid_at"), p.get("valid_at")
-    if ia is not None and ia <= at:
+    if ia is not None and (ia <= at or (va is not None and ia <= va)):  # ia <= va: cancelled before it began
         return "ended"
     if va is not None and va > at:
         return "scheduled"
@@ -931,6 +976,7 @@ class Memory:
                     for v in views
                 ],
                 "related_facts": related,
+                "known_relations": self._known_relations(group, channel),
             },
             "next": (
                 "Write the extraction JSON (see `schema`, `instructions`) and call commit_memory(token, extraction) "
@@ -1310,8 +1356,7 @@ class Memory:
             fact_text = opt_str(f.get("fact"), f"{where}.fact")
             if fact_text is None:
                 errors.append(f"{where}.fact is required")
-            rel_raw = opt_str(f.get("relation"), f"{where}.relation")
-            rel = "_".join((rel_raw or "RELATES_TO").upper().replace("-", "_").split())
+            rel = normalize_relation(opt_str(f.get("relation"), f"{where}.relation"))
             times: list[str | None] = []
             for key in ("valid_at", "invalid_at"):
                 raw = f.get(key)
@@ -1532,6 +1577,7 @@ class Memory:
                         }
                         for w in work
                     ],
+                    "known_relations": self._known_relations(group, channel),
                     "message": text,
                 },
                 prompts.EXTRACT_FACTS_SCHEMA,
@@ -1551,7 +1597,7 @@ class Memory:
             if ia is not None and ia <= va:
                 ia = None
             modality = f.get("modality") if f.get("modality") in ("definite", "planned", "tentative") else "definite"
-            rel = "_".join((f.get("relation") or "RELATES_TO").upper().replace("-", "_").split()) or "RELATES_TO"
+            rel = normalize_relation(f.get("relation"))
             facts.append(
                 {
                     "subject": si,
@@ -1940,6 +1986,9 @@ class Memory:
                 res.facts_duplicate.append(p["id"])
                 return
         subj, obj = node_of[f["subject"]], node_of.get(f["object"]) if f["object"] is not None else None
+        relation, swap = canonical_relation(f["relation"], obj is not None and obj["id"] != subj["id"])
+        if swap:
+            subj, obj = obj, subj
         va, ia = f["valid_at"], f["invalid_at"]
         expired: str | None = None
         olds: list[Relationship] = []
@@ -1960,7 +2009,7 @@ class Memory:
             "group_id": group,
             "fact": f["fact"],
             "text_norm": nfkc(f["fact"]).casefold(),
-            "relation": f["relation"],
+            "relation": relation,
             "subject_id": subj["id"],
             "valid_at": va,
             "created_at": now,
@@ -3083,6 +3132,466 @@ class Memory:
                     valid.append((eff["valid_at"] or "", f["fact"]))
             body = " / ".join(t for _, t in sorted(valid, reverse=True)[:4])
         return upd, short(f"{name}: {body}", 400)
+
+    # ================================================================== CURATION
+    # Corrections that keep history (unlike forget): two entities that are the same thing become one, a fact that is
+    # no longer true is closed, the relation vocabulary is cleaned up. ``review`` lists candidates for these; the
+    # caller (an agent, with the user's confirmation) decides.
+
+    def _fact_vector(self, edge: Relationship) -> list[float] | None:
+        ix = next((i for i in self.db.vector_indexes() if i.name == FACT_INDEX), None)
+        return self.db._vec_read(ix, edge.id) if ix is not None else None
+
+    def _replace_fact_edge(self, edge: Relationship, src: int, dst: int, upd: dict[str, Any]) -> None:
+        """Re-create a fact between other nodes (relationships cannot change endpoints), keeping id and vector."""
+        props = {k: v for k, v in edge.properties.items() if v is not None}
+        for k, v in upd.items():
+            if v is None:
+                props.pop(k, None)
+            else:
+                props[k] = v
+        vec = self._fact_vector(edge)
+        if vec:
+            props["embedding"] = vec
+        self.db.delete_edge(edge.id)
+        self.db.create_edge(src, dst, FACT_TYPE, props)
+
+    def merge_entities(
+        self,
+        keep: str,
+        merge: str,
+        *,
+        group_id: str | None = None,
+        dry_run: bool = False,
+    ) -> dict[str, Any]:
+        """Merge entity ``merge`` into ``keep`` (each: id, or exact name / alias): one entity remains.
+
+        ``keep`` gets the other's name and aliases as aliases, its channels and per-channel summaries; every fact and
+        mention of ``merge`` moves to ``keep``. A fact that becomes an exact duplicate of one ``keep`` already has (same
+        subject, object, relation and sentence, both still valid or both ended) is folded into it (sources united,
+        supersede links redirected). A fact between the two becomes an attribute of ``keep`` (listed in ``warnings``).
+        Nothing is deleted from the history. Returns what moved; with ``dry_run`` nothing is written.
+        """
+        if not dry_run:
+            self._need_writable()
+        group = self._group(group_id)
+        with self._write_guard():
+            k_node = self._single_entity(group, keep, "keep")
+            m_node = self._single_entity(group, merge, "merge")
+            if k_node["id"] == m_node["id"]:
+                raise ValueError(f"{keep!r} and {merge!r} are the same entity ({k_node['id']})")
+            kid, mid = k_node["id"], m_node["id"]
+            warnings: list[str] = []
+            if not _types_compatible(k_node.get("type", "Other"), m_node.get("type", "Other")):
+                warnings.append(
+                    f"types differ ({k_node.get('type')} vs {m_node.get('type')}); the merged entity keeps {k_node.get('type')}"
+                )
+            keep_facts = {f["id"]: f for f in self._facts_of_entity(kid, group)}
+            moving = [f for f in self._facts_of_entity(mid, group) if f["id"] not in keep_facts]
+            between = [f for f in self._facts_of_entity(mid, group) if f["id"] in keep_facts]
+
+            def remap(x: str | None) -> str | None:
+                return kid if x == mid else x
+
+            def key(subj: str | None, obj: str | None, f: Relationship) -> tuple[Any, ...]:
+                return (subj, obj, f.get("relation"), f.get("text_norm") or nfkc(f["fact"]).casefold(), f.get("invalid_at") is None)
+
+            existing = {key(f.get("subject_id"), f.get("object_id"), f): fid for fid, f in keep_facts.items()}
+            plan_move: list[tuple[Relationship, dict[str, Any]]] = []
+            plan_fold: list[tuple[Relationship, str]] = []  # (fact to drop, survivor id)
+            for f in moving:
+                subj, obj = remap(f.get("subject_id")), remap(f.get("object_id"))
+                k = key(subj, obj, f)
+                if k in existing:
+                    plan_fold.append((f, existing[k]))
+                    continue
+                existing[k] = f["id"]
+                plan_move.append((f, {"subject_id": subj, "object_id": obj}))
+            for f in between:  # a fact linking the two: now about one entity
+                warnings.append(f"fact {f['id']} linked the two entities and is now an attribute of {k_node['name']!r}: {f['fact']}")
+                plan_move.append((f, {"subject_id": kid, "object_id": None}))
+            mentions = [
+                (r["e"], r["role"])
+                for r in self.db.query(
+                    "MATCH (e:Episode)-[m:MENTIONS]->(x:Entity {id:$id}) RETURN e, m.role AS role", {"id": mid}
+                )
+            ]
+            already = {r["id"] for r in self.db.query("MATCH (e:Episode)-[:MENTIONS]->(x:Entity {id:$id}) RETURN e.id AS id", {"id": kid})}
+            new_mentions = [(e, role) for e, role in mentions if e["id"] not in already]
+            kp, mp = k_node.properties, m_node.properties
+            aliases = list(kp.get("aliases", []))
+            added: list[str] = []
+            for a in [mp["name"], *mp.get("aliases", [])]:
+                if a and a != kp["name"] and a not in aliases:
+                    aliases.append(a)
+                    added.append(a)
+            entries = dict(self._entries(kp))
+            for ch, text in self._entries(mp).items():
+                entries[ch] = short(f"{entries[ch]} / {text}", 300) if ch in entries and text not in entries[ch] else entries.get(ch, text)
+            legacy = not self._entries(kp) and not self._entries(mp)
+            upd: dict[str, Any] = {
+                "aliases": aliases,
+                "alias_keys": sorted({k for k in (norm_key(x) for x in [kp["name"], *aliases]) if k}),
+                "alias_src": list(dict.fromkeys([*kp.get("alias_src", []), *mp.get("alias_src", [])])),
+                "search_text": nfkc("\n".join([kp["name"], *aliases])).casefold(),
+                "channels": list(dict.fromkeys([*kp.get("channels", []), *mp.get("channels", [])])),
+                "created_at": min(kp.get("created_at") or "9999", mp.get("created_at") or "9999"),
+                "updated_at": self._now(),
+            }
+            if legacy:
+                parts = [s for s in (kp.get("summary"), mp.get("summary")) if s]
+                upd["summary"] = short(" / ".join(dict.fromkeys(parts)), 300)
+            else:
+                upd.update(
+                    summaries=[f"{c}\t{t}" for c, t in entries.items()],
+                    summary=" / ".join(entries.values()),
+                    summary_channels=list(entries),
+                )
+            result: dict[str, Any] = {
+                "kept": {"id": kid, "name": kp["name"], "type": kp.get("type")},
+                "merged": {"id": mid, "name": mp["name"], "type": mp.get("type")},
+                "facts_moved": sorted(f["id"] for f, _ in plan_move),
+                "facts_folded": [{"fact_id": f["id"], "into": s} for f, s in plan_fold],
+                "mentions_moved": len(new_mentions),
+                "aliases_added": added,
+                "warnings": warnings,
+                "dry_run": dry_run,
+            }
+            if dry_run:
+                return result
+            # new vector of the kept entity (outside the transaction; a failing embedder keeps the old vector)
+            vec: list[float] | None = None
+            if self.embedder is not None:
+                after = Node(k_node.id, k_node.labels, {**kp, **upd})
+                facts_after = [*keep_facts.values(), *(f for f, _ in plan_move)]
+                try:
+                    vec = self.embedder.embed([self._reembed_entity_text(after, facts_after, self._now())])[0]
+                except Exception as exc:  # noqa: BLE001
+                    warnings.append(f"could not re-embed the merged entity ({type(exc).__name__}); its old vector is kept")
+            if vec is not None:
+                upd["embedding"] = vec
+            nodes = self._nodes("Entity", {x for f, u in plan_move for x in (u["subject_id"], u["object_id"]) if x}, group)
+            folds = {s: [f for f, s2 in plan_fold if s2 == s] for s in {s for _, s in plan_fold}}
+            with self.db.transaction():
+                for f, u in plan_move:
+                    src = nodes[u["subject_id"]].id
+                    dst = nodes[u["object_id"]].id if u["object_id"] else src
+                    self._replace_fact_edge(f, src, dst, u)
+                for survivor_id, dropped in folds.items():
+                    self._fold_facts(group, survivor_id, dropped)
+                for e, role in new_mentions:
+                    self.db.create_edge(e.id, k_node.id, "MENTIONS", {"role": role} if role else {})
+                self.db.delete_node(m_node.id, detach=True)
+                self.db.update_node(k_node.id, upd)
+            return result
+
+    def _single_entity(self, group: str, ref: str, label: str) -> Node:
+        nodes = self._entities_by_ref(group, ref)
+        if not nodes:
+            raise ValueError(f"{label}: no entity with id / exact name {ref!r} (find it with search_entities)")
+        if len(nodes) > 1:
+            options = ", ".join(f"{n['id']} ({n.get('type')} {n['name']!r})" for n in nodes)
+            raise ValueError(f"{label}: {ref!r} is ambiguous; use an entity id: {options}")
+        return nodes[0]
+
+    def _fold_facts(self, group: str, survivor_id: str, dropped: list[Relationship]) -> None:
+        """Delete ``dropped`` duplicates of the fact ``survivor_id``: their sources and links move to the survivor."""
+        survivor = self._fact_edge(survivor_id)
+        assert survivor is not None
+        sp = survivor.properties
+        gone = {f["id"] for f in dropped}
+        eps = list(sp.get("episode_ids", []))
+        chans = list(sp.get("channels", []))
+        sup = list(sp.get("supersedes", []))
+        conf = float(sp.get("confidence", 0))
+        for f in dropped:
+            eps += [e for e in f.get("episode_ids", []) if e not in eps]
+            chans += [c for c in f.get("channels", []) if c not in chans]
+            sup += [s for s in f.get("supersedes", []) if s not in sup and s != survivor_id]
+            conf = max(conf, float(f.get("confidence", 0)))
+        upd: dict[str, Any] = {"episode_ids": eps, "channels": chans, "confidence": conf, "supersedes": sup or None}
+        self.db.update_edge(survivor.id, upd)
+        for f in dropped:
+            self.db.delete_edge(f.id)
+        # links pointing at a dropped fact now point at the survivor
+        for r in self.db.query("MATCH ()-[f:FACT {group_id:$g}]->() RETURN f", {"g": group}):
+            f = r["f"]
+            if f["id"] == survivor_id:
+                continue
+            fu: dict[str, Any] = {}
+            if f.get("superseded_by") in gone:
+                fu["superseded_by"] = survivor_id
+            if any(s in gone for s in f.get("supersedes", [])):
+                fu["supersedes"] = list(dict.fromkeys(survivor_id if s in gone else s for s in f["supersedes"]))
+            if fu:
+                self.db.update_edge(f.id, fu)
+
+    def invalidate_fact(
+        self,
+        fact_id: str,
+        *,
+        at: str | datetime | None = None,
+        reason: str | None = None,
+        group_id: str | None = None,
+    ) -> FactHit:
+        """Close a fact that is no longer true (a manual correction; nothing is deleted).
+
+        ``invalid_at`` becomes ``at`` (default now; a plan that has not started yet is cancelled at its start, so it
+        never becomes valid). ``reason`` is stored as ``invalid_reason``. A fact that already ended is refused.
+        """
+        self._need_writable()
+        group = self._group(group_id)
+        with self._write_guard():
+            f = self._fact_edge(fact_id)
+            if f is None or f.get("group_id") != group:
+                raise ValueError(f"no fact {fact_id!r} in group {group!r}")
+            now = self._now()
+            va = f.get("valid_at") or now
+            if at is None:
+                end = max(now, va)
+            else:
+                dt = parse_time(at, self.tz)
+                if dt is None:
+                    raise ValueError(f"cannot parse at: {at!r}")
+                end = to_iso(dt)
+                if end < va:
+                    raise ValueError(f"at ({self._local(end)}) is before the fact became valid ({self._local(va)})")
+            if f.get("invalid_at") is not None and f["invalid_at"] <= max(now, end):
+                raise ValueError(f"fact {fact_id} already ended at {self._local(f['invalid_at'])}")
+            upd: dict[str, Any] = {"invalid_at": end, "expired_at": now, "ended_by": "manual"}
+            if reason and reason.strip():
+                upd["invalid_reason"] = short(reason, 300)
+            edge = self.db.update_edge(f.id, upd)
+        return self._to_hits(group, [(edge, 0.0)], None, now)[0]
+
+    def _known_relations(self, group: str, channel: str | None = None, limit: int = KNOWN_RELATIONS_IN_CONTEXT) -> list[str]:
+        """Relation names in use (facts visible in ``channel``; ``None`` = all), most used first."""
+        counts: Counter[str] = Counter()
+        for r in self.db.query("MATCH ()-[f:FACT {group_id:$g}]->() RETURN f.relation AS r, f.channels AS c", {"g": group}):
+            if r["r"] and (channel is None or channel in (r["c"] or [])):
+                counts[r["r"]] += 1
+        return [rel for rel, _ in sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))[:limit]]
+
+    def relation_stats(self, group_id: str | None = None) -> list[dict[str, Any]]:
+        """Every relation name with its fact counts (``facts``, ``valid``) and the newest example sentence."""
+        group = self._group(group_id)
+        stats: dict[str, dict[str, Any]] = {}
+        now = self._now()
+        for r in self.db.query("MATCH ()-[f:FACT {group_id:$g}]->() RETURN f", {"g": group}):
+            f = r["f"]
+            s = stats.setdefault(f.get("relation", ""), {"relation": f.get("relation", ""), "facts": 0, "valid": 0, "_at": "", "example": ""})
+            s["facts"] += 1
+            if _fact_status(f.properties, now) != "ended":
+                s["valid"] += 1
+            if (f.get("valid_at") or "") >= s["_at"]:
+                s["_at"], s["example"] = f.get("valid_at") or "", short(f["fact"], 120)
+        out = sorted(stats.values(), key=lambda s: (-s["facts"], s["relation"]))
+        for s in out:
+            del s["_at"]
+        return out
+
+    def rename_relation(
+        self,
+        old: str,
+        new: str,
+        *,
+        swap: bool = False,
+        fact_ids: Sequence[str] | None = None,
+        group_id: str | None = None,
+        dry_run: bool = False,
+    ) -> dict[str, Any]:
+        """Rename relation ``old`` to ``new`` on every fact (or only ``fact_ids``); ``swap`` also turns the facts around
+        (subject <-> object; attribute facts have no object and are only renamed). A passive ``new`` with a known active
+        form (``OWNED_BY``) is stored as that form with the direction swapped, like at ingestion."""
+        if not dry_run:
+            self._need_writable()
+        group = self._group(group_id)
+        old_n = normalize_relation(old)
+        with self._write_guard():
+            facts = [r["f"] for r in self.db.query("MATCH ()-[f:FACT {group_id:$g}]->() WHERE f.relation = $r RETURN f", {"g": group, "r": old_n})]
+            if fact_ids is not None:
+                wanted = set(fact_ids)
+                missing = wanted - {f["id"] for f in facts}
+                if missing:
+                    raise ValueError(f"not facts with relation {old_n}: {', '.join(sorted(missing))}")
+                facts = [f for f in facts if f["id"] in wanted]
+            renamed: list[str] = []
+            swapped: list[str] = []
+            plan: list[tuple[Relationship, str, bool]] = []
+            for f in facts:
+                has_obj = bool(f.get("object_id")) and f.get("object_id") != f.get("subject_id")
+                rel, inv = canonical_relation(new, has_obj)
+                turn = has_obj and (swap != inv)
+                plan.append((f, rel, turn))
+                renamed.append(f["id"])
+                if turn:
+                    swapped.append(f["id"])
+            if not dry_run and plan:
+                ents = self._nodes("Entity", {x for f, _, t in plan if t for x in (f["subject_id"], f["object_id"])}, group)
+                with self.db.transaction():
+                    for f, rel, turn in plan:
+                        if turn:
+                            s, o = f["object_id"], f["subject_id"]
+                            self._replace_fact_edge(f, ents[s].id, ents[o].id, {"relation": rel, "subject_id": s, "object_id": o})
+                        else:
+                            self.db.update_edge(f.id, {"relation": rel})
+        return {
+            "relation": old_n,
+            "to": RELATION_INVERSES.get(normalize_relation(new), normalize_relation(new)),
+            "renamed": renamed,
+            "swapped": swapped,
+            "dry_run": dry_run,
+        }
+
+    def review(self, group_id: str | None = None, *, limit: int = 20) -> dict[str, Any]:
+        """Housekeeping report for an agent (read-only): candidates to clean up, never changed here.
+
+        * ``duplicate_entities``: pairs that may be the same thing (shared alias, one name containing the other, very
+          similar vectors), with the reasons; fix with :meth:`merge_entities`.
+        * ``relations``: the vocabulary with counts; ``relation_suggestions``: passive names to turn around, names that
+          differ only in spelling, and names used once (candidates for :meth:`rename_relation`).
+        * ``stale_plans``: planned / tentative facts whose start passed more than ``STALE_PLAN_DAYS`` ago without a
+          confirmation, to confirm or close (:meth:`invalidate_fact`).
+        """
+        group = self._group(group_id)
+        rels = self.relation_stats(group)
+        suggestions: list[dict[str, Any]] = []
+        names = {r["relation"] for r in rels}
+        for r in rels:
+            rel = r["relation"]
+            if rel in RELATION_INVERSES:
+                suggestions.append({"relation": rel, "suggest": RELATION_INVERSES[rel], "swap": True, "why": "passive form: store the active direction"})
+        by_squash: dict[str, list[str]] = defaultdict(list)
+        for n in names:
+            by_squash[re.sub(r"[_\W]+", "", n).casefold().rstrip("s")].append(n)
+        for variants in by_squash.values():
+            if len(variants) > 1:
+                top = max(variants, key=lambda v: next(r["facts"] for r in rels if r["relation"] == v))
+                for v in variants:
+                    if v != top:
+                        suggestions.append({"relation": v, "suggest": top, "swap": False, "why": "spelling variant"})
+        singletons = [r["relation"] for r in rels if r["facts"] == 1]
+        return {
+            "group_id": group,
+            "duplicate_entities": self._duplicate_entity_candidates(group, limit),
+            "relations": rels[:60],
+            "relation_suggestions": suggestions,
+            "relations_used_once": singletons,
+            "stale_plans": self._stale_plans(group, limit),
+            "next": (
+                "Show the user the candidates that look real and ask before changing anything. Then: merge_entities(keep, merge) "
+                "for duplicates, rename_relation(old, new[, swap]) to unify relation names (a relation used once is often a "
+                "synonym of a common one: compare the examples), invalidate_fact(fact_id) for plans that did not happen."
+            ),
+        }
+
+    def _duplicate_entity_candidates(self, group: str, limit: int) -> list[dict[str, Any]]:
+        ents = [r["e"] for r in self.db.query("MATCH (e:Entity {group_id:$g}) RETURN e", {"g": group})]
+        by_id = {n["id"]: n for n in ents}
+        reasons: dict[tuple[str, str], dict[str, Any]] = {}
+
+        def note(a: str, b: str, why: str, sim: float | None = None) -> None:
+            if a == b or not _types_compatible(by_id[a].get("type", "Other"), by_id[b].get("type", "Other")):
+                return
+            k = (a, b) if a < b else (b, a)
+            r = reasons.setdefault(k, {"reasons": [], "similarity": None})
+            if why not in r["reasons"]:
+                r["reasons"].append(why)
+            if sim is not None:
+                r["similarity"] = sim
+        keys: dict[str, list[str]] = defaultdict(list)
+        for n in ents:
+            for k in n.get("alias_keys", []) or [norm_key(n["name"])]:
+                keys[k].append(n["id"])
+        for ids in keys.values():
+            for i, a in enumerate(ids):
+                for b in ids[i + 1 :]:
+                    note(a, b, "shared name / alias")
+        names = [(norm_key(n["name"]), n["id"]) for n in ents]
+        for ka, a in names:
+            if len(ka) < 3:
+                continue
+            for kb, b in names:
+                if a != b and len(kb) > len(ka) and ka in kb:
+                    note(a, b, "one name contains the other")
+        ix = next((i for i in self.db.vector_indexes() if i.name == ENTITY_INDEX), None)
+        if ix is not None and len(ents) > 1:
+            thr = min(0.95, self.effective_min_similarity() + 0.3)
+            for n in ents:
+                v = self.db._vec_read(ix, n.id)
+                if not v:
+                    continue
+                for m, s in self.db.vector_search(ENTITY_INDEX, v, k=6):
+                    if m.get("group_id") != group or m["id"] == n["id"]:
+                        continue
+                    sim = 2.0 * s - 1.0
+                    if sim >= thr:
+                        note(n["id"], m["id"], "very similar description", round(sim, 4))
+        fact_counts: Counter[str] = Counter()
+        for r in self.db.query("MATCH ()-[f:FACT {group_id:$g}]->() RETURN f.subject_id AS s, f.object_id AS o", {"g": group}):
+            for x in {r["s"], r["o"]} - {None}:
+                fact_counts[x] += 1
+
+        def view(i: str) -> dict[str, Any]:
+            n = by_id[i]
+            return {"id": i, "name": n["name"], "type": n.get("type"), "aliases": n.get("aliases", [])[:5], "summary": short(n.get("summary", ""), 100), "facts": fact_counts[i]}
+
+        ranked = sorted(reasons.items(), key=lambda kv: (-len(kv[1]["reasons"]), -(kv[1]["similarity"] or 0)))
+        return [{"a": view(a), "b": view(b), **r} for (a, b), r in ranked[:limit]]
+
+    def _stale_plans(self, group: str, limit: int) -> list[dict[str, Any]]:
+        now = self._now()
+        cutoff = to_iso(self._clock() - timedelta(days=STALE_PLAN_DAYS))
+        rows = self.db.query(
+            "MATCH ()-[f:FACT {group_id:$g}]->() WHERE f.modality IN ['planned', 'tentative'] AND f.invalid_at IS NULL "
+            "AND f.valid_at < $cutoff RETURN f ORDER BY f.valid_at",
+            {"g": group, "cutoff": cutoff},
+        )
+        return [h.to_dict() for h in self._to_hits(group, [(r["f"], 0.0) for r in rows[:limit]], None, now, max_episodes=1)]
+
+    # ================================================================== UPCOMING
+
+    def upcoming(
+        self,
+        days: float = 7,
+        *,
+        group_id: str | None = None,
+        channels: Sequence[str] | None = None,
+        past_days: float = 0,
+        limit: int = 30,
+    ) -> list[dict[str, Any]]:
+        """Facts that start or end within the next ``days`` (and the last ``past_days``), soonest first.
+
+        Each item is ``{"event": "starts" | "ends", "at": local time, "fact": FactHit dict}``. "ends" covers stated
+        ends (an absence until 9/17), not ends caused by a newer contradicting fact; a plan cancelled before it began
+        is not listed.
+        """
+        group = self._group(group_id)
+        allowed = _channel_set(channels)
+        if allowed is not None and not allowed:
+            return []
+        now_dt = self._clock()
+        lo = to_iso(now_dt - timedelta(days=past_days))
+        hi = to_iso(now_dt + timedelta(days=days))
+        rows = self.db.query(
+            "MATCH ()-[f:FACT {group_id:$g}]->() WHERE (f.valid_at > $lo AND f.valid_at <= $hi) "
+            "OR (f.invalid_at > $lo AND f.invalid_at <= $hi) RETURN f",
+            {"g": group, "lo": lo, "hi": hi},
+        )
+        events: list[tuple[str, str, Relationship]] = []
+        for r in rows:
+            f = r["f"]
+            if not self._fact_visible(f.properties, allowed):
+                continue
+            va, ia = f.get("valid_at"), f.get("invalid_at")
+            if va and lo < va <= hi and (ia is None or ia > va):
+                events.append((va, "starts", f))
+            if ia and lo < ia <= hi and not f.get("superseded_by") and f.get("ended_by") != "manual" and (va is None or ia > va):
+                events.append((ia, "ends", f))
+        events.sort(key=lambda e: e[0])
+        events = events[:limit]
+        hits = {h.id: h for h in self._to_hits(group, [(f, 0.0) for _, _, f in events], allowed, to_iso(now_dt), max_episodes=1)}
+        return [{"event": kind, "at": self._local(at), "fact": hits[f["id"]].to_dict()} for at, kind, f in events]
 
     # -- re-embedding ----------------------------------------------------------------------------------
 

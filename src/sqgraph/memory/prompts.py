@@ -66,7 +66,7 @@ Input: `entities` (idx, name, type, current summary), `author`, `occurred_at` (l
 Output `facts`: relations between entities (subject idx -> object idx) or attributes of one entity (object null).
 - Only facts stated or clearly implied by `message`. Do not repeat facts that only appear in `context` or in summaries.
 - `fact`: one self-contained sentence in the message language that names its entities (no pronouns), e.g. "Bob は認証基盤の権限管理を担当している".
-- `relation`: UPPER_SNAKE_CASE verb phrase (WORKS_ON, OWNS, MANAGES, DEPENDS_ON, HAS_STATUS, PLANS_TO, ABSENT, DECIDED, USES, HANDS_OVER_TO ...).
+- `relation`: UPPER_SNAKE_CASE verb phrase (WORKS_ON, OWNS, MANAGES, DEPENDS_ON, HAS_STATUS, PLANS_TO, ABSENT, DECIDED, USES, HANDS_OVER_TO ...). Reuse a name from `known_relations` (the graph's vocabulary, most used first) whenever one fits; use the active direction (OWNS, not OWNED_BY).
 - valid_at: when the fact starts being true in the world, ISO 8601 (local time, no timezone, date-only is fine). Give a value ONLY if the message states or implies a start time (dates, 来週から, 明日, 9/14, 先月...), computed from `occurred_at` (assume the nearest sensible year). Otherwise null (= true from `occurred_at` on). Never guess a date.
 - invalid_at: when the fact stops being true if the message says so (e.g. absence 9/14-9/16 -> 2026-09-17: the first moment it is no longer true), else null.
 - modality: definite | planned (future intention/schedule) | tentative (unsure, proposal, question-like).
@@ -125,7 +125,7 @@ ENTITIES (`entities`): the people, services/tools/repos, teams/orgs, tickets/PRs
 FACTS (`facts`): durable knowledge only: ownership/assignment, status, decisions, plans/schedules, dependencies, where things live, absences, problems and causes, and the user's preferences, standing instructions and personal facts/habits. Not chit-chat, thanks, questions without new info, or this session's transient details. Prefer 0-5 high-value facts; none is fine.
 - subject/object: entity refs. An attribute of one entity (a status, an absence, a preference) has object null.
 - fact: ONE self-contained sentence in the message language that names its entities (no pronouns), e.g. "Bob は認証基盤の権限管理を担当している".
-- relation: UPPER_SNAKE_CASE (OWNS, WORKS_ON, MANAGES, DEPENDS_ON, HAS_STATUS, PLANS_TO, ABSENT, DECIDED, USES, PREFERS ...).
+- relation: UPPER_SNAKE_CASE (OWNS, WORKS_ON, MANAGES, DEPENDS_ON, HAS_STATUS, PLANS_TO, ABSENT, DECIDED, USES, PREFERS ...). Reuse a name from `context.known_relations` (the memory's vocabulary, most used first) whenever one fits the meaning; coin a new one only when none does. Use the active direction (Bob OWNS repo, not repo OWNED_BY Bob).
 - valid_at: when it starts being true, computed from `context.message.occurred_at` (weekday and UTC offset are given): ISO 8601, local time, date-only is fine (来週から, 明日, 9/14 ...). null means the message time. Never guess a date.
 - invalid_at: when it stops being true if stated (absence 9/14-9/16 -> 2026-09-17, the first moment it is no longer true), else null.
 - modality: definite | planned (future intention/schedule) | tentative (unsure, proposal). confidence: 0-1 (default by modality).
