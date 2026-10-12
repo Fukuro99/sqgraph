@@ -3,7 +3,9 @@
 Targets and the formats written (verified against each product's documentation):
 
 * **Claude Code** -- ``claude mcp add --scope user sqgraph-memory -- <cmd> mcp`` (stored in ``~/.claude.json``);
-  skill: ``~/.claude/skills/sqgraph-memory/SKILL.md``.
+  skill: ``~/.claude/skills/sqgraph-memory/SKILL.md``; hooks (``SessionStart`` / ``UserPromptSubmit`` running
+  ``<cmd> hook session-start|user-prompt``, see :mod:`sqgraph.memory.hooks`) in ``~/.claude/settings.json``
+  (https://code.claude.com/docs/en/hooks).
 * **Codex CLI** -- ``~/.codex/config.toml``, a ``[mcp_servers.sqgraph-memory]`` table with ``command`` / ``args``
   (https://developers.openai.com/codex/mcp); skill: ``~/.agents/skills/sqgraph-memory/SKILL.md``
   (https://developers.openai.com/codex/skills).
@@ -27,7 +29,7 @@ import subprocess
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Sequence
 
 SERVER_NAME = "sqgraph-memory"
 EXE_NAME = "sqgraph-memory"
@@ -35,6 +37,10 @@ AGENTS = ("claude-code", "codex", "cursor", "claude-desktop")
 STARTUP_TIMEOUT_SEC = 30  # Codex default is 10s; the first start imports sqlite-vec / openai / mcp
 
 Runner = Callable[[list[str]], "tuple[int, str, str]"]
+
+# Claude Code hooks: our event name -> (Claude Code event, timeout in seconds)
+HOOKS: dict[str, tuple[str, int]] = {"session-start": ("SessionStart", 30), "user-prompt": ("UserPromptSubmit", 15)}
+_OUR_HOOK_RE = re.compile(r"\bhook (session-start|user-prompt)\b")
 
 
 # --------------------------------------------------------------------------- helpers
@@ -149,6 +155,7 @@ class Context:
     platform: str = field(default_factory=lambda: sys.platform)
     appdata: Path | None = None  # Windows %APPDATA% override
     env: dict[str, str] = field(default_factory=dict)  # environment forwarded into every registration
+    hooks: tuple[str, ...] = tuple(HOOKS)  # Claude Code hooks to install (empty: leave hooks alone)
 
 
 # --------------------------------------------------------------------------- skill files
@@ -261,7 +268,14 @@ class Target:
             out["command"] = cur
         if err:
             out["error"] = err
+        hooks = self.hooks_status()
+        if hooks is not None:
+            out["hooks"] = hooks
         return out
+
+    def hooks_status(self) -> list[str] | None:
+        """Our hook events installed for this agent (``None``: the agent has no hooks)."""
+        return None
 
     def install(self) -> dict[str, Any]:
         report: dict[str, Any] = {"agent": self.name, "detected": self.detected(), "config": str(self.config_path()) if self.config_path() else None}
@@ -446,6 +460,54 @@ class ClaudeCodeTarget(Target):
         else:
             report["action"] = "updated" if cur is not None else "registered"
 
+    # -- hooks (~/.claude/settings.json) ----------------------------------------------------------
+
+    def settings_path(self) -> Path:
+        return self.ctx.home / ".claude" / "settings.json"
+
+    def hook_handler(self, event: str) -> dict[str, Any]:
+        command = hook_command(self.ctx.command, event, self.ctx.env, self.ctx.platform)
+        return {"type": "command", "command": command, "timeout": HOOKS[event][1]}
+
+    def hooks_status(self) -> list[str] | None:
+        try:
+            return sorted(installed_hooks(_read_json_object(self.settings_path())))
+        except Exception:  # noqa: BLE001 - unreadable settings: nothing of ours is known to be there
+            return []
+
+    def install(self) -> dict[str, Any]:
+        report = super().install()
+        if self.ctx.hooks:
+            report["hooks"] = self._set_hooks(self.ctx.hooks)
+        else:
+            report["hooks"] = {"action": "skipped"}
+        return report
+
+    def uninstall(self) -> dict[str, Any]:
+        report = super().uninstall()
+        report["hooks"] = self._set_hooks(())
+        return report
+
+    def _set_hooks(self, events: tuple[str, ...]) -> dict[str, Any]:
+        p = self.settings_path()
+        try:
+            data = _read_json_object(p)  # raises on invalid JSON: the file is left untouched
+            want = {ev: self.hook_handler(ev) for ev in events}
+            new = set_hooks(data, want)
+            if new is None:
+                return {"action": "unchanged" if want else "not-installed", "path": str(p), "events": sorted(want)}
+            if self.ctx.dry_run:
+                action = "would-install" if want else "would-remove"
+            else:
+                action = "installed" if want else "removed"
+            res: dict[str, Any] = {"action": action, "path": str(p), "events": sorted(want)}
+            if not self.ctx.dry_run:
+                res["backup"] = _backup(p)
+                _atomic_write(p, json.dumps(new, ensure_ascii=False, indent=2) + "\n")
+            return res
+        except Exception as exc:  # noqa: BLE001
+            return {"action": "failed", "path": str(p), "error": f"{type(exc).__name__}: {exc}"}
+
     def _unregister(self, report: dict[str, Any]) -> None:
         cur = self.current()
         claude = self.ctx.which("claude")
@@ -464,6 +526,74 @@ class ClaudeCodeTarget(Target):
             report.update(action="failed", error=(err or out).strip()[-400:])
         else:
             report["action"] = "removed"
+
+
+def hook_command(command: list[str], event: str, env: dict[str, str] | None = None, platform: str | None = None) -> str:
+    """The shell command a Claude Code hook runs: the server launch command with ``hook <event>`` instead of ``mcp``.
+
+    On Windows, drive paths use forward slashes (valid for both Git Bash and cmd.exe, either of which may run hooks)."""
+    plat = platform or sys.platform
+    base = command[:-1] if command and command[-1] == "mcp" else list(command)
+    argv = [*base, "hook", event, *[x for k, v in (env or {}).items() for x in ("--env", f"{k}={v}")]]
+    if plat == "win32":
+        argv = [a.replace("\\", "/") if re.match(r"^[A-Za-z]:[\\/]", a) else a for a in argv]
+    return format_command(argv, plat)
+
+
+def _is_our_hook(h: Any) -> bool:
+    cmd = h.get("command") if isinstance(h, dict) else None
+    return isinstance(cmd, str) and "sqgraph" in cmd.lower() and bool(_OUR_HOOK_RE.search(cmd))
+
+
+def installed_hooks(data: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
+    """Our hook handlers in a Claude Code settings object, by our event name."""
+    out: dict[str, list[dict[str, Any]]] = {}
+    hooks = data.get("hooks")
+    if not isinstance(hooks, dict):
+        return out
+    for ev, (cc_event, _) in HOOKS.items():
+        found: list[dict[str, Any]] = []
+        groups = hooks.get(cc_event)
+        for group in groups if isinstance(groups, list) else []:
+            if isinstance(group, dict):
+                found += [h for h in group.get("hooks") or [] if _is_our_hook(h)]
+        if found:
+            out[ev] = found
+    return out
+
+
+def set_hooks(data: dict[str, Any], want: dict[str, dict[str, Any]]) -> dict[str, Any] | None:
+    """A copy of ``data`` whose only sqgraph hooks are ``want`` (our event -> handler), every other hook kept as is;
+    ``None`` when nothing changes. Our handlers get matcher groups of their own (no matcher: every occurrence)."""
+    if {ev: [h] for ev, h in want.items()} == installed_hooks(data):
+        return None
+    new = json.loads(json.dumps(data))
+    hooks = new.get("hooks", {})
+    if not isinstance(hooks, dict):
+        raise ValueError("'hooks' in settings.json is not an object")
+    for ev, (cc_event, _) in HOOKS.items():
+        groups = hooks.get(cc_event) or []
+        if not isinstance(groups, list):
+            raise ValueError(f"'hooks.{cc_event}' in settings.json is not a list")
+        kept: list[Any] = []
+        for group in groups:
+            if isinstance(group, dict) and isinstance(group.get("hooks"), list) and any(_is_our_hook(h) for h in group["hooks"]):
+                rest = [h for h in group["hooks"] if not _is_our_hook(h)]
+                if rest:
+                    kept.append({**group, "hooks": rest})
+            else:
+                kept.append(group)
+        if ev in want:
+            kept.append({"hooks": [want[ev]]})
+        if kept:
+            hooks[cc_event] = kept
+        else:
+            hooks.pop(cc_event, None)
+    if hooks:
+        new["hooks"] = hooks
+    else:
+        new.pop("hooks", None)
+    return new
 
 
 # --------------------------------------------------------------------------- Codex (TOML, textual)
@@ -716,8 +846,11 @@ def run_setup(
     appdata: Path | None = None,
     warnings: list[str] | None = None,
     env: dict[str, str] | None = None,
+    hooks: Sequence[str] | None = None,
 ) -> dict[str, Any]:
-    """Install or uninstall on ``agents`` (``None`` = those detected on this machine). Returns a JSON-able report."""
+    """Install or uninstall on ``agents`` (``None`` = those detected on this machine). Returns a JSON-able report.
+
+    ``hooks``: the Claude Code hooks to install (default: all of ``HOOKS``; empty: leave hooks as they are)."""
     ctx = Context(
         home=home,
         command=command,
@@ -728,6 +861,7 @@ def run_setup(
         platform=platform or sys.platform,
         appdata=appdata,
         env=dict(env or {}),
+        hooks=tuple(HOOKS) if hooks is None else tuple(hooks),
     )
     targets = make_targets(ctx, agents, detected_only=agents is None)
     reports = [t.uninstall() if uninstall else t.install() for t in targets]

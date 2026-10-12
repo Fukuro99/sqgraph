@@ -16,6 +16,8 @@ All output is JSON on stdout (UTF-8); errors are ``{"error": ...}`` on stderr wi
     sqgraph-memory merge KEEP MERGE [--dry-run] | invalidate FACT_ID [--at T] [--reason R]
     sqgraph-memory relations | rename-relation OLD NEW [--swap] [--fact ID] [--dry-run] | review | upcoming [--days 7]
     sqgraph-memory export FILE|- [--with-embeddings] | import FILE|- [--into-group G] [--dry-run] | backup [DEST] [--keep 10]
+    sqgraph-memory hook session-start|user-prompt     (Claude Code hooks, registered by `setup`)
+    sqgraph-memory import-claude-memory [--limit 5] [--dry-run]
     sqgraph-memory mcp [--transport stdio|streamable-http] [--read-only] [--extractor agent|openai]
     sqgraph-memory setup [--agents ...] [--uninstall] | doctor [--online]
 
@@ -847,6 +849,120 @@ def cmd_backup(args: argparse.Namespace, cfg: MemoryConfig) -> dict[str, Any]:
     return res
 
 
+def cmd_hook(args: argparse.Namespace, cfg: MemoryConfig) -> None:
+    """A Claude Code hook: event JSON on stdin, ``hookSpecificOutput`` JSON (or nothing) on stdout, always exit 0."""
+    from . import hooks
+
+    try:
+        payload = json.loads(sys.stdin.read() or "{}")
+    except ValueError:
+        payload = {}
+    if not isinstance(payload, dict):
+        payload = {}
+
+    @contextmanager
+    def memory() -> Iterator[Memory]:
+        with open_memory(cfg, need_embedder=True) as (mem, _):
+            yield mem
+
+    out = hooks.run(args.event, payload, cfg.home, memory)
+    if out is not None:
+        sys.stdout.write(json.dumps(out, ensure_ascii=False) + "\n")
+        sys.stdout.flush()
+    return None
+
+
+def _claude_memory_files(root: Path) -> list[Path]:
+    return sorted(p for p in root.glob("*/memory/*.md") if p.name != "MEMORY.md" and p.is_file())
+
+
+def _parse_front_matter(text: str) -> tuple[dict[str, str], str]:
+    """``(fields, body)`` of a Markdown file with ``---`` front matter (flat ``key: value``; nested keys are dotted)."""
+    m = re.match(r"^---\s*\n(.*?)\n---\s*\n?(.*)$", text, re.S)
+    if not m:
+        return {}, text
+    fields: dict[str, str] = {}
+    parent = None
+    for ln in m.group(1).splitlines():
+        km = re.match(r"^(\s*)([A-Za-z0-9_-]+):\s*(.*)$", ln)
+        if not km:
+            continue
+        indent, key, value = km.groups()
+        if not indent:
+            parent = key if not value else None
+            if value:
+                fields[key] = value.strip().strip("\"'")
+        elif parent:
+            fields[f"{parent}.{key}"] = value.strip().strip("\"'")
+    return fields, m.group(2)
+
+
+def cmd_import_claude_memory(args: argparse.Namespace, cfg: MemoryConfig) -> dict[str, Any]:
+    """Claude Code's file-based auto-memory (``~/.claude/projects/*/memory/*.md``) as episodes (one per file)."""
+    import hashlib
+    from datetime import datetime, timezone
+
+    root = Path(args.root).expanduser() if args.root else user_home() / ".claude" / "projects"
+    if not root.is_dir():
+        raise CliError(f"no Claude Code projects directory at {root}", 2)
+    items = []
+    for p in _claude_memory_files(root):
+        raw = p.read_text(encoding="utf-8-sig")
+        fields, body = _parse_front_matter(raw)
+        project = p.parent.parent.name
+        title = fields.get("name") or p.stem
+        head = f"Claude Code memory ({fields.get('metadata.type') or fields.get('type') or 'note'}, project {project}): {title}"
+        if fields.get("description"):
+            head += f" -- {fields['description']}"
+        content = f"{head}\n\n{body.strip()}"[:6000]
+        digest = hashlib.sha1(raw.encode("utf-8")).hexdigest()[:12]
+        mtime = datetime.fromtimestamp(p.stat().st_mtime, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        items.append({"file": str(p), "source_ref": f"{project}/{p.name}#{digest}", "occurred_at": mtime, "content": content})
+    source = "claude-memory"
+    if cfg.extractor == "openai" and not args.dry_run:
+        stored = []
+        with open_memory(cfg, need_llm=True) as (mem, _):
+            for it in items[: args.limit]:
+                res = mem.add_episode(it["content"], group_id=cfg.group_id, source=source, channel=args.channel, author="user",
+                                      occurred_at=it["occurred_at"], source_ref=it["source_ref"])
+                stored.append({"file": it["file"], **_episode_summary(cfg, res)})
+        return {"group_id": cfg.group_id, "files": len(items), "stored": stored}
+    pending: list[dict[str, Any]] = []
+    done = 0
+    with open_memory(cfg, need_embedder=True) as (mem, warnings):
+        for it in items:
+            if mem._episode_by_ref(cfg.group_id, source, it["source_ref"]) is not None:
+                done += 1
+                continue
+            if args.dry_run or len(pending) >= args.limit:
+                pending.append({"file": it["file"], "source_ref": it["source_ref"]})
+                continue
+            prep = mem.prepare_episode(it["content"], group_id=cfg.group_id, source=source, channel=args.channel, author="user",
+                                       occurred_at=it["occurred_at"], source_ref=it["source_ref"])
+            pending.append({"file": it["file"], **prep})
+    ready = [p for p in pending if "token" in p]
+    out: dict[str, Any] = {
+        "group_id": cfg.group_id,
+        "files": len(items),
+        "already_imported": done,
+        "pending": len(pending),
+        "items": pending if args.dry_run else ready,
+    }
+    if ready:
+        out["instructions"] = ready[0]["instructions"]
+        out["schema"] = ready[0]["schema"]
+        for p in ready:
+            p.pop("instructions", None)
+            p.pop("schema", None)
+            p.pop("next", None)
+        out["next"] = (
+            "For each item: write the extraction from its context (see instructions) and run "
+            "`sqgraph-memory commit --token <token>` (or commit_memory). Then run this command again for the next "
+            f"{args.limit} files until pending is 0."
+        )
+    return _with_warning(out, warnings)
+
+
 def mcp_argv(cfg: MemoryConfig, args: argparse.Namespace) -> list[str]:
     """Arguments for :func:`sqgraph.memory.mcp.main`, filled from the config."""
     argv = [
@@ -890,6 +1006,15 @@ def cmd_setup(args: argparse.Namespace, cfg: MemoryConfig) -> dict[str, Any]:
         command, warnings = setup_agents.resolve_launch_command(args.command, which=lambda n: shutil.which(n))
     except ValueError as exc:
         raise CliError(str(exc), 2) from exc
+    spec = "none" if args.no_hooks else (args.hooks or "all")
+    hooks = [h.strip() for h in spec.split(",") if h.strip()]
+    if hooks == ["all"]:
+        hooks = list(setup_agents.HOOKS)
+    elif hooks == ["none"]:
+        hooks = []
+    bad = [h for h in hooks if h not in setup_agents.HOOKS]
+    if bad:
+        raise CliError(f"unknown hook(s): {', '.join(bad)} (choose from {', '.join(setup_agents.HOOKS)}, all or none)", 2)
     out = setup_agents.run_setup(
         agents,
         home=user_home(),
@@ -901,6 +1026,7 @@ def cmd_setup(args: argparse.Namespace, cfg: MemoryConfig) -> dict[str, Any]:
         which=lambda n: shutil.which(n),
         warnings=warnings,
         env=None if args.uninstall else setup_agents.forwarded_env(),
+        hooks=hooks,
     )
     if not args.uninstall and cfg.extractor == "openai" and not cfg.has_api_key():
         out["note_init"] = "no API key configured yet: run `sqgraph-memory init` (agents launch the server without your shell environment)"
@@ -1186,6 +1312,18 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--keep", type=int, default=10, help="snapshots kept in the default directory (default 10)")
     p.set_defaults(fn=cmd_backup)
 
+    p = sub.add_parser("hook", help="Claude Code hook (event JSON on stdin): session-start | user-prompt")
+    p.add_argument("event", choices=["session-start", "user-prompt"])
+    p.add_argument("--env", action="append", metavar="KEY=VALUE", help="set an SQGRAPH_MEMORY_* variable first (repeatable)")
+    p.set_defaults(fn=cmd_hook, raw=True)
+
+    p = sub.add_parser("import-claude-memory", parents=[common], help="import Claude Code's file memory (~/.claude/projects/*/memory/*.md), a few files per run")  # fmt: skip
+    p.add_argument("--root", metavar="DIR", help="projects directory (default: ~/.claude/projects)")
+    p.add_argument("--limit", type=int, default=5, help="files prepared per run (agent mode) / stored (openai mode)")
+    p.add_argument("--channel", default="personal")
+    p.add_argument("--dry-run", action="store_true", help="only list the files not imported yet")
+    p.set_defaults(fn=cmd_import_claude_memory)
+
     p = sub.add_parser("purge", parents=[common], help="delete ALL memories of the configured group")
     p.add_argument("--yes", action="store_true", help="required to actually purge")
     p.add_argument("--dry-run", action="store_true")
@@ -1203,6 +1341,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--agents", help="comma-separated: claude-code,codex,cursor,claude-desktop or all (default: detected)")
     p.add_argument("--command", help='full launch command (e.g. "uvx --from sqgraph[mcp] sqgraph-memory mcp")')
     p.add_argument("--no-skill", action="store_true", help="do not install SKILL.md")
+    p.add_argument("--hooks", metavar="LIST", help="Claude Code hooks to install: session-start,user-prompt | all (default) | none")
+    p.add_argument("--no-hooks", action="store_true", help="same as --hooks none (existing hooks are left as they are)")
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--uninstall", action="store_true", help="remove the registration and the Skill")
     p.set_defaults(fn=cmd_setup)
@@ -1217,6 +1357,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     _utf8()
     try:
         args = build_parser().parse_args(list(argv) if argv is not None else None)
+        for kv in getattr(args, "env", None) or []:  # hooks: the registration may carry SQGRAPH_MEMORY_* settings
+            key, sep, value = kv.partition("=")
+            if not sep or not key.startswith("SQGRAPH_MEMORY_"):
+                raise CliError(f"--env expects SQGRAPH_MEMORY_*=VALUE, got {kv!r}", 2)
+            os.environ[key] = value
         cfg = MemoryConfig.load()
         result = args.fn(args, cfg)
         if getattr(args, "raw", False) or result is None:  # the command wrote its own output (mcp, export -)
