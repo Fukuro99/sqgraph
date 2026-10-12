@@ -15,6 +15,7 @@ All output is JSON on stdout (UTF-8); errors are ``{"error": ...}`` on stderr wi
     sqgraph-memory purge --yes [--dry-run]
     sqgraph-memory merge KEEP MERGE [--dry-run] | invalidate FACT_ID [--at T] [--reason R]
     sqgraph-memory relations | rename-relation OLD NEW [--swap] [--fact ID] [--dry-run] | review | upcoming [--days 7]
+    sqgraph-memory export FILE|- [--with-embeddings] | import FILE|- [--into-group G] [--dry-run] | backup [DEST] [--keep 10]
     sqgraph-memory mcp [--transport stdio|streamable-http] [--read-only] [--extractor agent|openai]
     sqgraph-memory setup [--agents ...] [--uninstall] | doctor [--online]
 
@@ -789,6 +790,63 @@ def cmd_upcoming(args: argparse.Namespace, cfg: MemoryConfig) -> dict[str, Any]:
     return {"group_id": cfg.group_id, "days": args.days, "count": len(items), "events": items}
 
 
+def cmd_export(args: argparse.Namespace, cfg: MemoryConfig) -> dict[str, Any] | None:
+    from . import portable
+
+    with open_memory(cfg) as (mem, _):
+        if args.file == "-":
+            portable.export_memory(mem, sys.stdout, group_id=cfg.group_id, with_embeddings=args.with_embeddings)
+            return None
+        dest = Path(args.file)
+        if dest.exists() and not args.force:
+            raise CliError(f"{dest} already exists (use --force to overwrite)", 2)
+        tmp = dest.with_name(dest.name + ".part")
+        with tmp.open("w", encoding="utf-8", newline="\n") as out:
+            counts = portable.export_memory(mem, out, group_id=cfg.group_id, with_embeddings=args.with_embeddings)
+        tmp.replace(dest)
+    return {"path": str(dest), "bytes": dest.stat().st_size, **counts}
+
+
+def cmd_import(args: argparse.Namespace, cfg: MemoryConfig) -> dict[str, Any]:
+    from . import portable
+
+    def progress(kind: str, done: int, total: int) -> None:
+        sys.stderr.write(json.dumps({"progress": kind, "done": done, "total": total}) + "\n")
+
+    try:
+        src = sys.stdin if args.file == "-" else Path(args.file).open(encoding="utf-8-sig")
+    except OSError as exc:
+        raise CliError(f"cannot read {args.file}: {exc}", 2) from exc
+    try:
+        with open_memory(cfg, need_embedder=True) as (mem, warnings):
+            res = portable.import_memory(
+                mem, src, group_id=args.into_group or cfg.group_id, dry_run=args.dry_run, progress=progress if args.progress else None
+            )
+    except ValueError as exc:
+        raise CliError(str(exc), 2) from exc
+    finally:
+        if src is not sys.stdin:
+            src.close()
+    return _with_warning(res, warnings)
+
+
+def cmd_backup(args: argparse.Namespace, cfg: MemoryConfig) -> dict[str, Any]:
+    import time
+
+    from . import portable
+
+    directory = cfg.home / "backups"
+    dest = Path(args.dest) if args.dest else directory / time.strftime("memory-%Y%m%d-%H%M%S.db")
+    with open_memory(cfg) as (mem, _):
+        try:
+            res = portable.backup_database(mem, dest)
+        except FileExistsError as exc:
+            raise CliError(str(exc), 2) from exc
+    if not args.dest:
+        res["removed"] = portable.rotate_backups(directory, args.keep)
+    return res
+
+
 def mcp_argv(cfg: MemoryConfig, args: argparse.Namespace) -> list[str]:
     """Arguments for :func:`sqgraph.memory.mcp.main`, filled from the config."""
     argv = [
@@ -1110,6 +1168,24 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--past-days", type=float, default=0, help="also include the last N days")
     p.set_defaults(fn=cmd_upcoming)
 
+    p = sub.add_parser("export", parents=[common], help="write the group's memory as JSONL (portable, human-readable)")
+    p.add_argument("file", metavar="FILE", help="output file; '-' writes the JSONL to stdout")
+    p.add_argument("--with-embeddings", action="store_true", help="include the vectors (reused on import with the same model)")
+    p.add_argument("--force", action="store_true", help="overwrite FILE")
+    p.set_defaults(fn=cmd_export)
+
+    p = sub.add_parser("import", parents=[common], help="load a JSONL export (records already present are skipped)")
+    p.add_argument("file", metavar="FILE", help="an export file; '-' reads stdin")
+    p.add_argument("--into-group", metavar="G", help="target group (default: the configured group)")
+    p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--progress", action="store_true", help="print JSON progress lines on stderr")
+    p.set_defaults(fn=cmd_import)
+
+    p = sub.add_parser("backup", parents=[common], help="consistent snapshot of the database file (default: <home>/backups, rotated)")
+    p.add_argument("dest", metavar="DEST", nargs="?", help="target file (default: <home>/backups/memory-YYYYmmdd-HHMMSS.db)")
+    p.add_argument("--keep", type=int, default=10, help="snapshots kept in the default directory (default 10)")
+    p.set_defaults(fn=cmd_backup)
+
     p = sub.add_parser("purge", parents=[common], help="delete ALL memories of the configured group")
     p.add_argument("--yes", action="store_true", help="required to actually purge")
     p.add_argument("--dry-run", action="store_true")
@@ -1143,7 +1219,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         args = build_parser().parse_args(list(argv) if argv is not None else None)
         cfg = MemoryConfig.load()
         result = args.fn(args, cfg)
-        if getattr(args, "raw", False):
+        if getattr(args, "raw", False) or result is None:  # the command wrote its own output (mcp, export -)
             return 0
         emit(result, compact=getattr(args, "compact", False))
         if args.fn is cmd_doctor and not result["ok"]:
