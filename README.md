@@ -198,7 +198,7 @@ MATCH ()-[r:FACT {id: $id}]->() RETURN r.fact                        // edges �
 | `MERGE` | 単一パス。名前付きパス・可変長は不可。無向 `MERGE` は既存を両方向で照合し、無ければ左→右で作成 |
 | `CREATE` / `MERGE` のプロパティ式 | 同じ句で作成される変数は参照できません (`CREATE (a {x:1}), (b {y: a.x})` はエラー) |
 | プロパティ値 | プリミティブまたはそのリストのみ (Neo4j と同じ)。`SET n.p = {map}` はエラー |
-| `UNION` | 読み取りのみ。書き込み句を含む枝は不可 |
+| `UNION` | 読み取りのみ。書き込み句を含む枝は不可。同じ列の型は枝ごとに違ってよい (ノード / リレーションシップ / パスと他の値の混在だけは不可) |
 | ラベル / 埋め込み | `labels(n)` はアルファベット順 (Neo4j は作成順)。索引対象の埋め込みプロパティは props に無いので `RETURN n.embedding` (リレーションシップ索引なら `RETURN r.embedding`) は `null` |
 | 型チェック | 型をまたぐ `=` は false、`<` などの順序比較は `null` (Neo4j と同じ。真偽値は整数と別物)。プロパティ由来の動的型の値は `json_type()` で判定します |
 | 整数の 0 除算 | 整数同士の `/` `%` はエラー、浮動小数の 0 除算は `null` (Neo4j は Infinity/NaN) |
@@ -374,8 +374,15 @@ python -m sqgraph.memory.mcp --db memory.db [--group-id G] [--allowed-channels a
 | `add_memory` | 決定・担当・状態変化・予定・好みなど長期的に覚えるべきことの記録 (`--read-only` では無効)。`--extractor agent` (既定) では**何も保存せず**、`token` / `instructions` / `schema` / `context` を返す。`openai` ではサーバー側の LLM で抽出して保存する |
 | `commit_memory` | `agent` モードの 2 段階目。`add_memory` の `token` と、エージェントが作った `extraction` を渡して保存する (`openai` モードでも使える。`--read-only` では無効) |
 | `forget_memory` | エピソード / ファクト / エンティティ / 期間を指定した削除 (`dry_run` で影響範囲の確認)。例: `forget_memory(episode_id="ep_...", dry_run=True)`。セレクタはちょうど 1 つ: `episode_id` (別名 `episode`) / `fact_id` (別名 `fact`) / `entity` (別名 `entity_id`, `name`) / `source_ref` (+ `source`) / `since`・`until`・`channel`。書き込み可能で `--allowed-channels` なしのときだけ登録される |
+| `merge_entities` | 同じものを指す 2 つのエンティティを 1 つにまとめる (`keep` に `merge` を統合。名前・エイリアス・要約・ファクト・言及が移り、完全に同じファクトは 1 つにまとまる。履歴は消えない。`dry_run` あり) |
+| `invalidate_fact` | もう成り立たないファクトを手で失効させる (`at` 既定は現在、`reason` を記録。始まる前の予定は取り消しになる。削除ではない) |
+| `rename_relation` | 関係名をまとめて付け替える (`swap=true` で主語と目的語も入れ替え。`fact_ids` で一部だけ。`dry_run` あり) |
+| `review_memory` | 整理の候補 (重複していそうなエンティティの組と理由、関係名の一覧と統一の提案、日付を過ぎた未確認の予定) を返す。変更はしない |
+| `get_upcoming` | これから `days` 日以内 (と過去 `past_days` 日) に始まる / 終わるファクト (予定・不在・締切) |
 | `get_schema` | ラベル / 関係タイプ / インデックス / 件数と Cypher サブセットの説明 |
 | `read_cypher` | 読み取り専用 Cypher (行数 / 文字数 / 時間の制限つき)。上記で足りない集計・結合用 |
+
+`merge_entities` / `invalidate_fact` / `rename_relation` は書き込み可能で `--allowed-channels` なしのときだけ、`review_memory` (全チャンネルを見る) は `--allowed-channels` なしのときだけ登録されます。`get_upcoming` はチャンネル制限に従います。
 
 `--extractor` (既定 `agent`) は、`add_memory` のエンティティ・ファクト抽出を誰が行うかです。`agent` ではサーバーに LLM も OpenAI キーも要らず、呼び出したエージェント自身が `instructions` に従って `extraction` を作り `commit_memory` を呼びます (「エージェント抽出」参照。MCP の sampling には依存しません)。`openai` は従来どおり `add_memory` 1 回で OpenAI の LLM が抽出します (bot 向け。`OPENAI_API_KEY` が必要で、無いと `add_memory` はエラーになります)。
 
@@ -429,12 +436,21 @@ sqgraph-memory doctor [--online]    # 環境・DB・登録状況の診断 (失�
 
 | エージェント | MCP の登録先 | Skill |
 |---|---|---|
-| Claude Code | `claude mcp add --scope user sqgraph-memory -- <実行ファイル> mcp` (`claude` が PATH にないときは実行すべきコマンドを表示) | `~/.claude/skills/sqgraph-memory/SKILL.md` |
+| Claude Code | `claude mcp add --scope user sqgraph-memory -- <実行ファイル> mcp` (`claude` が PATH にないときは実行すべきコマンドを表示)。フックは `~/.claude/settings.json` (下記) | `~/.claude/skills/sqgraph-memory/SKILL.md` |
 | Codex CLI | `~/.codex/config.toml` の `[mcp_servers.sqgraph-memory]` (`command` / `args`) | `~/.agents/skills/sqgraph-memory/SKILL.md` |
 | Cursor | `~/.cursor/mcp.json` の `mcpServers` | `~/.cursor/skills/sqgraph-memory/SKILL.md` |
 | Claude Desktop | `claude_desktop_config.json` の `mcpServers` (Windows `%APPDATA%\Claude`、macOS `~/Library/Application Support/Claude`、Linux `~/.config/Claude`) | なし |
 
 `--agents claude-code,codex,cursor,claude-desktop|all` で対象を指定し (既定は検出できたもの)、`--command "uvx --from 'sqgraph[mcp]' sqgraph-memory mcp"` で起動コマンドを丸ごと差し替え、`--no-skill` で Skill を入れません。登録後はエージェントを再起動してください。Skill (`SKILL.md`) は、いつ検索し、いつ覚えさせ、いつ忘れるか (明示的に頼まれたときだけ、`dry_run` で確認してから) をエージェントに教えます。
+
+**Claude Code のフック** (`setup` が `~/.claude/settings.json` に登録。`--hooks session-start,user-prompt` で選択、`--no-hooks` で触らない、`--uninstall` で削除。自分以外のフックはそのまま残します): エージェントが検索しようと思わなくても、関係のある記憶が会話に入ります。
+
+| フック | Claude Code のイベント | 入れるもの |
+|---|---|---|
+| `sqgraph-memory hook session-start` | `SessionStart` (起動 / 再開 / `/clear` / コンパクション後) | ユーザー自身についての今有効なファクト (好み・指示)、作業ディレクトリ (git リポジトリ名・フォルダ名) に関係するファクト、7 日以内に始まる / 終わる予定 |
+| `sqgraph-memory hook user-prompt` | `UserPromptSubmit` | プロンプトで検索して関連性ゲートを通ったファクト (同じセッションでは同じファクトを 2 回出さない)。「覚えて」「remember this」があれば保存を促す一文 |
+
+フックは失敗してもユーザーの操作を止めません (エラーは `~/.sqgraph-memory/hooks.log`)。埋め込みの呼び出しは 3 秒で打ち切り、埋め込みサーバーが落ちていればキーワードとエンティティ名だけで検索します。1 回あたり約 1 秒 (Windows、ローカル DB、LAN の埋め込みサーバー) です。セッションごとの表示済みファクトは `~/.sqgraph-memory/hook-state/` に置き、7 日で消します。
 
 **CLI** (出力は常に UTF-8 の JSON、エラーは stderr に `{"error": ...}` で非ゼロ終了。`--compact` で 1 行):
 
@@ -447,6 +463,14 @@ sqgraph-memory doctor [--online]    # 環境・DB・登録状況の診断 (失�
 | `entity NAME` / `entities QUERY` / `episodes [--entity E] [--query Q]` / `stats` | プロファイルと履歴 / 名前解決 / 元のメモ / 件数 |
 | `forget (--episode ID \| --source-ref REF [--source S] \| --fact ID \| --entity NAME [--keep-episodes] \| --since/--until/--channel [--source S]) [--dry-run]` | 削除 (対象の種類はちょうど 1 つ。`--episode-id` / `--fact-id` / `--entity-id` は別名) |
 | `purge --yes [--dry-run]` | 設定中の group の全記憶を削除 |
+| `merge KEEP MERGE [--dry-run]` / `invalidate FACT_ID [--at T] [--reason R]` | エンティティの統合 / ファクトの手動失効 (どちらも履歴は残る) |
+| `relations` / `rename-relation OLD NEW [--swap] [--fact ID] [--dry-run]` | 関係名の一覧 (件数・例文) / 付け替え |
+| `review [--limit N]` | 整理の候補 (MCP の `review_memory` と同じ) |
+| `upcoming [--days 7] [--past-days 0]` | これから始まる / 終わるファクト |
+| `export FILE\|- [--with-embeddings] [--force]` / `import FILE\|- [--into-group G] [--dry-run]` | JSONL への書き出し / 読み込み (下の「エクスポートとバックアップ」) |
+| `backup [DEST] [--keep 10]` | DB ファイルのスナップショット (既定 `~/.sqgraph-memory/backups/memory-YYYYmmdd-HHMMSS.db`、新しい 10 個を残す) |
+| `import-claude-memory [--limit 5] [--dry-run]` | Claude Code のファイル型メモリ (`~/.claude/projects/*/memory/*.md`) を 1 ファイル 1 エピソードとして取り込む。`agent` モードでは `--limit` 件ずつ `add` と同じ token / context を返すので、エージェントが `commit` し、0 件になるまで繰り返す (内容が同じファイルは 2 度取り込まない) |
+| `hook session-start\|user-prompt` | Claude Code のフック本体 (`setup` が登録。標準入力にイベントの JSON) |
 | `config [--extractor agent\|openai] [--embed-base-url URL\|openai] [--embed-model M] [--embed-dimensions N] [--llm-model M] [--group-id G] [--tz TZ] [--embed-api-key-env NAME] [--search-min-similarity X\|default] [--no-probe]` | 設定を表示 (秘密は出しません) / 変更。埋め込みの設定を変えるとエンドポイントを確認し、DB の埋め込みと合わないときは `reembed` を促します |
 | `reembed [--yes] [--batch-size N] [--progress]` | すべてのエンティティとファクトの埋め込みを、設定中の埋め込みモデルで作り直す (`--yes` なしは計画の表示だけ) |
 | `mcp [--transport stdio\|streamable-http] [--read-only] [--extractor agent\|openai]` | MCP サーバー (エージェントが起動する。設定ファイルの DB / group / extractor / モデル / 埋め込みエンドポイントを自動で渡す) |
@@ -503,6 +527,23 @@ sqgraph-memory doctor --online      # エンドポイントに 1 回問い合わ
 - **通信は平文の HTTP です**: メモの本文 (エンティティ名・ファクト文・検索クエリ) がそのままそのサーバーに送られます。信頼できる LAN の中だけで使い、インターネットには公開しないでください (リバースプロキシで TLS を付けるなら `https://` の URL も指定できます)。サーバー側のログにメモが残る可能性にも注意してください。
 - サーバーが落ちている間も `search` は数秒 (接続 5 秒 / 全体 30 秒、リトライ 1 回) でベクトルなしの検索 (全文 + エンティティ) に切り替わります。`add` / `commit` / `reembed` はエラーになります。`add` のバッチは 32 件ずつ送ります。
 
+### 記憶の整理 (履歴は消さない)
+
+抽出をエージェントや LLM に任せると、同じものが別名で 2 つ登録されたり、同じ意味の関係が別の名前で増えたりします。`forget` は削除なので、直すための操作を別に用意しています。
+
+- **関係名の語彙**: 関係名は `UPPER_SNAKE_CASE` に正規化し、能動形がはっきりしている受動形 (`OWNED_BY`、`MANAGED_BY`、`USED_BY`、`REVIEWED_BY` など) は主語と目的語を入れ替えて能動形 (`OWNS` ...) で保存します。抽出するエージェント / LLM には、その DB で使われている関係名を多い順に `known_relations` として渡し、合うものがあれば再利用させます。
+- **`merge_entities(keep, merge)`**: `merge` の名前とエイリアスは `keep` のエイリアスになり、チャンネルごとの要約・ファクト・言及が移ります。統合後に完全に同じになるファクト (主語・目的語・関係・文・有効かどうかが同じ) は 1 つにまとめ、出典を合わせ、`superseded_by` / `supersedes` の参照も付け替えます。2 つの間のファクト (「k8s は Kubernetes の略」) は `keep` の属性ファクトになります (`warnings` に出ます)。
+- **`invalidate_fact(fact_id, at=None, reason=None)`**: `invalid_at` を入れて閉じます (`ended_by: "manual"`、`invalid_reason`)。まだ始まっていない予定を閉じると、始まる時刻で閉じる (= 取り消し) ので有効になることはありません。代わりの新しいファクトがあるときは、`add_memory` の `contradicts` を使えば同じことが起きます。
+- **`rename_relation(old, new, swap=False, fact_ids=None)`**: 同義の関係名をまとめます (`HAS_REQUIREMENT` → `REQUIRES` など)。
+- **`review()`**: 重複候補のエンティティの組 (エイリアスの共有 / 一方の名前が他方を含む / 埋め込みがとても近い。理由つき)、関係名の一覧と統一の提案 (受動形、綴りの揺れ、1 回しか使われていない名前)、開始から 14 日過ぎても `planned` / `tentative` のままのファクトを返します。何を直すかは人 (とエージェント) が決めます。
+- **`upcoming(days=7)`**: これから始まる / 終わるファクト。「終わる」は明示された終わり (9/14-9/16 の不在など) だけで、新しいファクトに置き換えられた終わりや手動失効は含みません。
+
+### エクスポートとバックアップ
+
+- **`export FILE`**: 1 行 1 JSON の JSONL (`kind` が `header` / `entity` / `episode` / `mention` / `fact`)。時刻は保存している UTC のまま、`alias_keys` などの派生フィールドは書き出さず、読み込み時に作り直します。`--with-embeddings` でベクトルも書き出せます。人が読める形なので、DB の形式に依存しないバックアップにもなります。
+- **`import FILE [--into-group G]`**: 既にある ID (と、同じ `source` / `source_ref` のエピソード) は飛ばすので、何度読み込んでも同じです。書き出したときと同じ埋め込みモデルならベクトルを再利用し、違えば今の埋め込みで計算し直します (全件の埋め込みが成功してから 1 トランザクションで書き込み)。別のマシンへの移行や、DB を作り直すときに使います。
+- **`backup [DEST]`**: SQLite のオンラインバックアップで、書き込み中でも整合した 1 ファイル (WAL なし) を作り、`quick_check` で確認します。既定では `~/.sqgraph-memory/backups/` に作り、新しいものから `--keep` 個 (既定 10) を残します。定期的に取るなら OS のスケジューラから `sqgraph-memory backup` を呼んでください。
+
 ### Discord bot への組み込み (概要)
 
 `on_message` で `queue.put((message.content, channel.name, author.display_name, message.created_at, message.id))` し、ワーカーが `mem.add_episode(..., source="discord", source_ref=str(message.id))` を 1 件ずつ呼びます (メッセージ ID を `source_ref` にすれば再投入しても重複しません)。`/ask` スラッシュコマンドでは、質問者が閲覧できるチャンネルを Discord の権限 (`channel.permissions_for(member).view_channel`) で判定し、その一覧を `channels=` に渡して `mem.answer(question, group_id=str(guild.id), channels=allowed)` を呼びます。
@@ -526,7 +567,7 @@ sqgraph-memory doctor --online      # エンドポイントに 1 回問い合わ
 
 - 取り込みは 1 件ずつ直列です (LLM 呼び出し数回分の待ち時間)。大量の過去ログは `add_episodes_bulk` を夜間に流す想定です。
 - エンティティの完全一致 / 名前検索は `group_id` 内のエンティティを走査するため、数万エンティティを超える規模では索引化が必要です。
-- 抽出品質は LLM 依存です (誤った同一視 / 見落とし)。`get_entity` のタイムラインと出典 (`source_ref`) で確認できます。エンティティの手動マージやファクトの手動失効の API はまだありません。
+- 抽出品質は LLM 依存です (誤った同一視 / 見落とし)。`get_entity` のタイムラインと出典 (`source_ref`) で確認できます。誤りは `merge_entities` / `invalidate_fact` / `rename_relation` で直せます (「記憶の整理」)。
 - ファクトの全文検索は trigram なので 2 文字以下の語は索引にかかりません (エンティティ名は別経路で一致します)。
 
 ## クラウドへのデプロイ
