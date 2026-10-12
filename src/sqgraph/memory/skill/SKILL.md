@@ -54,12 +54,25 @@ How to write it:
 ```
 
 - `"author"` is the user (already exists); never list it. One self-contained sentence per fact, in the user's language.
+- `relation`: reuse a name from `context.known_relations` when one fits (the memory's vocabulary); active direction
+  (`OWNS`, not `OWNED_BY`).
 - Same thing as a `candidate_entities` entry (alias, other spelling)? Set `existing_id` to its id instead of creating a duplicate.
 - A `related_facts` entry that is no longer true because of this note (new owner, changed preference, cancelled plan)?
   Put its id in `contradicts`; it is closed, not deleted. One that this note merely restates: `duplicate_of`.
 - `valid_at` / `invalid_at`: ISO dates computed from the note's time ("来週から", "9/14-9/16"); null = the note's time.
 - Do not invent facts that are not in the content. Nothing worth keeping is fine: `{}` stores just the note.
 - If `commit_memory` reports problems with the JSON, fix them and call it again with the same token.
+
+## Correcting and tidying (keeps history)
+
+- Something stopped being true and nothing replaces it ("pnpm はもう使ってない", a plan was dropped):
+  `invalidate_fact(fact_id, reason=...)`. When a new fact replaces it, add the new one with `contradicts` instead.
+- The same thing is stored twice under different names (`search_entities` / `get_entity` show both):
+  `merge_entities(keep, merge, dry_run=True)`, show the user, then run it without `dry_run`.
+- When the user asks to tidy / review the memory ("記憶を整理して"): `review_memory()` lists duplicate candidates,
+  relation names to unify and plans whose date passed. Propose the changes, apply only the ones the user agrees to
+  (`merge_entities`, `rename_relation(old, new, swap?)`, `invalidate_fact`).
+- "What's coming up?" / at the start of planning: `get_upcoming(days=7)` lists facts that start or end soon.
 
 ## When to forget
 
@@ -92,6 +105,9 @@ sqgraph-memory add --source <agent-name> "ユーザーは Python のパッケー
 sqgraph-memory commit --token <token> < extraction.json      # or pipe {"token": ..., "extraction": {...}} on stdin
 sqgraph-memory forget --fact-id <id> --dry-run     # also: --episode-id ID, --entity NAME, --since/--until
 sqgraph-memory forget --fact-id <id>              # after the user confirmed
+sqgraph-memory invalidate <fact-id> --reason "..."  # no longer true (kept as history)
+sqgraph-memory review                              # then: merge KEEP MERGE / rename-relation OLD NEW [--swap]
+sqgraph-memory upcoming --days 7
 ```
 
 If neither works, run `sqgraph-memory doctor` and tell the user what it reports.

@@ -262,3 +262,59 @@ def test_upcoming_lists_starts_and_stated_ends_soonest_first():
     assert [i["event"] for i in mem.upcoming(30)][-1] == "starts" and len(mem.upcoming(30)) == 3
     assert [i["at"][:10] for i in mem.upcoming(1, past_days=10)] == ["2026-07-01", "2026-07-02"]
     assert mem.upcoming(7, channels=["other"]) == []
+
+
+# --------------------------------------------------------------------------- CLI
+
+
+@pytest.fixture
+def cli_home(tmp_path, monkeypatch):
+    import sqgraph.memory.cli as cli_mod
+    from sqgraph.memory import FakeLLM
+
+    h = tmp_path / "mem-home"
+    monkeypatch.setenv("SQGRAPH_MEMORY_HOME", str(h))
+    monkeypatch.setenv("SQGRAPH_MEMORY_EXTRACTOR", "openai")
+    for k in ("OPENAI_API_KEY", "SQGRAPH_MEMORY_DB", "SQGRAPH_MEMORY_GROUP"):
+        monkeypatch.delenv(k, raising=False)
+
+    def make_providers(cfg, *, need_llm, need_embedder):
+        return (FakeLLM() if need_llm else None), (FakeEmbedder() if (need_llm or need_embedder) else None), []
+
+    monkeypatch.setattr(cli_mod, "make_providers", make_providers)
+    return h
+
+
+def run_cli(capsys, *argv):
+    import json
+
+    from sqgraph.memory import cli as cli_mod
+
+    capsys.readouterr()
+    code = cli_mod.main(list(argv))
+    cap = capsys.readouterr()
+    return code, (json.loads(cap.out) if cap.out.strip() else None), (json.loads(cap.err) if cap.err.strip() else None)
+
+
+def test_cli_curation_commands(capsys, cli_home):
+    assert run_cli(capsys, "add", "[[Rails|Service]] [[太郎|Person]] {{Rails|OWNED_BY|太郎|2026-07-01}}")[0] == 0
+    assert run_cli(capsys, "add", "[[RoR|Service]] [[花子|Person]] {{RoR|USED_BY|花子|2026-07-02}}")[0] == 0
+    code, out, _ = run_cli(capsys, "relations")
+    assert code == 0 and {r["relation"] for r in out["relations"]} == {"OWNS", "USES"}  # stored in the active direction
+    code, out, _ = run_cli(capsys, "merge", "Rails", "RoR", "--dry-run")
+    assert code == 0 and out["dry_run"] and out["merged"]["name"] == "RoR"
+    code, out, _ = run_cli(capsys, "merge", "Rails", "RoR")
+    assert code == 0 and out["aliases_added"] == ["RoR"]
+    code, _, err = run_cli(capsys, "merge", "Rails", "nothing")
+    assert code == 2 and "no entity" in err["error"]
+    code, out, _ = run_cli(capsys, "rename-relation", "USES", "DEPENDS_ON")
+    assert code == 0 and len(out["renamed"]) == 1
+    code, out, _ = run_cli(capsys, "review")
+    assert code == 0 and "duplicate_entities" in out and "next" in out
+    fid = run_cli(capsys, "search", "Rails")[1]["facts"][0]["id"]
+    code, out, _ = run_cli(capsys, "invalidate", fid, "--reason", "引き継ぎ済み")
+    assert code == 0 and out["fact"]["status"] == "ended"
+    code, _, err = run_cli(capsys, "invalidate", fid)
+    assert code == 2 and "already ended" in err["error"]
+    code, out, _ = run_cli(capsys, "upcoming", "--days", "3")
+    assert code == 0 and out["count"] == 0

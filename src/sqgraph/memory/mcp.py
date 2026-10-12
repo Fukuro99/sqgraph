@@ -284,6 +284,57 @@ class MemoryTools:
             )
         return {"group_id": group, **res.to_dict()}
 
+    # -- curation (writes across channels: only without a channel restriction) ------------------
+
+    def _curation_allowed(self, tool: str, write: bool = True) -> None:
+        if write and self.read_only:
+            raise PermissionError(f"this server is read-only ({tool} is disabled)")
+        if self.allowed is not None:
+            raise PermissionError(f"{tool} is not available with a channel restriction (--allowed-channels)")
+
+    def merge_entities(self, keep: str, merge: str, dry_run: bool = False, group_id: str | None = None) -> dict[str, Any]:
+        self._curation_allowed("merge_entities")
+        group = self._group(group_id)
+        return {"group_id": group, **self.memory.merge_entities(keep, merge, group_id=group, dry_run=dry_run)}
+
+    def invalidate_fact(
+        self, fact_id: str, at: str | None = None, reason: str | None = None, group_id: str | None = None
+    ) -> dict[str, Any]:
+        self._curation_allowed("invalidate_fact")
+        group = self._group(group_id)
+        hit = self.memory.invalidate_fact(fact_id, at=at or None, reason=reason, group_id=group)
+        return {"group_id": group, "fact": hit.to_dict()}
+
+    def rename_relation(
+        self,
+        old: str,
+        new: str,
+        swap: bool = False,
+        fact_ids: list[str] | None = None,
+        dry_run: bool = False,
+        group_id: str | None = None,
+    ) -> dict[str, Any]:
+        self._curation_allowed("rename_relation")
+        group = self._group(group_id)
+        res = self.memory.rename_relation(old, new, swap=swap, fact_ids=fact_ids or None, group_id=group, dry_run=dry_run)
+        return {"group_id": group, **res}
+
+    def review_memory(self, limit: int = 20, group_id: str | None = None) -> dict[str, Any]:
+        self._curation_allowed("review_memory", write=False)
+        return self.memory.review(self._group(group_id), limit=max(1, min(limit, 100)))
+
+    def get_upcoming(
+        self, days: float = 7, past_days: float = 0, channels: list[str] | None = None, group_id: str | None = None
+    ) -> dict[str, Any]:
+        group = self._group(group_id)
+        items = self.memory.upcoming(
+            max(0.0, min(float(days), 366.0)),
+            group_id=group,
+            channels=self._channels(channels),
+            past_days=max(0.0, min(float(past_days), 366.0)),
+        )
+        return {"group_id": group, "count": len(items), "events": items}
+
     def search_memory(
         self,
         query: str,
@@ -453,7 +504,9 @@ INSTRUCTIONS = (
     "from the returned `context` following `instructions` / `schema`, then call commit_memory(token, extraction). "
     "Facts have validity intervals (valid_at / invalid_at); superseded facts stay available as history. "
     "forget_memory (when present) deletes memory permanently: use it only when the user explicitly asks to forget "
-    "something, and preview with dry_run=true."
+    "something, and preview with dry_run=true. get_upcoming lists what starts or ends soon (plans, absences). "
+    "To keep the memory clean (when the user asks, or when you notice duplicates / outdated facts): review_memory, then "
+    "merge_entities / rename_relation / invalidate_fact after confirming with the user; these keep history."
 )
 
 TOOL_DOCS = {
@@ -495,6 +548,36 @@ TOOL_DOCS = {
         "again; entities left without any mention are removed. Use dry_run=true first to preview what would be "
         "deleted (ids returned), and confirm with the user. Returns the ids deleted / restored / updated. Not "
         "available on read-only servers or with --allowed-channels (forgetting across channel ACLs is unsupported)."
+    ),
+    "merge_entities": (
+        "Merge two entities that are the same real-world thing (e.g. 'Rails' and 'Ruby on Rails', or a person stored under two "
+        "names): `merge` is folded into `keep` (id or exact name/alias each). keep gets merge's name and aliases as aliases; "
+        "all facts and mentions move; exact duplicate facts are combined. History is kept (nothing is forgotten). Preview "
+        "with dry_run=true and confirm with the user first. Not available on read-only servers or with --allowed-channels."
+    ),
+    "invalidate_fact": (
+        "Mark a fact as no longer true (it ends at `at`, default now; a plan that has not started yet is cancelled). Use it "
+        "when the user says something stopped being true or a plan was dropped and there is no new fact replacing it (when "
+        "there is one, add_memory with `contradicts` does this). The fact stays in the history with `reason`. Get fact ids "
+        "from search_memory / get_entity. Not available on read-only servers or with --allowed-channels."
+    ),
+    "rename_relation": (
+        "Rename a relation (the fact's verb, e.g. HAS_REQUIREMENT -> REQUIRES) on all its facts, or only on `fact_ids`; "
+        "swap=true also turns the facts around (subject <-> object, e.g. OWNED_BY -> OWNS). Use it to unify synonyms found by "
+        "review_memory, after confirming with the user; preview with dry_run=true. Not available on read-only servers or with "
+        "--allowed-channels."
+    ),
+    "review_memory": (
+        "Housekeeping report (read-only): entity pairs that may be duplicates (with reasons), the relation vocabulary with "
+        "counts and examples, suggested relation renames (passive forms, spelling variants, names used once) and planned "
+        "facts whose date passed without confirmation. Use it when the user asks to tidy / review the memory; propose the "
+        "changes, and apply the ones the user agrees to with merge_entities / rename_relation / invalidate_fact. Not "
+        "available with --allowed-channels."
+    ),
+    "get_upcoming": (
+        "List facts that start or end within the next `days` (default 7): plans, schedules, absences, deadlines, with "
+        "`past_days` to include ones that just happened. Use it for 'what is coming up?', at the start of a working session, "
+        "or before planning. Each event says starts/ends and when."
     ),
     "search_memory": (
         "Search long-term memory for facts (hybrid semantic + keyword + graph search). Use it FIRST for questions about "
@@ -639,6 +722,44 @@ def build_server(tools: MemoryTools, name: str = "sqgraph-memory") -> Any:
                 source_ref=source_ref,
                 source=source,
             )
+
+    if not tools.read_only and tools.allowed is None:
+
+        @server.tool(name="merge_entities", description=TOOL_DOCS["merge_entities"])
+        async def merge_entities(keep: str, merge: str, dry_run: bool = False, group_id: str | None = None) -> dict[str, Any]:
+            return await wrap(tools.merge_entities)(keep=keep, merge=merge, dry_run=dry_run, group_id=group_id)
+
+        @server.tool(name="invalidate_fact", description=TOOL_DOCS["invalidate_fact"])
+        async def invalidate_fact(
+            fact_id: str,
+            at: Annotated[str | None, Field(description="when it stopped being true (ISO 8601); default now")] = None,
+            reason: str | None = None,
+            group_id: str | None = None,
+        ) -> dict[str, Any]:
+            return await wrap(tools.invalidate_fact)(fact_id=fact_id, at=at, reason=reason, group_id=group_id)
+
+        @server.tool(name="rename_relation", description=TOOL_DOCS["rename_relation"])
+        async def rename_relation(
+            old: str,
+            new: str,
+            swap: bool = False,
+            fact_ids: Annotated[list[str] | None, Field(description="only these facts (default: every fact with `old`)")] = None,
+            dry_run: bool = False,
+            group_id: str | None = None,
+        ) -> dict[str, Any]:
+            return await wrap(tools.rename_relation)(old=old, new=new, swap=swap, fact_ids=fact_ids, dry_run=dry_run, group_id=group_id)
+
+    if tools.allowed is None:
+
+        @server.tool(name="review_memory", description=TOOL_DOCS["review_memory"])
+        async def review_memory(limit: int = 20, group_id: str | None = None) -> dict[str, Any]:
+            return await wrap(tools.review_memory)(limit=limit, group_id=group_id)
+
+    @server.tool(name="get_upcoming", description=TOOL_DOCS["get_upcoming"])
+    async def get_upcoming(
+        days: float = 7, past_days: float = 0, channels: list[str] | None = None, group_id: str | None = None
+    ) -> dict[str, Any]:
+        return await wrap(tools.get_upcoming)(days=days, past_days=past_days, channels=channels, group_id=group_id)
 
     @server.tool(name="search_memory", description=TOOL_DOCS["search_memory"])
     async def search_memory(

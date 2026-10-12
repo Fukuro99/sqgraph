@@ -13,6 +13,8 @@ All output is JSON on stdout (UTF-8); errors are ``{"error": ...}`` on stderr wi
     sqgraph-memory forget (--episode ID | --source-ref REF | --fact ID | --entity NAME | --since/--until/--channel) [--dry-run]
                           (--episode-id / --fact-id are aliases of --episode / --fact)
     sqgraph-memory purge --yes [--dry-run]
+    sqgraph-memory merge KEEP MERGE [--dry-run] | invalidate FACT_ID [--at T] [--reason R]
+    sqgraph-memory relations | rename-relation OLD NEW [--swap] [--fact ID] [--dry-run] | review | upcoming [--days 7]
     sqgraph-memory mcp [--transport stdio|streamable-http] [--read-only] [--extractor agent|openai]
     sqgraph-memory setup [--agents ...] [--uninstall] | doctor [--online]
 
@@ -740,6 +742,53 @@ def cmd_purge(args: argparse.Namespace, cfg: MemoryConfig) -> dict[str, Any]:
     return res.to_dict()
 
 
+def cmd_merge(args: argparse.Namespace, cfg: MemoryConfig) -> dict[str, Any]:
+    with open_memory(cfg, need_embedder=True) as (mem, warnings):  # the kept entity gets a fresh embedding
+        try:
+            res = mem.merge_entities(args.keep, args.merge, group_id=cfg.group_id, dry_run=args.dry_run)
+        except ValueError as exc:
+            raise CliError(str(exc), 2) from exc
+    return _with_warning({"group_id": cfg.group_id, **res}, warnings)
+
+
+def cmd_invalidate(args: argparse.Namespace, cfg: MemoryConfig) -> dict[str, Any]:
+    with open_memory(cfg) as (mem, _):
+        try:
+            hit = mem.invalidate_fact(args.fact_id, at=args.at, reason=args.reason, group_id=cfg.group_id)
+        except ValueError as exc:
+            raise CliError(str(exc), 2) from exc
+    return {"group_id": cfg.group_id, "fact": hit.to_dict()}
+
+
+def cmd_relations(args: argparse.Namespace, cfg: MemoryConfig) -> dict[str, Any]:
+    with open_memory(cfg) as (mem, _):
+        rels = mem.relation_stats(cfg.group_id)
+    return {"group_id": cfg.group_id, "count": len(rels), "relations": rels}
+
+
+def cmd_rename_relation(args: argparse.Namespace, cfg: MemoryConfig) -> dict[str, Any]:
+    with open_memory(cfg) as (mem, _):
+        try:
+            res = mem.rename_relation(
+                args.old, args.new, swap=args.swap, fact_ids=args.fact or None, group_id=cfg.group_id, dry_run=args.dry_run
+            )
+        except ValueError as exc:
+            raise CliError(str(exc), 2) from exc
+    return {"group_id": cfg.group_id, **res}
+
+
+def cmd_review(args: argparse.Namespace, cfg: MemoryConfig) -> dict[str, Any]:
+    with open_memory(cfg, need_embedder=True) as (mem, warnings):
+        res = mem.review(cfg.group_id, limit=max(1, min(args.limit, 100)))
+    return _with_warning(res, warnings)
+
+
+def cmd_upcoming(args: argparse.Namespace, cfg: MemoryConfig) -> dict[str, Any]:
+    with open_memory(cfg) as (mem, _):
+        items = mem.upcoming(args.days, group_id=cfg.group_id, past_days=args.past_days)
+    return {"group_id": cfg.group_id, "days": args.days, "count": len(items), "events": items}
+
+
 def mcp_argv(cfg: MemoryConfig, args: argparse.Namespace) -> list[str]:
     """Arguments for :func:`sqgraph.memory.mcp.main`, filled from the config."""
     argv = [
@@ -1028,6 +1077,38 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--channel")
     p.add_argument("--dry-run", action="store_true", help="show what would be removed without deleting")
     p.set_defaults(fn=cmd_forget)
+
+    p = sub.add_parser("merge", parents=[common], help="merge entity MERGE into KEEP (the same real-world thing); history is kept")
+    p.add_argument("keep", metavar="KEEP", help="entity id or exact name / alias that remains")
+    p.add_argument("merge", metavar="MERGE", help="entity id or exact name / alias folded into KEEP")
+    p.add_argument("--dry-run", action="store_true")
+    p.set_defaults(fn=cmd_merge)
+
+    p = sub.add_parser("invalidate", parents=[common], help="mark a fact as no longer true (kept in the history)")
+    p.add_argument("fact_id", metavar="FACT_ID")
+    p.add_argument("--at", help="when it stopped being true (ISO 8601; default now)")
+    p.add_argument("--reason", help="why (stored with the fact)")
+    p.set_defaults(fn=cmd_invalidate)
+
+    p = sub.add_parser("relations", parents=[common], help="the relation vocabulary with counts and an example each")
+    p.set_defaults(fn=cmd_relations)
+
+    p = sub.add_parser("rename-relation", parents=[common], help="rename a relation on its facts (--swap also turns them around)")
+    p.add_argument("old", metavar="OLD")
+    p.add_argument("new", metavar="NEW")
+    p.add_argument("--swap", action="store_true", help="also swap subject and object")
+    p.add_argument("--fact", action="append", metavar="ID", help="only this fact (repeatable)")
+    p.add_argument("--dry-run", action="store_true")
+    p.set_defaults(fn=cmd_rename_relation)
+
+    p = sub.add_parser("review", parents=[common], help="housekeeping report: duplicate entities, relation suggestions, stale plans")
+    p.add_argument("--limit", type=int, default=20)
+    p.set_defaults(fn=cmd_review)
+
+    p = sub.add_parser("upcoming", parents=[common], help="facts starting or ending soon (plans, absences, deadlines)")
+    p.add_argument("--days", type=float, default=7)
+    p.add_argument("--past-days", type=float, default=0, help="also include the last N days")
+    p.set_defaults(fn=cmd_upcoming)
 
     p = sub.add_parser("purge", parents=[common], help="delete ALL memories of the configured group")
     p.add_argument("--yes", action="store_true", help="required to actually purge")

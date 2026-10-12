@@ -178,17 +178,20 @@ def test_server_registers_tools_according_to_policy(db_path):
     full = _tool_names(build_server(t))
     assert full == {
         "add_memory", "commit_memory", "forget_memory", "search_memory", "search_entities", "get_entity", "get_episodes", "get_schema", "read_cypher",
+        "merge_entities", "invalidate_fact", "rename_relation", "review_memory", "get_upcoming",
     }
     mem.close()
 
     t2, mem2 = tools_for(db_path, group_id=G, allowed_channels=["pub"])
     names2 = _tool_names(build_server(t2))
     assert "read_cypher" not in names2 and "forget_memory" not in names2 and "add_memory" in names2 and "commit_memory" in names2  # no forgetting under channel ACLs
+    assert not {"merge_entities", "invalidate_fact", "rename_relation", "review_memory"} & names2 and "get_upcoming" in names2
     mem2.close()
 
     t3, mem3 = tools_for(db_path, group_id=G, read_only=True, db_read_only=True)
     names = _tool_names(build_server(t3))
     assert "add_memory" not in names and "commit_memory" not in names and "forget_memory" not in names and "search_memory" in names
+    assert not {"merge_entities", "invalidate_fact", "rename_relation"} & names and {"review_memory", "get_upcoming"} <= names
     mem3.close()
 
 
@@ -353,3 +356,28 @@ def test_server_add_memory_passes_source(db_path):
     asyncio.run(go())
     assert mem.db.query("MATCH (e:Episode {author:'ivy'}) RETURN e.source AS s, e.channel AS c") == [{"s": "codex", "c": "personal"}]
     mem.close()
+
+
+def test_curation_tools(db_path):
+    t, mem = tools_for(db_path, group_id=G)
+    rep = t.review_memory()
+    assert rep["group_id"] == G and {r["relation"] for r in rep["relations"]} >= {"OWNER"}
+    res = t.rename_relation("OWNER", "OWNED_BY", dry_run=True)
+    assert res["to"] == "OWNS" and len(res["swapped"]) == 2 and res["dry_run"]
+    fid = t.search_memory("Rails OWNER")["facts"][0]["id"]
+    out = t.invalidate_fact(fid, reason="handed over")
+    assert out["fact"]["status"] == "ended"
+    plan = t.merge_entities("alice", "bob", dry_run=True)
+    assert plan["kept"]["name"] == "alice" and plan["dry_run"]
+    assert t.get_upcoming(days=30)["group_id"] == G
+    mem.close()
+
+    t2, mem2 = tools_for(db_path, group_id=G, allowed_channels=["pub"])
+    for call in (lambda: t2.review_memory(), lambda: t2.merge_entities("alice", "bob"), lambda: t2.invalidate_fact(fid)):
+        with pytest.raises(PermissionError):
+            call()
+    mem2.close()
+    t3, mem3 = tools_for(db_path, group_id=G, read_only=True, db_read_only=True)
+    with pytest.raises(PermissionError, match="read-only"):
+        t3.rename_relation("OWNER", "OWNS")
+    mem3.close()
