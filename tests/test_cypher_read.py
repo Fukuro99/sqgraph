@@ -835,6 +835,26 @@ def test_union_and_union_all(db, social):
         q(db, "RETURN 1 AS x UNION RETURN 1 AS y")
 
 
+def test_union_columns_with_different_types_per_branch(db, social):
+    # property access (JSON) in one branch, a computed string in the other
+    rows = q(
+        db,
+        "MATCH (n:Company) RETURN n.name AS name, count(*) AS c "
+        "UNION ALL MATCH (m:Person {name:'Alice'}) RETURN 'p:' + m.name AS name, null AS c",
+    )
+    assert sorted(col(rows, "name")) == ["Acme", "Globex", "p:Alice"]
+    rows = q(db, "RETURN true AS x UNION ALL RETURN 'a' AS x UNION ALL RETURN [1, 2] AS x UNION ALL RETURN 1.5 AS x")
+    assert col(rows, "x") == [True, "a", [1, 2], 1.5]
+    rows = q(db, "RETURN 1 AS x UNION ALL RETURN 'a' AS x UNION ALL RETURN null AS x")
+    assert col(rows, "x") == [1, "a", None]
+    rows = q(db, "RETURN null AS x UNION ALL RETURN [true] AS x")
+    assert col(rows, "x") == [None, [True]]
+    rows = q(db, "RETURN 'a' AS x UNION RETURN 'a' AS x UNION RETURN ['a'] AS x")
+    assert col(rows, "x") == ["a", ["a"]]
+    with pytest.raises(CypherUnsupportedError):
+        q(db, "MATCH (n:Company) RETURN n AS x UNION ALL RETURN 1 AS x")
+
+
 # ------------------------------------------------------------------ errors
 
 

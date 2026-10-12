@@ -21,6 +21,7 @@ from .exprs import (
     elem_type,
     free_vars,
     implicit_grouping_violation,
+    json_text,
     native,
     split_conjuncts,
 )
@@ -28,20 +29,40 @@ from .sqltypes import (
     ANY,
     FLOAT,
     INT,
+    JSON_KINDS,
     NODE,
     PATH,
     RAWPATH,
     REL,
+    SCALAR,
     STR,
     Ex,
     Frame,
     T,
     Var,
+    contains_entity,
     list_of,
 )
 
 HIDDEN = "$"
 ORD = HIDDEN + "ord"  # implicit ordinal of a procedure's rows (its natural, best-first order)
+
+_NATIVE_SCALARS = ("int", "float", "str", "scalar")
+
+
+def _unify_union(a: T, b: T) -> T | None:
+    """Common type of one UNION column across two branches (None: not representable)."""
+    if a == b:
+        return a
+    if a.kind == "null":
+        return b
+    if b.kind == "null":
+        return a
+    if contains_entity(a) or contains_entity(b):
+        return None
+    if a.kind in _NATIVE_SCALARS and b.kind in _NATIVE_SCALARS:
+        return SCALAR  # native SQLite values either way: no re-encoding needed
+    return ANY
 
 
 @dataclass
@@ -188,7 +209,7 @@ class Compiler(ExprCompiler):
         return Segment(self.assemble(sql), dict(self.binds), columns, False, self.reads_graph)
 
     def compile_union(self, queries: list[list[A.Clause]], union_all: bool) -> Segment:
-        selects: list[str] = []
+        branches: list[tuple[str, list[tuple[str, T]]]] = []
         columns: list[tuple[str, T]] = []
         for i, clauses in enumerate(queries):
             self.begin(None, False)
@@ -213,7 +234,29 @@ class Compiler(ExprCompiler):
                 columns = cols
             elif [n for n, _ in cols] != [n for n, _ in columns]:
                 raise self.err("All sub queries in an UNION must have the same return column names", clauses[-1])
-            selects.append(f"SELECT * FROM ({final_sql})")
+            branches.append((final_sql, cols))
+        # one column type for all branches; a branch whose representation differs is re-encoded
+        types = [t for _, t in branches[0][1]]
+        for _, cols in branches[1:]:
+            for j, (name, t) in enumerate(cols):
+                u = _unify_union(types[j], t)
+                if u is None:
+                    raise self.unsupported(
+                        f"UNION column `{name}` mixes nodes/relationships/paths with other types", queries[-1][-1]
+                    )
+                types[j] = u
+        columns = [(n, t) for (n, _), t in zip(columns, types)]
+        selects: list[str] = []
+        for final_sql, cols in branches:
+            conv = [
+                f"{json_text(Ex(f'a{j}', t))} AS a{j}" if types[j].kind == "any" and t.kind not in JSON_KINDS
+                else f"a{j}"
+                for j, (_, t) in enumerate(cols)
+            ]
+            if all(c == f"a{j}" for j, c in enumerate(conv)):
+                selects.append(f"SELECT * FROM ({final_sql})")
+            else:
+                selects.append(f"SELECT {', '.join(conv)} FROM ({final_sql})")
         op = " UNION ALL " if union_all else " UNION "
         return Segment(self.assemble(op.join(selects)), dict(self.binds), columns, True, self.reads_graph)
 
