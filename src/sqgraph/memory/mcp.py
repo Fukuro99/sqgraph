@@ -866,6 +866,9 @@ def _existing_dims(path: str) -> int | None:
 
 def main(argv: list[str] | None = None) -> None:
     ap = argparse.ArgumentParser(prog="python -m sqgraph.memory.mcp", description=__doc__.split("\n\n")[0])
+    from .. import __version__
+
+    ap.add_argument("--version", action="version", version=f"sqgraph {__version__}")
     ap.add_argument("--db", required=True, help="path of the memory database (created when writable)")
     ap.add_argument("--group-id", help="fix the namespace (tool calls cannot use another group)")
     ap.add_argument("--allowed-channels", help="comma-separated channels readable/writable through this server")

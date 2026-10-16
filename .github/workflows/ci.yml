@@ -1,0 +1,157 @@
+name: CI
+
+on:
+  push:
+    branches: [master, main, "feature/**"]
+  pull_request:
+
+# a newer push to the same branch / PR cancels the run it supersedes
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash # the same shell (Git Bash on Windows) for every step on every OS
+
+env:
+  # Always use uv-managed (python-build-standalone) interpreters: their sqlite3 supports enable_load_extension,
+  # which sqlite-vec needs and which the macOS system / framework Pythons may lack.
+  UV_PYTHON_PREFERENCE: only-managed
+
+jobs:
+  test:
+    name: test (${{ matrix.os }}, py${{ matrix.python }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        python: ["3.10", "3.13"]
+        include:
+          - { os: ubuntu-latest, python: "3.11" }
+          - { os: ubuntu-latest, python: "3.12" }
+    steps:
+      - uses: actions/checkout@v7
+
+      # NOTE: astral-sh/setup-uv publishes no floating major tag (immutable releases): pin an exact version.
+      - uses: astral-sh/setup-uv@v10.3.0
+        with:
+          python-version: ${{ matrix.python }}
+          activate-environment: true # creates ./.venv and puts it first on PATH for the following steps
+
+      - name: Show interpreter and SQLite
+        run: >
+          python -c "import sqlite3, sys;
+          print(sys.version);
+          print('sqlite', sqlite3.sqlite_version);
+          sqlite3.connect(':memory:').enable_load_extension(True)"
+
+      - name: Install
+        run: uv pip install -e ".[dev,mcp]"
+
+      - name: Test
+        run: python -m pytest -q -ra
+
+  lowest-direct:
+    # Installs the lowest version of every direct dependency allowed by pyproject.toml (including the
+    # extras), so the lower bounds declared there are actually exercised.
+    name: lowest-direct (ubuntu-latest, py3.10)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: astral-sh/setup-uv@v10.3.0
+        with:
+          python-version: "3.10"
+          activate-environment: true
+
+      - name: Install lowest direct dependencies
+        run: uv pip install --resolution lowest-direct -e ".[dev,mcp]"
+
+      - name: Show resolved versions
+        run: uv pip list
+
+      - name: Test
+        run: python -m pytest -q -ra
+
+  build:
+    name: build and smoke-test the distribution
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: astral-sh/setup-uv@v10.3.0
+        with:
+          python-version: "3.13"
+
+      - name: Build sdist and wheel
+        run: uv build
+
+      - name: Check package data
+        run: |
+          python3 - <<'PY'
+          import glob, sys, tarfile, zipfile
+
+          REQUIRED = [
+              "sqgraph/cypher/grammar.lark",
+              "sqgraph/viewer/static/index.html",
+              "sqgraph/memory/skill/SKILL.md",
+              "sqgraph/memory/opencode/sqgraph-memory.js",
+          ]
+          (wheel,) = glob.glob("dist/*.whl")
+          (sdist,) = glob.glob("dist/*.tar.gz")
+          in_wheel = set(zipfile.ZipFile(wheel).namelist())
+          in_sdist = tarfile.open(sdist).getnames()
+          missing_wheel = [p for p in REQUIRED if p not in in_wheel]
+          missing_sdist = [p for p in REQUIRED if not any(n.endswith("/src/" + p) for n in in_sdist)]
+          print(f"{wheel}: {len(in_wheel)} files; {sdist}: {len(in_sdist)} files")
+          if missing_wheel or missing_sdist:
+              sys.exit(f"missing from the wheel: {missing_wheel}; missing from the sdist: {missing_sdist}")
+          print("package data present in the wheel and the sdist")
+          PY
+
+      - name: Install the wheel into a fresh environment (oldest supported Python, no extras)
+        run: |
+          uv venv --python 3.10 "$RUNNER_TEMP/smoke"
+          uv pip install --python "$RUNNER_TEMP/smoke/bin/python" dist/*.whl
+
+      - name: Smoke test
+        # run outside the checkout so that nothing is imported from ./src
+        working-directory: ${{ runner.temp }}
+        run: |
+          expected=$(python3 -c "import tomllib; print(tomllib.load(open('$GITHUB_WORKSPACE/pyproject.toml', 'rb'))['project']['version'])")
+          smoke="$RUNNER_TEMP/smoke/bin"
+
+          "$smoke/sqgraph-memory" --help
+          [ "$("$smoke/sqgraph-memory" --version)" = "sqgraph-memory $expected" ]
+
+          version=$("$smoke/python" -c "import sqgraph; print(sqgraph.__version__)")
+          echo "sqgraph.__version__ = $version (pyproject: $expected)"
+          [ "$version" = "$expected" ]
+
+          # sqlite-vec loads, the packaged Cypher grammar / viewer page / skill are found
+          "$smoke/python" - <<'PY'
+          from importlib import resources
+
+          from sqgraph import GraphDB
+          from sqgraph.memory import setup_agents
+
+          with GraphDB(":memory:") as db:
+              assert db.query("RETURN 1 AS x") == [{"x": 1}]
+          assert "sqgraph" in setup_agents.skill_text().lower()
+          assert resources.files("sqgraph.viewer").joinpath("static", "index.html").is_file()
+          print("ok")
+          PY
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dist
+          path: dist/
+          retention-days: 7

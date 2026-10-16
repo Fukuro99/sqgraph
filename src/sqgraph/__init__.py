@@ -1,5 +1,7 @@
 """sqgraph: an embedded property graph database on SQLite + sqlite-vec, built for GraphRAG."""
 
+from importlib.metadata import PackageNotFoundError, version as _dist_version
+
 from .db import FulltextIndex, GraphDB, VectorIndex
 from .errors import (
     CypherError,
@@ -26,4 +28,7 @@ __all__ = [
     "DimensionMismatchError",
 ]
 
-__version__ = "0.1.0"
+try:  # single source of truth: the version in pyproject.toml, as recorded in the installed distribution metadata
+    __version__ = _dist_version("sqgraph")
+except PackageNotFoundError:  # running from a source checkout that was never installed
+    __version__ = "0+unknown"

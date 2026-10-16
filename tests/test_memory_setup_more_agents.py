@@ -19,7 +19,7 @@ def runner(argv):
     return 0, "", ""
 
 
-def setup(home, agents, **kw):
+def run_setup_for(home, agents, **kw):
     return sa.run_setup(agents, home=home, command=kw.pop("command", CMD), runner=runner, which=lambda n: None, platform="linux", **kw)
 
 
@@ -42,16 +42,16 @@ def test_strip_jsonc_keeps_strings():
 
 def test_codex_hooks_in_hooks_json(tmp_path):
     (tmp_path / ".codex").mkdir()
-    out = setup(tmp_path, ["codex"])
+    out = run_setup_for(tmp_path, ["codex"])
     rep = agent(out, "codex")
     assert rep["action"] == "registered" and rep["hooks"]["action"] == "installed" and "/hooks" in rep["hooks"]["note"]
     data = json.loads((tmp_path / ".codex" / "hooks.json").read_text(encoding="utf-8"))
     assert data["hooks"]["SessionStart"][0]["hooks"][0]["command"] == "/bin/sqgraph-memory hook session-start --agent codex"
     assert data["hooks"]["UserPromptSubmit"][0]["hooks"][0]["timeout"] == 15
-    assert agent(setup(tmp_path, ["codex"]), "codex")["hooks"]["action"] == "unchanged"
+    assert agent(run_setup_for(tmp_path, ["codex"]), "codex")["hooks"]["action"] == "unchanged"
     st = sa.agents_status(home=tmp_path, command=CMD, which=lambda n: None, platform="linux")
     assert next(s for s in st if s["agent"] == "codex")["hooks"] == ["session-start", "user-prompt"]
-    out = setup(tmp_path, ["codex"], uninstall=True)
+    out = run_setup_for(tmp_path, ["codex"], uninstall=True)
     assert agent(out, "codex")["hooks"]["action"] == "removed"
     assert json.loads((tmp_path / ".codex" / "hooks.json").read_text(encoding="utf-8")) == {}
 
@@ -69,7 +69,7 @@ def test_opencode_register_beside_a_commented_jsonc(tmp_path):
     d = oc_dir(tmp_path)
     jsonc = '{\n  // my provider\n  "provider": {"x": {}},\n}\n'
     (d / "opencode.jsonc").write_text(jsonc, encoding="utf-8")
-    out = setup(tmp_path, ["opencode"], env={"SQGRAPH_MEMORY_HOME": "/h"})
+    out = run_setup_for(tmp_path, ["opencode"], env={"SQGRAPH_MEMORY_HOME": "/h"})
     rep = agent(out, "opencode")
     assert rep["action"] == "registered" and rep["skill"]["action"] == "installed" and rep["hooks"]["action"] == "installed"
     assert (d / "opencode.jsonc").read_text(encoding="utf-8") == jsonc  # never rewritten
@@ -81,7 +81,7 @@ def test_opencode_register_beside_a_commented_jsonc(tmp_path):
     plugin = (d / "plugins" / "sqgraph-memory.js").read_text(encoding="utf-8")
     assert 'const COMMAND = ["/bin/sqgraph-memory"]' in plugin and '"SQGRAPH_MEMORY_HOME": "/h"' in plugin
     assert "__SQGRAPH" not in plugin
-    again = agent(setup(tmp_path, ["opencode"], env={"SQGRAPH_MEMORY_HOME": "/h"}), "opencode")
+    again = agent(run_setup_for(tmp_path, ["opencode"], env={"SQGRAPH_MEMORY_HOME": "/h"}), "opencode")
     assert again["action"] == "unchanged" and again["hooks"]["action"] == "unchanged"
     st = next(s for s in sa.agents_status(home=tmp_path, command=CMD, which=lambda n: None, platform="linux", env={"SQGRAPH_MEMORY_HOME": "/h"}) if s["agent"] == "opencode")
     assert st["registered"] and st["up_to_date"] and st["hooks"] == ["session-start", "user-prompt"]
@@ -90,10 +90,10 @@ def test_opencode_register_beside_a_commented_jsonc(tmp_path):
 def test_opencode_existing_opencode_json_is_merged_and_uninstall_cleans_up(tmp_path):
     d = oc_dir(tmp_path)
     (d / "opencode.json").write_text(json.dumps({"model": "a/b", "mcp": {"other": {"type": "remote", "url": "u"}}}), encoding="utf-8")
-    setup(tmp_path, ["opencode"])
+    run_setup_for(tmp_path, ["opencode"])
     cfg = json.loads((d / "opencode.json").read_text(encoding="utf-8"))
     assert cfg["model"] == "a/b" and set(cfg["mcp"]) == {"other", "sqgraph-memory"}
-    out = setup(tmp_path, ["opencode"], uninstall=True)
+    out = run_setup_for(tmp_path, ["opencode"], uninstall=True)
     rep = agent(out, "opencode")
     assert rep["action"] == "removed" and rep["hooks"]["action"] == "removed" and rep["skill"]["action"] == "removed"
     assert json.loads((d / "opencode.json").read_text(encoding="utf-8")) == {"model": "a/b", "mcp": {"other": {"type": "remote", "url": "u"}}}
@@ -103,8 +103,8 @@ def test_opencode_existing_opencode_json_is_merged_and_uninstall_cleans_up(tmp_p
 def test_opencode_created_file_is_removed_and_shared_skill_kept_for_codex(tmp_path):
     d = oc_dir(tmp_path)
     (tmp_path / ".codex").mkdir()
-    setup(tmp_path, ["codex", "opencode"])
-    out = setup(tmp_path, ["opencode"], uninstall=True)
+    run_setup_for(tmp_path, ["codex", "opencode"])
+    out = run_setup_for(tmp_path, ["opencode"], uninstall=True)
     rep = agent(out, "opencode")
     assert not (d / "opencode.json").exists()  # only ours was in it
     assert rep["skill"]["action"] == "kept" and (tmp_path / ".agents" / "skills" / "sqgraph-memory" / "SKILL.md").is_file()
@@ -113,21 +113,21 @@ def test_opencode_created_file_is_removed_and_shared_skill_kept_for_codex(tmp_pa
 def test_opencode_entry_kept_in_jsonc_or_commented_json_is_manual(tmp_path):
     d = oc_dir(tmp_path)
     (d / "opencode.jsonc").write_text('{\n // mine\n "mcp": {"sqgraph-memory": {"type": "local", "command": ["old", "mcp"]}}\n}', encoding="utf-8")
-    rep = agent(setup(tmp_path, ["opencode"]), "opencode")
+    rep = agent(run_setup_for(tmp_path, ["opencode"]), "opencode")
     assert rep["action"] == "manual" and "opencode.jsonc" in rep["note"] and rep["manual_entry"]["sqgraph-memory"]["command"] == CMD
     assert not (d / "opencode.json").exists()
     (d / "opencode.jsonc").unlink()
     (d / "opencode.json").write_text('{\n // comment\n "model": "x"\n}', encoding="utf-8")
-    rep = agent(setup(tmp_path, ["opencode"]), "opencode")
+    rep = agent(run_setup_for(tmp_path, ["opencode"]), "opencode")
     assert rep["action"] == "manual" and "comments" in rep["note"]
 
 
 def test_opencode_dry_run_and_no_hooks(tmp_path):
     d = oc_dir(tmp_path)
-    rep = agent(setup(tmp_path, ["opencode"], dry_run=True), "opencode")
+    rep = agent(run_setup_for(tmp_path, ["opencode"], dry_run=True), "opencode")
     assert rep["action"] == "would-register" and rep["hooks"]["action"] == "would-install"
     assert not (d / "opencode.json").exists() and not (d / "plugins").exists()
-    rep = agent(setup(tmp_path, ["opencode"], hooks=()), "opencode")
+    rep = agent(run_setup_for(tmp_path, ["opencode"], hooks=()), "opencode")
     assert rep["hooks"] == {"action": "skipped"} and not (d / "plugins").exists()
 
 

@@ -1170,6 +1170,9 @@ def cmd_doctor(args: argparse.Namespace, cfg: MemoryConfig) -> dict[str, Any]:
 
 def build_parser() -> argparse.ArgumentParser:
     ap = _Parser(prog="sqgraph-memory", description="Personal long-term memory shared by local agents (sqgraph.memory).")
+    from .. import __version__
+
+    ap.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("--compact", action="store_true", help="one-line JSON instead of indented")
     sub = ap.add_subparsers(dest="command", metavar="COMMAND", required=True, parser_class=_Parser)

@@ -627,8 +627,9 @@ def test_mcp_server_registers_and_serves_both_steps():
         prep = json.loads((r1.content if hasattr(r1, "content") else r1[0])[0].text)
         r2 = await server.call_tool("commit_memory", {"token": prep["token"], "extraction": PNPM})
         out = json.loads((r2.content if hasattr(r2, "content") else r2[0])[0].text)
-        r3 = await server.call_tool("commit_memory", {"token": json.loads((await server.call_tool("add_memory", {"content": "もう一件のメモ", "author": "user"})).content[0].text)["token"],
-                                                      "extraction": json.dumps(PNPM)})
+        r_more = await server.call_tool("add_memory", {"content": "もう一件のメモ", "author": "user"})
+        more_token = json.loads((r_more.content if hasattr(r_more, "content") else r_more[0])[0].text)["token"]
+        r3 = await server.call_tool("commit_memory", {"token": more_token, "extraction": json.dumps(PNPM)})
         return tools, prep, out, r3
 
     tools, prep, out, _ = asyncio.run(go())
