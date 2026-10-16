@@ -185,18 +185,9 @@ AGENT_EXTRACTION_SCHEMA: dict[str, Any] = {
 
 # --------------------------------------------------------------------------- answer
 
-DEFAULT_ANSWER_LANGUAGE = "English"
-
-
-def answer_system(language: str | None = DEFAULT_ANSWER_LANGUAGE) -> str:
-    """System prompt of ``Memory.answer``; ``language=None`` answers in the language of the question."""
-    lang = language.strip() if language and language.strip() else "the language of the question"
-    return f"""You answer questions from a long-term memory (a temporal knowledge graph).
-Answer concisely in {lang}, using only the given `facts` (and `entities`).
+ANSWER_SYSTEM = """You answer questions from a long-term memory (a temporal knowledge graph).
+Answer concisely in English, using only the given `facts` (and `entities`).
 - Cite the sources of each claim as [F1]; add the author and date when it helps.
 - Each fact has a status: valid (true now), ended (no longer true; a past state) or scheduled (planned, not started yet). For the current state prefer valid facts; for history, use ended facts too and explain in chronological order.
 - Use valid_at / invalid_at to say from when until when something holds. If `as_of` is set, answer for that point in time.
 - If the facts do not answer the question, say so instead of guessing. Point out contradictions and uncertainty (modality tentative or planned)."""
-
-
-ANSWER_SYSTEM = answer_system()

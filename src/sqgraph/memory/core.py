@@ -108,7 +108,6 @@ EXPAND_SLACK = 0.05  # facts reached through the graph (weakly) need only ``min_
 RELATIVE_MARGIN = 0.08  # vector-only candidates must be within this of the best candidate's similarity
 
 NO_MATCH_TEXT = "No matching memories found."  # ``Answer.text`` when nothing matched (the LLM is not called)
-_UNSET: Any = object()  # sentinel: "argument not given" (None is a real value for ``answer(language=...)``)
 # prepare_episode (agent extraction) is more permissive than search: a missed fact may be a missed contradiction
 PREPARE_ENTITY_SLACK = 0.05  # candidate entities (vector match): min_similarity - this
 PREPARE_FACT_SLACK = 0.10  # related facts: min_similarity - this ...
@@ -436,9 +435,12 @@ class Memory:
         ``expand_slack`` lowers that bar for facts reached through the entity graph; ``relative_margin`` drops
         vector-only candidates that are further than this below the best candidate.
 
-    answer_language:
-        Language of :meth:`answer`, as a language name such as ``"English"`` (default) or ``"Japanese"``.
-        ``None`` = the language of the question. :meth:`answer` can override it per call with ``language=``.
+    answer_prompt:
+        System prompt of :meth:`answer`; ``None`` = :data:`sqgraph.memory.prompts.ANSWER_SYSTEM` (answers in English).
+        The user message it receives is a JSON object with ``now`` (local time with weekday), ``as_of`` (or null),
+        ``question``, ``entities`` (name, type, summary; up to 4) and ``facts`` (each with ``id`` "F1".., ``fact``,
+        ``status`` valid|ended|scheduled, ``valid_at``, ``invalid_at``, ``modality`` and ``sources``
+        [{author, at, channel}]). E.g. ``Memory(..., answer_prompt=ANSWER_SYSTEM.replace("in English", "in Japanese"))``.
 
     A database opened here has ``PRAGMA secure_delete=ON``: forgotten data is overwritten, not left in free pages.
     """
@@ -460,9 +462,11 @@ class Memory:
         min_similarity: float | None = None,
         expand_slack: float = EXPAND_SLACK,
         relative_margin: float = RELATIVE_MARGIN,
-        answer_language: str | None = prompts.DEFAULT_ANSWER_LANGUAGE,
+        answer_prompt: str | None = None,
     ) -> None:
-        self.answer_language = answer_language
+        if answer_prompt is not None and not answer_prompt.strip():
+            raise ValueError("answer_prompt must not be empty (use None for the default prompt)")
+        self.answer_prompt: str = prompts.ANSWER_SYSTEM if answer_prompt is None else answer_prompt
         self._allow_embedder_change = allow_embedder_change
         self.min_similarity = self._check_similarity(min_similarity)
         self.expand_slack = float(expand_slack)
@@ -2724,14 +2728,11 @@ class Memory:
         center_entity: str | None = None,
         limit: int = 20,
         min_similarity: float | None = None,
-        language: str | None = _UNSET,
     ) -> Answer:
         """Retrieve facts for ``question`` and let the LLM answer, citing sources and validity.
 
-        The answer is written in ``language`` (a language name such as ``"English"`` or ``"Japanese"``;
-        ``None`` = the language of the question), default :attr:`answer_language` (English). When nothing
-        matches, the LLM is not called and ``text`` is the fixed English :data:`NO_MATCH_TEXT`; callers that
-        want another language can check ``not answer.hits`` and substitute their own text.
+        The LLM is given :attr:`answer_prompt` as its system prompt. When nothing matches, the LLM is not
+        called and ``text`` is :data:`NO_MATCH_TEXT`; callers can check ``not answer.hits`` to show their own text.
 
         Retrieval includes ended facts (history) and, when ``as_of`` is not given, planned facts that have
         not started yet; each is labelled with its ``status`` so the model can tell them apart.
@@ -2776,9 +2777,8 @@ class Memory:
             ],
         }
         self._llm_calls += 1
-        lang = self.answer_language if language is _UNSET else language
         text = llm.complete_text(
-            prompts.answer_system(lang), json.dumps(payload, ensure_ascii=False, separators=(",", ":")), task="answer"
+            self.answer_prompt, json.dumps(payload, ensure_ascii=False, separators=(",", ":")), task="answer"
         )
         views = [self._entity_view(e, allowed, group) for e in ents[:4]]
         return Answer(question, text, hits, views, payload["as_of"])

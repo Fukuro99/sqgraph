@@ -65,11 +65,11 @@ mem.search_entities("bob", channels=["backend"])            # [{id, name, type, 
 mem.get_entity("bob", channels=["backend"])                 # プロフィール + ファクトのタイムライン (失効分含む)
 mem.get_episodes(entity="Rails", channels=["backend"], limit=10)
 ans = mem.answer("Rails の対応はどこまで進んだ？", group_id="my-guild", channels=["backend"])
-print(ans.text)                                                # 既定は英語で、出典 [F1] と有効期間つきの回答 (日本語にするには下記の answer_language)
+print(ans.text)                                                # 既定は英語で、出典 [F1] と有効期間つきの回答 (日本語にするには下記の answer_prompt)
 print(tracker.summary("run"))
 ```
 
-`answer` は既定で英語で回答します。既定を変えるには `Memory(..., answer_language="Japanese")` (任意の言語名)、1 回だけ変えるには `mem.answer(..., language="Japanese")` を指定します。`None` なら質問の言語で回答します。該当なしのときは LLM を呼ばず、`ans.text` は固定の英語 `No matching memories found.` になります (別の言語で表示したい場合は `not ans.hits` を確認して自前の文言を出してください)。
+`answer` は既定で英語で回答します。言語や文体を変えるには、システムプロンプトを差し替えます: `from sqgraph.memory.prompts import ANSWER_SYSTEM` のうえで `Memory(..., answer_prompt=ANSWER_SYSTEM.replace("in English", "in Japanese"))`。プロンプトには user メッセージとして次の JSON が渡されます: `now` (曜日つきのローカル時刻)、`as_of` (または null)、`question`、`entities` (name, type, summary。最大 4 件)、`facts` (各 `id` "F1".. / `fact` / `status` valid|ended|scheduled / `valid_at` / `invalid_at` / `modality` / `sources` [{author, at, channel}])。該当なしのときは LLM を呼ばず、`ans.text` は固定の英語 `No matching memories found.` になります (自前の文言を出したい場合は `not ans.hits` を確認してください)。
 
 取り込み 1 件あたりの LLM 呼び出しは通常 2〜4 回です: ① エンティティ抽出 (直近の同チャンネル発言を文脈として渡し「それ」等を解決。覚えるべき事実が無い発言はここで打ち切り) → ② 既存エンティティとの同一判定 (完全一致・エイリアス一致は LLM 不要。曖昧な名前だけ、ベクトル / 全文 / 完全一致の候補をまとめて 1 回で判定) → ③ ファクト抽出 + エンティティ要約更新 → ④ 重複 / 矛盾判定 (関連する既存の有効ファクトがある時だけ)。埋め込みは 1 件につき 1〜2 回のバッチ呼び出しで、DB への書き込みは 1 トランザクションです。取り込みは内部ロックで直列化されます (bot ではキューに積む想定)。
 
@@ -200,7 +200,7 @@ claude mcp add sqgraph-memory-backend -- python -m sqgraph.memory.mcp --db /path
 
 ## Discord bot への組み込み (概要)
 
-`on_message` で `queue.put((message.content, channel.name, author.display_name, message.created_at, message.id))` し、ワーカーが `mem.add_episode(..., source="discord", source_ref=str(message.id))` を 1 件ずつ呼びます (メッセージ ID を `source_ref` にすれば再投入しても重複しません)。`/ask` スラッシュコマンドでは、質問者が閲覧できるチャンネルを Discord の権限 (`channel.permissions_for(member).view_channel`) で判定し、その一覧を `channels=` に渡して `mem.answer(question, group_id=str(guild.id), channels=allowed)` を呼びます (英語以外のサーバーでは `Memory` を `answer_language="Japanese"` などで作るか、`language=None` を渡して質問の言語に合わせます)。
+`on_message` で `queue.put((message.content, channel.name, author.display_name, message.created_at, message.id))` し、ワーカーが `mem.add_episode(..., source="discord", source_ref=str(message.id))` を 1 件ずつ呼びます (メッセージ ID を `source_ref` にすれば再投入しても重複しません)。`/ask` スラッシュコマンドでは、質問者が閲覧できるチャンネルを Discord の権限 (`channel.permissions_for(member).view_channel`) で判定し、その一覧を `channels=` に渡して `mem.answer(question, group_id=str(guild.id), channels=allowed)` を呼びます (英語以外のサーバーでは `Memory` を独自の `answer_prompt=` で作ります)。
 
 ## コスト目安 (gpt-5.4-mini, text-embedding-3-small)
 

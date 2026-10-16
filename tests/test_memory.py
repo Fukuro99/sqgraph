@@ -5,6 +5,7 @@ from __future__ import annotations
 import pytest
 
 from sqgraph import GraphDB
+from sqgraph.memory import prompts
 from sqgraph.memory import FakeEmbedder, FakeLLM, Memory, clean_display_name, person_forms
 from sqgraph.memory.core import NO_MATCH_TEXT
 from sqgraph.memory.util import fts_or_query, norm_key, parse_time, query_terms, to_iso
@@ -331,37 +332,32 @@ def _answer_memory(**kw):
     return mem, llm
 
 
-def test_answer_language_defaults_to_english():
+def test_answer_prompt_defaults_to_the_english_system_prompt():
     mem, llm = _answer_memory()
+    assert mem.answer_prompt == prompts.ANSWER_SYSTEM and "in English" in prompts.ANSWER_SYSTEM
     assert mem.answer("Rails の OWNER は?", group_id=G, channels=["backend"]).hits
-    assert "in English" in llm.systems[-1]
+    assert llm.systems[-1] == prompts.ANSWER_SYSTEM
 
 
-def test_answer_language_from_the_constructor_and_per_call():
-    mem, llm = _answer_memory(answer_language="Japanese")
+def test_custom_answer_prompt_is_passed_through_verbatim():
+    custom = prompts.ANSWER_SYSTEM.replace("in English", "in Japanese")
+    mem, llm = _answer_memory(answer_prompt=custom)
+    assert mem.answer_prompt == custom
     assert mem.answer("Rails の OWNER は?", group_id=G, channels=["backend"]).hits
-    assert "in Japanese" in llm.systems[-1] and "English" not in llm.systems[-1]
-    mem.answer("Rails の OWNER は?", group_id=G, channels=["backend"], language="French")
-    assert "in French" in llm.systems[-1]
-    mem.answer("Rails の OWNER は?", group_id=G, channels=["backend"], language=None)  # explicit None: the question's
-    assert "the language of the question" in llm.systems[-1]
-    mem.answer("Rails の OWNER は?", group_id=G, channels=["backend"])  # the constructor value applies again
-    assert "in Japanese" in llm.systems[-1]
+    assert llm.systems[-1] == custom
 
 
-def test_answer_language_none_in_the_constructor_follows_the_question():
-    mem, llm = _answer_memory(answer_language=None)
-    mem.answer("Rails の OWNER は?", group_id=G, channels=["backend"])
-    assert "the language of the question" in llm.systems[-1]
-    mem.answer("Rails の OWNER は?", group_id=G, channels=["backend"], language="English")
-    assert "in English" in llm.systems[-1]
+@pytest.mark.parametrize("bad", ["", "   "])
+def test_empty_answer_prompt_is_rejected(bad):
+    with pytest.raises(ValueError):
+        Memory(":memory:", FakeLLM(), FakeEmbedder(), answer_prompt=bad)
 
 
 def test_answer_without_hits_does_not_call_the_llm():
-    mem, llm = _answer_memory(answer_language="Japanese")
+    mem, llm = _answer_memory(answer_prompt="custom prompt")
     n = len(llm.systems)
     none = mem.answer("Rails の OWNER は?", group_id=G, channels=[])
-    assert none.text == NO_MATCH_TEXT and not none.hits  # English regardless of the answer language
+    assert none.text == NO_MATCH_TEXT and not none.hits
     assert len(llm.systems) == n and llm.count("answer") == 0
 
 
