@@ -7,7 +7,7 @@
 
 The core :mod:`sqgraph` package stays LLM-free; models are plugged in through the
 :class:`LLMProvider` / :class:`Embedder` protocols (OpenAI implementations and deterministic fakes
-are included). See ``README.md`` (エージェント長期記憶) for the data model, ACL design and MCP server.
+are included). See ``docs/memory.md`` for the data model, ACL design and MCP server.
 """
 
 from .core import MEMORY_SCHEMA_VERSION, Answer, EpisodeRef, EpisodeResult, FactHit, ForgetResult, Memory

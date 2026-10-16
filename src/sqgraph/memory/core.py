@@ -19,7 +19,7 @@ Bi-temporal: ``valid_at`` / ``invalid_at`` are event time (when the fact is true
 ``invalid_at`` and ``superseded_by`` (id of the newer fact), the newer one lists the ids in ``supersedes``.
 
 Access control: every Episode and Fact records its source ``channel``(s). All read methods take
-``channels`` (allowed channels, ``None`` = unrestricted). See :meth:`Memory.search` and the README.
+``channels`` (allowed channels, ``None`` = unrestricted). See :meth:`Memory.search` and ``docs/memory.md``.
 """
 
 from __future__ import annotations

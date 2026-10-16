@@ -1,72 +1,74 @@
-# クラウドで sqgraph を動かす (AWS / Cloudflare)
+[日本語](ja/deployment.md)
 
-sqgraph は **SQLite の 1 ファイルに載る組み込み DB** です。サーバー型の DB (Neo4j など) と違い、「DB サーバーを立てる」のではなく「**DB ファイルを置いたディスクの上でアプリ (bot / MCP サーバー / API) を動かす**」構成になります。この文書では、AWS と Cloudflare でその構成を作る方法と、守るべき制約をまとめます。
+# Running sqgraph in the Cloud (AWS / Cloudflare)
 
-- [1. 先に知っておくべき制約](#1-先に知っておくべき制約)
-- [2. 構成パターン](#2-構成パターン)
-- [3. 共通部品 (Docker イメージ / スナップショット / Litestream)](#3-共通部品)
+sqgraph is an **embedded DB that lives in a single SQLite file**. Unlike server-based databases such as Neo4j, you don't "run a DB server". Instead, you **run your application (bot / MCP server / API) on the disk that holds the DB file**. This document explains how to set that up on AWS and Cloudflare, and the constraints you need to respect.
+
+- [1. Constraints to know first](#1-constraints-to-know-first)
+- [2. Deployment patterns](#2-deployment-patterns)
+- [3. Common building blocks (Docker image / snapshots / Litestream)](#3-common-building-blocks)
 - [4. AWS](#4-aws)
 - [5. Cloudflare](#5-cloudflare)
-- [6. MCP サーバーを公開するときの認証](#6-mcp-サーバーを公開するときの認証)
-- [7. 転送量とコスト (DB が大きくなったとき)](#7-転送量とコスト)
-- [8. 運用 (バックアップ・更新・監視)](#8-運用)
-- [9. チェックリスト](#9-チェックリスト)
+- [6. Authenticating a public MCP server](#6-authenticating-a-public-mcp-server)
+- [7. Transfer volume and cost (when the DB grows)](#7-transfer-volume-and-cost)
+- [8. Operations (backup, upgrades, monitoring)](#8-operations)
+- [9. Checklist](#9-checklist)
 
 ---
 
-## 1. 先に知っておくべき制約
+## 1. Constraints to know first
 
-| 制約 | 理由 | 帰結 |
+| Constraint | Reason | Consequence |
 |---|---|---|
-| **書き込みは 1 プロセスだけ** | SQLite の書き込みロックは 1 つ。`sqgraph.memory` の取り込みもプロセス内ロックで直列化している | 書き込み側はインスタンス 1 台固定。オートスケールさせない。デプロイ時に新旧 2 台が同時に書かないようにする |
-| **DB ファイルはローカルディスクに置く** | 書き込み可能で開くと `journal_mode=WAL` になる。WAL は共有メモリ (`-shm`) を使うため、**ネットワークファイルシステム (EFS / NFS / SMB / FUSE マウントのオブジェクトストレージ) 上では安全に動かない** | EBS / インスタンスストア / コンテナのローカルディスクを使う。永続化・バックアップは Litestream などで S3 / R2 に逃がす |
-| **SQLite 3.38 以上 + 拡張ロード** | JSON の `->` 演算子、sqlite-vec (`vec0`) のロードが必要 | Python の `sqlite3` が `enable_load_extension` を持っている必要がある (下のチェックで確認) |
-| **読み取りはいくらでも増やせる** | `GraphDB(path, read_only=True)` は `mode=ro` で開き、書き込みクエリを拒否する | 「書き込み 1 + 読み取り N」はスナップショット配布で作る (パターン B) |
-| **LLM は外部 API** | `sqgraph` 本体は LLM を使わない。`sqgraph.memory` の取り込み / `answer` だけが OpenAI などを呼ぶ | 実行環境から LLM API への外向き通信と、API キーの安全な受け渡しが必要 |
+| **Only one process may write** | SQLite has a single write lock. `sqgraph.memory` ingestion is also serialized by an in-process lock | Pin the writer to exactly one instance. Do not autoscale. During deploys, make sure the old and new instances never write at the same time |
+| **Keep the DB file on a local disk** | Opened for writing, the DB switches to `journal_mode=WAL`. WAL uses shared memory (`-shm`), so it **does not run safely on network file systems (EFS / NFS / SMB / object storage mounted via FUSE)** | Use EBS, instance store, or the container's local disk. Persist and back up to S3 / R2 with Litestream or similar |
+| **SQLite 3.38 or later with extension loading** | The JSON `->` operator and loading sqlite-vec (`vec0`) are required | Python's `sqlite3` must provide `enable_load_extension` (verify with the check below) |
+| **Reads scale freely** | `GraphDB(path, read_only=True)` opens with `mode=ro` and rejects write queries | Build "1 writer + N readers" by distributing snapshots (pattern B) |
+| **The LLM is an external API** | The `sqgraph` core does not use an LLM. Only `sqgraph.memory` ingestion and `answer` call OpenAI or similar | The runtime needs outbound access to the LLM API and a safe way to receive the API key |
 
-実行環境で動くかは、次のスクリプトで確認できます (Docker イメージや Lambda の中で実行)。
+To check whether your runtime works, run the script below (inside the Docker image or Lambda).
 
 ```python
 import sqlite3, sqlite_vec
-print("sqlite", sqlite3.sqlite_version)                       # 3.38 以上であること
+print("sqlite", sqlite3.sqlite_version)                       # must be 3.38 or later
 conn = sqlite3.connect(":memory:")
-conn.enable_load_extension(True)                               # AttributeError なら拡張ロード不可のビルド
+conn.enable_load_extension(True)                               # AttributeError means the build cannot load extensions
 sqlite_vec.load(conn)
 print("vec", conn.execute("select vec_version()").fetchone()[0])
 ```
 
-公式の `python:3.12-slim` (Debian bookworm, SQLite 3.40) イメージはこの条件を満たします。マネージドランタイム (Lambda の zip デプロイなど) を使う場合は、デプロイ前に必ずこのチェックを通してください。通らない場合はコンテナイメージにします。
+The official `python:3.12-slim` image (Debian bookworm, SQLite 3.40) meets these requirements. If you use a managed runtime (such as a Lambda zip deployment), always run this check before deploying. If it fails, use a container image instead.
 
 ---
 
-## 2. 構成パターン
+## 2. Deployment patterns
 
-| パターン | 形 | 向いている用途 |
+| Pattern | Shape | Suited for |
 |---|---|---|
-| **A. 単一サーバー + 継続バックアップ** (推奨の出発点) | 1 台のコンテナ / VM が DB ファイルを持ち、読み書きの両方を担当。Litestream で S3 / R2 に継続レプリケーション | `sqgraph.memory` の MCP サーバー、Discord bot、社内 API |
-| **B. 書き込み 1 + 読み取り N** | A の書き込みサーバーが定期的にスナップショットを S3 / R2 に置き、読み取り側 (Lambda / 複数コンテナ) がダウンロードして `read_only=True` で開く | 検索 API のアクセスが多い、読み取りのレイテンシを地域ごとに下げたい |
-| **C. バッチ構築 → 読み取り専用配布** | GraphRAG のインデックス (`examples/graphrag_openai` の `index` など) をバッチで作り、完成した DB ファイルを配布するだけ | 文書コーパスの GraphRAG、更新頻度が低い知識ベース |
+| **A. Single server + continuous backup** (recommended starting point) | One container / VM holds the DB file and handles both reads and writes. Continuous replication to S3 / R2 with Litestream | The `sqgraph.memory` MCP server, a Discord bot, an internal API |
+| **B. 1 writer + N readers** | The writer server from A periodically puts snapshots in S3 / R2. Readers (Lambda / multiple containers) download them and open with `read_only=True` | High search API traffic, or lowering read latency per region |
+| **C. Batch build → read-only distribution** | Build a GraphRAG index in a batch job (e.g. `index` in `examples/graphrag_openai`) and just distribute the finished DB file | GraphRAG over a document corpus, knowledge bases that rarely change |
 
 ```
 A:  client ──> [app + sqgraph + DB file] ──(Litestream)──> S3 / R2
 
-B:  writer ──> [app + DB file] ──(snapshot 定期)──> S3 / R2 ──(download)──> [reader 1..N (read_only)]
+B:  writer ──> [app + DB file] ──(periodic snapshot)──> S3 / R2 ──(download)──> [reader 1..N (read_only)]
 
 C:  [batch job: index] ──(upload)──> S3 / R2 ──(download)──> [reader 1..N (read_only)]
 ```
 
-B / C の読み取り側が見るのはスナップショット時点のデータです (数分〜数時間の遅れ)。書いた直後に読める必要がある処理 (例: `add_memory` の直後の `search_memory`) は書き込みサーバー側で処理してください。
+In B / C, readers see the data as of the snapshot (minutes to hours behind). Anything that must be readable immediately after a write (for example `search_memory` right after `add_memory`) should be handled on the writer server.
 
 ---
 
-## 3. 共通部品
+## 3. Common building blocks
 
-### 3.1 Docker イメージ
+### 3.1 Docker image
 
 ```dockerfile
 FROM python:3.12-slim
 
-# Litestream (パターン A で使う。不要なら削除)。バージョンは最新のリリースに合わせる
+# Litestream (used by pattern A; remove if not needed). Match the version to the latest release
 ARG LITESTREAM_VERSION=0.5.17
 ADD https://github.com/benbjohnson/litestream/releases/download/v${LITESTREAM_VERSION}/litestream-${LITESTREAM_VERSION}-linux-x86_64.tar.gz /tmp/litestream.tgz
 RUN tar -C /usr/local/bin -xzf /tmp/litestream.tgz && rm /tmp/litestream.tgz
@@ -86,34 +88,34 @@ EXPOSE 8000
 ENTRYPOINT ["/entrypoint.sh"]
 ```
 
-この章のファイルは [deploy/](../deploy/) に同じものを置いてあります。ビルドはリポジトリのルートで行います (ビルドコンテキストはルート)。
+The files in this section are also available in [deploy/](../deploy/). Build from the repository root (the build context is the root).
 
 ```bash
 docker build -f deploy/Dockerfile -t sqgraph-memory .
 ```
 
-> Litestream のリリースアセット名 (`linux-x86_64` / `linux-amd64` / `.deb` など) はバージョンによって違うので、[リリースページ](https://github.com/benbjohnson/litestream/releases) で確認してください。ARM (Graviton) で動かす場合は arm64 版にします。
+> Litestream release asset names (`linux-x86_64` / `linux-amd64` / `.deb`, etc.) vary by version, so check the [releases page](https://github.com/benbjohnson/litestream/releases). To run on ARM (Graviton), use the arm64 build.
 
-### 3.2 Litestream 設定 (S3 / R2)
+### 3.2 Litestream configuration (S3 / R2)
 
-Litestream は SQLite の WAL を監視して、変更をオブジェクトストレージに数秒おきに送るツールです。sqgraph は WAL モードで書くのでそのまま使えます。v0.5 以降は **DB 1 つにつきレプリカ 1 つ** です。
+Litestream watches the SQLite WAL and ships changes to object storage every few seconds. sqgraph writes in WAL mode, so it works as is. Since v0.5, there is **one replica per DB**.
 
 ```yaml
 # deploy/litestream.yml
-access-key-id: ${LITESTREAM_ACCESS_KEY_ID}         # AWS で IAM ロールを使うなら 2 行とも削除
+access-key-id: ${LITESTREAM_ACCESS_KEY_ID}         # on AWS with an IAM role, delete both lines
 secret-access-key: ${LITESTREAM_SECRET_ACCESS_KEY}
 
 dbs:
   - path: ${DB_PATH}
     replica:
       url: ${LITESTREAM_REPLICA_URL}               # s3://my-bucket/sqgraph/memory
-      # --- Cloudflare R2 の場合 ---
+      # --- For Cloudflare R2 ---
       # endpoint: https://<ACCOUNT_ID>.r2.cloudflarestorage.com
       # region: auto
       sync-interval: 5s
 ```
 
-### 3.3 起動スクリプト (リストア → レプリケーションしながらアプリ起動)
+### 3.3 Startup script (restore → start the app while replicating)
 
 ```sh
 #!/bin/sh
@@ -121,22 +123,22 @@ dbs:
 set -e
 mkdir -p "$(dirname "$DB_PATH")"
 
-# ローカルに DB が無ければ (新しいコンテナ / ディスク) レプリカから復元。レプリカも無ければ新規作成になる
+# If there is no local DB (new container / disk), restore it from the replica. If there is no replica either, a new DB is created
 litestream restore -config /etc/litestream.yml -if-db-not-exists -if-replica-exists "$DB_PATH"
 
-# アプリを子プロセスとして起動し、動いている間ずっとレプリケーションする
+# Start the app as a child process and replicate for as long as it runs
 exec litestream replicate -config /etc/litestream.yml -exec "python -m sqgraph.memory.mcp \
   --db $DB_PATH --transport streamable-http --host 0.0.0.0 --port 8000 \
   --group-id ${GROUP_ID:-main} --extractor ${EXTRACTOR:-openai} ${MCP_EXTRA_ARGS}"
 ```
 
-- `--host 0.0.0.0` はコンテナの外から届くようにするためです。**MCP サーバー自体には認証が無い**ので、必ず [6 章](#6-mcp-サーバーを公開するときの認証) の方法で前段に認証を置いてください。
-- `OPENAI_API_KEY` は環境変数で渡します (Secrets Manager / Cloudflare のシークレットから注入)。`.env` をイメージに焼き込まないでください。
-- 共有サーバーは `--extractor openai` (`EXTRACTOR` 環境変数で変更可) で起動します。MCP の既定は `agent` (呼び出したエージェントが抽出して `commit_memory` で保存。OpenAI キー不要) です。
+- `--host 0.0.0.0` makes the server reachable from outside the container. **The MCP server itself has no authentication**, so always put authentication in front of it as described in [section 6](#6-authenticating-a-public-mcp-server).
+- Pass `OPENAI_API_KEY` as an environment variable (injected from Secrets Manager / Cloudflare secrets). Do not bake `.env` into the image.
+- A shared server starts with `--extractor openai` (overridable via the `EXTRACTOR` environment variable). The MCP default is `agent` (the calling agent does the extraction and saves it with `commit_memory`; no OpenAI key needed).
 
-### 3.4 読み取り用スナップショットの作り方 (パターン B / C)
+### 3.4 Building a read snapshot (patterns B / C)
 
-WAL モードのファイルをそのままコピーすると、`-wal` にしか無い最新の変更が欠けたり、読み取り専用の環境で開けなかったりします。**`VACUUM INTO` で整合性のとれた 1 ファイルを作ってから配布**してください (結果のファイルは `journal_mode=DELETE` の単一ファイルになります)。書き込み中のプロセスがいても実行できます。
+Copying a WAL-mode file as is can miss recent changes that exist only in `-wal`, and may fail to open in read-only environments. **Create a consistent single file with `VACUUM INTO`, then distribute that** (the resulting file is a single file with `journal_mode=DELETE`). It can run while another process is writing.
 
 ```python
 # deploy/snapshot.py  —  python deploy/snapshot.py /data/memory.db /tmp/snap.db && aws s3 cp /tmp/snap.db s3://my-bucket/snapshots/memory-$(date +%Y%m%dT%H%M%S).db
@@ -148,68 +150,68 @@ if os.path.exists(dst):
     os.remove(dst)
 conn = sqlite3.connect(f"file:{src}?mode=ro", uri=True)
 conn.enable_load_extension(True)
-sqlite_vec.load(conn)                 # vec0 仮想テーブルを含む DB なので拡張をロードしておく
+sqlite_vec.load(conn)                 # the DB contains vec0 virtual tables, so load the extension
 conn.enable_load_extension(False)
 conn.execute("VACUUM INTO ?", (dst,))
 conn.close()
 ```
 
-スナップショットは**毎回新しいキー名**で置き、「最新はどれか」を `snapshots/LATEST` のような小さなファイル (中身はキー名) で示すと、読み取り側が中途半端なファイルを掴みません。
+Upload each snapshot under a **new key** and point to the latest one with a small file such as `snapshots/LATEST` (containing the key name). This keeps readers from picking up a partially written file.
 
 ---
 
 ## 4. AWS
 
-### 4.1 どのサービスを使うか
+### 4.1 Which service to use
 
-| サービス | 使い方 | 評価 |
+| Service | Usage | Rating |
 |---|---|---|
-| **EC2 + EBS** | 1 台の VM に DB を置く。EBS スナップショット / Litestream でバックアップ | ◎ 最もシンプル。DB が大きくなっても再起動で全量転送が起きない。まずはこれ |
-| **ECS on EC2 + EBS ボリューム** | タスクに EBS をアタッチ | ◎ コンテナで運用しつつ永続ディスクが欲しいとき |
-| **ECS on Fargate + Litestream (S3)** | タスク 1 個固定。ローカル (エフェメラル) ストレージに DB、起動時に S3 から復元 | ○ サーバー管理不要。ただし**起動のたびに DB 全量を復元**するので、DB が小さいうち (目安 1 GB 程度まで) 向け (7 章)。デプロイ設定に注意 (4.3) |
-| **Lambda (読み取り専用)** | S3 のスナップショットを `/tmp` に落として `read_only=True` で開く | ○ パターン B / C の読み取り側。コールドスタートごとにダウンロードが発生する (7 章) |
-| **Lambda (書き込み)** | — | ✕ 同時実行で複数の書き込みが発生する。やらない |
-| **EFS 上の DB を共有** | — | ✕ WAL がネットワーク FS で安全に動かない。複数タスクからの書き込みは破損の原因 |
-| App Runner | — | △ ディスクが永続でなく、インスタンス数を 1 に固定しにくい。Fargate を推奨 |
+| **EC2 + EBS** | Put the DB on a single VM. Back up with EBS snapshots / Litestream | ◎ Simplest. Restarts never trigger a full transfer, even as the DB grows. Start here |
+| **ECS on EC2 + EBS volume** | Attach EBS to the task | ◎ When you want containers with a persistent disk |
+| **ECS on Fargate + Litestream (S3)** | Fixed at one task. DB on local (ephemeral) storage, restored from S3 at startup | ○ No server management. But the **full DB is restored on every start**, so it suits small DBs (up to about 1 GB; see section 7). Mind the deployment settings (4.3) |
+| **Lambda (read-only)** | Download the S3 snapshot to `/tmp` and open with `read_only=True` | ○ Reader side of patterns B / C. A download happens on every cold start (section 7) |
+| **Lambda (write)** | — | ✕ Concurrent executions cause multiple writers. Don't |
+| **Sharing a DB on EFS** | — | ✕ WAL does not run safely on network file systems. Writes from multiple tasks cause corruption |
+| App Runner | — | △ The disk is not persistent and it is hard to pin the instance count to 1. Fargate is recommended |
 
-### 4.2 EC2 + EBS (最小構成)
+### 4.2 EC2 + EBS (minimal setup)
 
-1. Amazon Linux 2023 か Ubuntu の EC2 を 1 台、gp3 の EBS をデータ用に用意して `/data` にマウント。
-2. Docker を入れて 3.1 のイメージを起動するか、venv に `pip install ".[mcp]"` して systemd で起動。
-3. バックアップは Litestream (3.2) を S3 に向ける。インスタンスに S3 への書き込み権限を持つ **IAM ロール** を付ければアクセスキーは不要です。
-4. EBS のスナップショット (Data Lifecycle Manager) も併用すると、Litestream が止まっていた場合の保険になります。
+1. Prepare one EC2 instance (Amazon Linux 2023 or Ubuntu) and a gp3 EBS volume for data, mounted at `/data`.
+2. Install Docker and run the image from 3.1, or `pip install ".[mcp]"` into a venv and run it under systemd.
+3. For backup, point Litestream (3.2) at S3. If you attach an **IAM role** with write access to S3 to the instance, no access keys are needed.
+4. Also using EBS snapshots (Data Lifecycle Manager) gives you insurance for when Litestream has stopped.
 
 ```ini
-# /etc/systemd/system/sqgraph-memory.service (Docker を使わない場合)
+# /etc/systemd/system/sqgraph-memory.service (when not using Docker)
 [Service]
 Environment=DB_PATH=/data/memory.db
-EnvironmentFile=/etc/sqgraph/env            # OPENAI_API_KEY=... (権限 600)
+EnvironmentFile=/etc/sqgraph/env            # OPENAI_API_KEY=... (mode 600)
 ExecStart=/usr/local/bin/litestream replicate -config /etc/litestream.yml \
   -exec "/opt/sqgraph/.venv/bin/python -m sqgraph.memory.mcp --db /data/memory.db --transport streamable-http --host 127.0.0.1 --port 8000 --group-id main --extractor openai"
 Restart=always
 ```
 
-外からのアクセスは、同じ VM の Caddy / nginx で認証をかけてから `127.0.0.1:8000` に流すか、Cloudflare Tunnel を使います (6 章)。
+For external access, either put Caddy / nginx on the same VM to authenticate and forward to `127.0.0.1:8000`, or use Cloudflare Tunnel (section 6).
 
 ### 4.3 ECS on Fargate + Litestream
 
-- **タスク定義**
-  - コンテナイメージ: 3.1 のイメージ (ECR に push)
-  - エフェメラルストレージ: DB サイズ + 余裕 (既定 20 GiB、最大 200 GiB)
-  - 環境変数: `DB_PATH=/data/memory.db`, `LITESTREAM_REPLICA_URL=s3://<bucket>/sqgraph/memory`, `GROUP_ID=...`
-  - シークレット: `OPENAI_API_KEY` を Secrets Manager (または SSM パラメータストア) から `secrets` で注入
-  - タスクロール: 対象バケット / プレフィックスへの `s3:GetObject`, `s3:PutObject`, `s3:DeleteObject`, `s3:ListBucket`
-- **ネットワーク**: プライベートサブネットで動かす場合は **S3 のゲートウェイ型 VPC エンドポイント**を作ってください。無いと起動時の復元や Litestream の転送が NAT Gateway を通り、GB 単位の処理料がかかります (7 章)
-- **サービス設定 (重要)**
-  - `desiredCount = 1`、オートスケーリングは設定しない
-  - デプロイ設定を `minimumHealthyPercent = 0`, `maximumPercent = 100` にする。既定値 (100 / 200) だと**新旧 2 タスクが同時に起動し、同じレプリカに 2 つの書き込みが走る**ため
-  - その代わりデプロイ中は数十秒の停止が発生します
-- **停止時**: ECS はタスク停止時に SIGTERM を送り、`stopTimeout` (既定 30 秒) 待ちます。Litestream は `-exec` の子プロセスにシグナルを渡して終了します。ただし `sync-interval` の間に書いた最後の数秒分は、停止の仕方によっては失われる可能性があります。取りこぼしが許されないデータは、呼び出し側で再送できるようにしてください (`sqgraph.memory` は同じ `source_ref` の再投入を無視するので、再送しても重複しません)。
-- **前段**: ALB (ターゲットはタスクの 8000 番) + 認証 (6 章)。ヘルスチェックは TCP か、アプリの HTTP パス (MCP の `/mcp` は POST 前提なので、ALB のヘルスチェックには向かない。TCP チェックを推奨)。
+- **Task definition**
+  - Container image: the image from 3.1 (pushed to ECR)
+  - Ephemeral storage: DB size plus headroom (default 20 GiB, max 200 GiB)
+  - Environment variables: `DB_PATH=/data/memory.db`, `LITESTREAM_REPLICA_URL=s3://<bucket>/sqgraph/memory`, `GROUP_ID=...`
+  - Secrets: inject `OPENAI_API_KEY` from Secrets Manager (or SSM Parameter Store) via `secrets`
+  - Task role: `s3:GetObject`, `s3:PutObject`, `s3:DeleteObject`, `s3:ListBucket` on the target bucket / prefix
+- **Networking**: if you run in a private subnet, create an **S3 gateway VPC endpoint**. Without it, the startup restore and Litestream transfers go through the NAT Gateway and incur per-GB processing charges (section 7)
+- **Service settings (important)**
+  - `desiredCount = 1`, with no autoscaling
+  - Set the deployment configuration to `minimumHealthyPercent = 0`, `maximumPercent = 100`. With the defaults (100 / 200), **the old and new tasks run at the same time, and two writers write to the same replica**
+  - The trade-off is a downtime of a few tens of seconds during deploys
+- **On stop**: ECS sends SIGTERM when a task stops and waits for `stopTimeout` (default 30 seconds). Litestream forwards the signal to the `-exec` child process and exits. However, depending on how the task is stopped, the last few seconds of writes within `sync-interval` may be lost. For data that must not be lost, make it re-sendable from the caller (`sqgraph.memory` ignores re-ingestion of the same `source_ref`, so re-sending creates no duplicates).
+- **Front end**: ALB (target is port 8000 of the task) + authentication (section 6). For the health check, use TCP or an HTTP path of the app (MCP's `/mcp` expects POST, so it is not suitable for an ALB health check; a TCP check is recommended).
 
-### 4.4 Lambda で読み取り専用の検索 API (パターン B / C)
+### 4.4 A read-only search API on Lambda (patterns B / C)
 
-コンテナイメージ (3.1 から Litestream と entrypoint を除いたもの + `awslambdaric`、または Lambda の Python ベースイメージ) で作るのが確実です。
+The reliable way is a container image (the one from 3.1 minus Litestream and the entrypoint, plus `awslambdaric`, or Lambda's Python base image).
 
 ```python
 # handler.py
@@ -223,7 +225,7 @@ _KEY: str | None = None
 
 
 def _db() -> GraphDB:
-    """コールドスタート時 (と LATEST が変わったとき) にスナップショットを /tmp へ落として開く。"""
+    """On cold start (and when LATEST changes), download the snapshot to /tmp and open it."""
     global _DB, _KEY
     bucket = os.environ["SNAPSHOT_BUCKET"]
     key = _S3.get_object(Bucket=bucket, Key="snapshots/LATEST")["Body"].read().decode().strip()
@@ -243,40 +245,40 @@ def handler(event, context):
     return {"statusCode": 200, "body": json.dumps(rows, ensure_ascii=False, default=str)}
 ```
 
-- `LATEST` の確認をリクエストのたびに行いたくなければ、「最後に確認してから 60 秒以内なら確認しない」などの間引きを入れてください。
-- `/tmp` の容量 (エフェメラルストレージ) は既定 512 MB で、最大 10 GB まで増やせます。DB サイズに合わせて設定します。
-- 任意の Cypher を受け付ける API を公開しないでください (上の例は説明用)。実際には `sqgraph.memory.Memory(..., read_only=True)` の `search` など、決まった操作だけを公開します。読み取り専用 DB でも、重いクエリで Lambda のタイムアウトまで CPU を使われる可能性があります。
-- `sqgraph.memory` の検索は**質問の埋め込み**に OpenAI API を呼ぶので、Lambda からインターネット (または NAT) に出られる必要があります。
+- If you don't want to check `LATEST` on every request, throttle it, for example by skipping the check within 60 seconds of the last one.
+- `/tmp` (ephemeral storage) defaults to 512 MB and can be raised to 10 GB. Size it to your DB.
+- Do not expose an API that accepts arbitrary Cypher (the example above is for illustration). In practice, expose only fixed operations such as `search` on `sqgraph.memory.Memory(..., read_only=True)`. Even with a read-only DB, a heavy query can burn CPU until the Lambda timeout.
+- `sqgraph.memory` search calls the OpenAI API to **embed the question**, so the Lambda needs a route to the internet (or a NAT).
 
-### 4.5 GraphRAG のインデックスをバッチで作る (パターン C)
+### 4.5 Building a GraphRAG index as a batch job (pattern C)
 
-`examples/graphrag_openai/graphrag_demo.py index` のようなバッチは、ECS の単発タスク (`aws ecs run-task`)、AWS Batch、EventBridge Scheduler からの定期実行が向いています。処理の最後に 3.4 のスナップショットを S3 に置き、`LATEST` を更新すれば、読み取り側 (4.4) が次のリクエストから新しいデータを使います。
+Batches like `examples/graphrag_openai/graphrag_demo.py index` fit one-off ECS tasks (`aws ecs run-task`), AWS Batch, or scheduled runs from EventBridge Scheduler. At the end of the job, put the snapshot from 3.4 in S3 and update `LATEST`; readers (4.4) then use the new data from the next request.
 
 ---
 
 ## 5. Cloudflare
 
-### 5.1 Workers / D1 / Durable Objects で直接動かせない理由
+### 5.1 Why Workers / D1 / Durable Objects can't run it directly
 
-| サービス | 動かない理由 |
+| Service | Why it doesn't work |
 |---|---|
-| **Workers (JS / Python)** | ローカルのファイルシステムが無く、ネイティブ拡張 (sqlite-vec) もロードできない。Python Workers は Pyodide (WebAssembly) 上で動く |
-| **D1** | 中身は SQLite だが、アクセスは Workers のバインディング経由のクエリだけ。独自の拡張 (sqlite-vec の `vec0`) をロードできず、sqgraph の Python コードも D1 上では動かない |
-| **Durable Objects の SQLite ストレージ** | JS の API から SQL を実行する形で、sqgraph (Python + 拡張) を載せられない |
+| **Workers (JS / Python)** | No local file system, and native extensions (sqlite-vec) cannot be loaded. Python Workers run on Pyodide (WebAssembly) |
+| **D1** | It is SQLite underneath, but access is limited to queries through Workers bindings. You cannot load custom extensions (sqlite-vec's `vec0`), and sqgraph's Python code does not run on D1 |
+| **Durable Objects SQLite storage** | SQL is executed through a JS API, so sqgraph (Python + extension) cannot be hosted on it |
 
-sqgraph を Cloudflare で使うには、**Linux コンテナを動かせる Cloudflare Containers** を使うか、**別の場所 (AWS / VPS) で動かして Cloudflare を前段に置く**かのどちらかになります。
+To use sqgraph on Cloudflare, you either use **Cloudflare Containers, which can run Linux containers**, or **run it somewhere else (AWS / a VPS) and put Cloudflare in front**.
 
 ### 5.2 Cloudflare Containers + Litestream (R2)
 
-Cloudflare Containers では、各コンテナインスタンスが Durable Object (DO) と 1 対 1 で結び付き、DO の名前でインスタンスを指定できます。**常に同じ名前 (例: `"main"`) で呼べば、書き込みインスタンスが 1 つに保たれます**。これで「書き込みは 1 プロセスだけ」という制約を満たせます。
+In Cloudflare Containers, each container instance is bound one-to-one to a Durable Object (DO), and you pick the instance by the DO's name. **If you always address it by the same name (e.g. `"main"`), there is only ever one writer instance.** This satisfies the "only one process may write" constraint.
 
-注意点:
+Caveats:
 
-- **コンテナのディスクはエフェメラル**です。スリープ (既定では一定時間アクセスが無いと停止) や再デプロイでローカルの DB ファイルは消えます。3.3 の entrypoint (起動時に R2 から復元 → Litestream で継続レプリケーション) が前提になります。
-- R2 を FUSE でマウントしてその上に DB を置く方法は、1 章の理由 (WAL + ネットワーク FS) で**使わないでください**。
-- スリープからの復帰時は、**毎回 R2 から DB 全量を復元**するので、その時間ぶん最初のリクエストが遅くなります (R2 はエグレス無料なので料金はほぼかかりませんが、DB が数 GB になると復帰に数十秒かかります)。常時応答が必要なら、スリープまでの時間を長くしてください。DB が大きくなる前提なら、5.3 の構成 (永続ディスクのサーバー + Cloudflare を前段) を選んでください (7 章)。
+- **The container disk is ephemeral.** The local DB file is lost on sleep (by default the container stops after a period without access) or redeploy. This assumes the entrypoint from 3.3 (restore from R2 at startup → continuous replication with Litestream).
+- **Do not mount R2 via FUSE and put the DB on it**, for the reason in section 1 (WAL + network FS).
+- Every wake from sleep **restores the whole DB from R2**, so the first request is slower by that time (R2 has free egress, so it costs almost nothing, but once the DB reaches several GB, waking takes tens of seconds). If you need constant responsiveness, lengthen the time before sleep. If you expect the DB to grow large, choose the setup in 5.3 (a server with a persistent disk + Cloudflare in front) (section 7).
 
-`wrangler.jsonc` の例:
+`wrangler.jsonc` example:
 
 ```jsonc
 {
@@ -293,18 +295,18 @@ Cloudflare Containers では、各コンテナインスタンスが Durable Obje
 }
 ```
 
-Worker (`src/index.ts`) の例:
+Worker (`src/index.ts`) example:
 
 ```ts
 import { Container, getContainer } from "@cloudflare/containers";
 
 export class SqgraphContainer extends Container<Env> {
   defaultPort = 8000;
-  sleepAfter = "30m"; // アクセスが無くなってからスリープするまで
+  sleepAfter = "30m"; // how long after the last access before sleeping
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
-    // シークレットは `wrangler secret put OPENAI_API_KEY` などで登録し、コンテナの環境変数に渡す
+    // Register secrets with `wrangler secret put OPENAI_API_KEY` etc. and pass them to the container as environment variables
     this.envVars = {
       OPENAI_API_KEY: env.OPENAI_API_KEY,
       LITESTREAM_ACCESS_KEY_ID: env.R2_ACCESS_KEY_ID,
@@ -318,159 +320,159 @@ export class SqgraphContainer extends Container<Env> {
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
-    // 認証 (6 章) を通ったリクエストだけをコンテナへ。書き込みインスタンスは常に "main" の 1 つ
+    // Forward only requests that passed authentication (section 6) to the container. The writer instance is always the single "main"
     return getContainer(env.SQGRAPH, "main").fetch(request);
   },
 };
 ```
 
-- `deploy/Dockerfile` はリポジトリのルートをビルドコンテキストにする前提です。wrangler の設定でビルドコンテキストをルートに指定してください (設定キーは wrangler のバージョンで確認)。
-- `litestream.yml` には R2 用の `endpoint: https://<ACCOUNT_ID>.r2.cloudflarestorage.com` と `region: auto` を設定します (3.2)。R2 の API トークン (S3 互換のアクセスキー) は、対象バケットだけに権限を絞って発行してください。
-- Cloudflare Containers の API (`@cloudflare/containers` のクラス名 / プロパティ名、`wrangler` の設定キー、インスタンスの種類とディスク容量の上限、スナップショット機能の有無) は更新が続いています。ここに書いたものは執筆時点の形なので、[公式ドキュメント](https://developers.cloudflare.com/containers/) で最新の書き方を確認してください。
+- `deploy/Dockerfile` assumes the repository root as its build context. Configure wrangler to use the root as the build context (check the config key for your wrangler version).
+- In `litestream.yml`, set `endpoint: https://<ACCOUNT_ID>.r2.cloudflarestorage.com` and `region: auto` for R2 (3.2). Issue the R2 API token (S3-compatible access key) with permissions limited to the target bucket.
+- The Cloudflare Containers API (the `@cloudflare/containers` class and property names, `wrangler` config keys, instance types and disk limits, whether a snapshot feature exists) is still evolving. What is written here reflects the state at the time of writing; check the [official documentation](https://developers.cloudflare.com/containers/) for current syntax.
 
-### 5.3 AWS / VPS で動かして Cloudflare を前段に置く (実用的な構成)
+### 5.3 Running on AWS / a VPS with Cloudflare in front (the practical setup)
 
-DB とアプリは 4.2 の EC2 (または任意の VPS) に置き、Cloudflare は**入口と認証**だけを担当する構成です。サーバー側にインバウンドのポートを開けずに済みます。
+The DB and app live on the EC2 instance from 4.2 (or any VPS), and Cloudflare handles only **ingress and authentication**. You don't need to open any inbound port on the server.
 
-1. サーバーで MCP サーバーを `--host 127.0.0.1 --port 8000` で起動
-2. 同じサーバーで `cloudflared` を動かし、Cloudflare Tunnel で `https://memory.example.com` → `http://127.0.0.1:8000` をつなぐ
-3. Cloudflare Access (Zero Trust) でそのホスト名にアプリケーションを作り、人は SSO、エージェントは **サービストークン** で認証させる (6 章)
-4. バックアップは Litestream から R2 (または S3) へ
+1. Start the MCP server on the server with `--host 127.0.0.1 --port 8000`
+2. Run `cloudflared` on the same server and connect `https://memory.example.com` → `http://127.0.0.1:8000` with Cloudflare Tunnel
+3. Create an application for that hostname in Cloudflare Access (Zero Trust); authenticate people with SSO and agents with a **service token** (section 6)
+4. Back up from Litestream to R2 (or S3)
 
-### 5.4 R2 をスナップショット置き場にする (パターン B / C)
+### 5.4 Using R2 as snapshot storage (patterns B / C)
 
-3.4 のスナップショットを R2 に置き、読み取り側 (Containers、AWS の Lambda、社内 PC など) がダウンロードして `read_only=True` で開きます。R2 はデータ転送 (エグレス) が無料なので、多くの読み取り側に配る用途と相性が良いです。
-
----
-
-## 6. MCP サーバーを公開するときの認証
-
-`python -m sqgraph.memory.mcp --transport streamable-http` は**認証を持っていません**。そのまま `0.0.0.0` で公開すると、URL を知っている人は誰でも記憶を読み書きできます。必ず前段で認証してください。
-
-| 方法 | 設定 | クライアント (Claude Code) 側 |
-|---|---|---|
-| **Cloudflare Access のサービストークン** | Access のアプリケーションに「Service Auth」ポリシーを作り、トークンを発行 | `claude mcp add --transport http sqgraph-memory https://memory.example.com/mcp --header "CF-Access-Client-Id: <id>" --header "CF-Access-Client-Secret: <secret>"` |
-| **リバースプロキシで Bearer トークン** | Caddy / nginx で `Authorization: Bearer <token>` を検証してから `127.0.0.1:8000` に流す (ECS なら同じタスクのサイドカーにする) | `--header "Authorization: Bearer <token>"` |
-| **VPN / プライベートネットワーク** | 社内 VPN / Tailscale / VPC 内からのみアクセス可能にする | 通常の URL |
-
-あわせて、サーバー側の制限も必ず設定してください。
-
-- `--group-id` で名前空間を固定する (他の `group_id` の読み書きを拒否)
-- `--allowed-channels` で、その MCP サーバーから読めるチャンネルを絞る (指定すると ACL を迂回する `read_cypher` は自動で無効になる)
-- 読むだけのエージェントには `--read-only` のサーバーを別に立てる (`add_memory` が登録されない)
-- ビューワー (`python -m sqgraph.viewer`) は DB を読み取り専用で開きますが、認証はありません。公開する場合は同じく前段で認証してください
-
-> リバースプロキシ経由でアクセスしたときに `421 Misdirected Request` などが返る場合は、MCP SDK の Host ヘッダー検証 (DNS リバインディング対策) に引っかかっている可能性があります。使っている `mcp` パッケージのバージョンの設定方法を確認してください。
+Put the snapshots from 3.4 in R2, and readers (Containers, AWS Lambda, internal PCs, etc.) download them and open with `read_only=True`. R2 has free data transfer (egress), which makes it a good fit for distributing to many readers.
 
 ---
 
-## 7. 転送量とコスト
+## 6. Authenticating a public MCP server
 
-DB が大きくなったときに気になるのは「起動のたびに DB 全量を転送して料金がかかるのでは」という点です。結論は次のとおりです。
+`python -m sqgraph.memory.mcp --transport streamable-http` has **no authentication**. If you expose it on `0.0.0.0` as is, anyone who knows the URL can read and write the memory. Always put authentication in front of it.
 
-- **全量の転送が起きるのは、ディスクが消える構成だけ** (Fargate / Cloudflare Containers / Lambda)。永続ディスク (EBS) なら、全量の転送は障害からの復旧時だけです
-- **同じリージョンの S3 からのダウンロードは転送料が無料**。料金が膨らむのは NAT Gateway 経由・リージョン越え・インターネット越えのとき
-- 多くの場合、料金より先に**起動時間**が問題になります
-
-### 構成ごとの転送
-
-| 構成 | 起動のたびに全量ダウンロード | 普段の転送 |
+| Method | Setup | Client (Claude Code) side |
 |---|---|---|
-| EC2 + EBS / ECS on EC2 + EBS | **しない** (`-if-db-not-exists` により、ディスクが空のときだけ復元) | Litestream の変更差分 (WAL) + 定期的な全体スナップショットのアップロード |
-| ECS on Fargate | **する** (タスクの起動・デプロイ・再起動のたび) | 同上 |
-| Cloudflare Containers | **する** (スリープからの復帰・再デプロイのたび) | 同上 |
-| Lambda (読み取り側) | **する** (実行環境のコールドスタートごと、スナップショットの更新ごと) | なし |
-| パターン B の読み取り N 台 | スナップショットの更新ごとに N 台がそれぞれ全量 | 更新頻度 × 台数 × DB サイズ |
+| **Cloudflare Access service token** | Create a "Service Auth" policy on the Access application and issue a token | `claude mcp add --transport http sqgraph-memory https://memory.example.com/mcp --header "CF-Access-Client-Id: <id>" --header "CF-Access-Client-Secret: <secret>"` |
+| **Bearer token at a reverse proxy** | Verify `Authorization: Bearer <token>` in Caddy / nginx, then forward to `127.0.0.1:8000` (on ECS, run it as a sidecar of the same task) | `--header "Authorization: Bearer <token>"` |
+| **VPN / private network** | Allow access only from a corporate VPN / Tailscale / inside the VPC | Plain URL |
 
-S3 / R2 へのアップロード (イングレス) は無料で、かかるのはリクエスト料と保存料です。
+Also be sure to configure the server-side limits.
 
-### 経路ごとの料金 (目安)
+- Fix the namespace with `--group-id` (reads and writes to other `group_id`s are rejected)
+- Narrow the channels readable from that MCP server with `--allowed-channels` (when specified, `read_cypher`, which would bypass the ACL, is disabled automatically)
+- For read-only agents, run a separate server with `--read-only` (`add_memory` is not registered)
+- The viewer (`python -m sqgraph.viewer`) opens the DB read-only but has no authentication. If you expose it, put authentication in front of it as well
 
-AWS はバージニア北部の目安です (東京リージョンはやや高い)。最新の料金は各社の料金ページで確認してください。
-
-| 経路 | 料金 | 5 GB の DB を 1 回転送 |
-|---|---|---|
-| S3 → 同じリージョンの EC2 / Fargate / Lambda | 転送料無料 (リクエスト料のみ) | ほぼ $0 |
-| 上記が **NAT Gateway を通る** | 処理料 約 $0.045/GB | 約 $0.23 |
-| S3 → 別のリージョン | 約 $0.02/GB | 約 $0.10 |
-| S3 → インターネット (社内 PC / Cloudflare など) | 約 $0.09/GB | 約 $0.45 |
-| **R2** → どこへでも | エグレス無料 (読み取りリクエスト料のみ) | ほぼ $0 |
-
-料金が膨らむ例:
-
-- Fargate を NAT 経由で 1 日 10 回再起動: 5 GB × 10 × $0.045 ≒ **$2.3/日**
-- 読み取り 10 台にインターネット越しで毎時スナップショットを配布: 5 GB × 10 × 24 × $0.09 ≒ **$108/日**
-
-見落としやすい**保存料**: 日次スナップショットを 30 日分残すと 5 GB × 30 = 150 GB で、S3 標準で約 $3.5/月、R2 で約 $2.3/月です。ライフサイクルルールで古いものを消してください。
-
-### 起動時間
-
-同じリージョン内のダウンロードは大まかに毎秒数百 MB です。1 GB なら数秒、10 GB なら数十秒〜1 分以上、起動 (Lambda のコールドスタート、Containers のスリープ復帰、Fargate のデプロイ) が遅くなります。Litestream の復元はスナップショットに差分を適用するので、単純なダウンロードより少し長くかかります。
-
-### DB サイズの目安
-
-容量の大半はベクトル (1536 次元 × 4 バイト = 1 本あたり約 6 KB) です。
-
-- 実測: `chatlog_vector` 形式 (1 メッセージ 1 ベクトル) で、711 メッセージが約 8 MB (1 メッセージあたり約 11 KB)
-- 推定: `sqgraph.memory` は 1 メッセージから 1〜2 本のファクト (それぞれベクトル付き) ができるので、1 メッセージあたり 10〜15 KB 程度
-- 10 万メッセージで 1〜1.5 GB 程度。社内 Discord 規模なら数 GB に届くまでには時間がかかります
-
-### 対策 (効果の大きい順)
-
-1. **書き込み側は永続ディスクにする** (EC2 + EBS / ECS on EC2 + EBS)。全量の転送が障害時だけになります。DB が大きくなる前提なら、これを基本にしてください
-2. **NAT を通さない**。S3 のゲートウェイ型 VPC エンドポイント (無料) を作ると、Fargate / Lambda から S3 への転送が NAT を通らなくなります
-3. **配布は R2 にする**。読み取り側がリージョン外やインターネットにある場合、転送料が 0 になります
-4. **ダウンロードの回数を減らす**
-   - Lambda は `LATEST` が変わったときだけダウンロードする (4.4 の例はそうなっている)。プロビジョンド同時実行でコールドスタートを減らす
-   - スナップショットの更新頻度を、読み取り側が必要とする鮮度に合わせて下げる
-   - Cloudflare Containers は `sleepAfter` を長くする
-5. **DB 自体を小さくする**。`text-embedding-3-small` は次元数を減らせます (1536 → 512 でベクトルが約 1/3。検索精度は少し落ちる)。削除や更新が多かった DB は `VACUUM` で空き領域を詰める
-6. **将来の選択肢**: Litestream v0.5 には、S3 上のレプリカを全量ダウンロードせずに必要なページだけ読む VFS 拡張があります。ただし sqgraph は現状この VFS を指定して DB を開けないので、使うにはコードの変更が必要です
-
-## 8. 運用
-
-### バックアップとリストア
-
-- **Litestream**: レプリカから任意の時点に戻せます。`litestream restore -config /etc/litestream.yml -o /tmp/restored.db /data/memory.db` で別名に復元し、中身を確認してから差し替えてください。
-- **定期スナップショット**: 3.4 の `VACUUM INTO` を日次などで取り、S3 / R2 のライフサイクルルールで古いものを消します。Litestream とは別系統の保険になります。
-- **リストア訓練**: 年に数回は、別環境で復元して `GraphDB(path, read_only=True).stats()` や `Memory(...).stats()` が期待どおりになるか確認してください。
-
-### sqgraph のバージョンを上げるとき
-
-- DB のスキーマのバージョン (`_meta.schema_version`) は、**書き込み可能で開いたとき**に自動で上がります (例: v2 → v3 でリレーションシップ索引のメタデータ列が追加)。読み取り専用で開いたときは移行せずに読みます。
-- パターン B / C では、**書き込み側を先に**新しいバージョンにし、そのあとで読み取り側を上げてください。
-- `sqgraph.memory` の保存形式は、ファクトがノード形式だった古い DB を移行しません (開くとエラーで止まります)。形式が変わる更新のときは DB を作り直してください。
-
-### 性能と容量の目安
-
-- 大量に投入したあとや索引を作ったあとは `db.analyze()` を実行して、クエリプランナの統計を更新してください (`close()` でも自動で行います)。
-- ベクトル索引は `vec0` による全件スキャンです。数十万ベクトル程度までは実用的ですが、それを超える場合はベクトル検索だけ外部サービス (OpenSearch / Vectorize など) に分けることを検討してください。
-- `sqgraph.memory` の取り込みは 1 件あたり LLM を 2〜4 回呼び、直列で処理します。取り込みの量が多い bot では、キューに積んで 1 つのワーカーで順に処理してください (1 メッセージあたり約 $0.004 の目安は README を参照)。
-
-### 監視
-
-- ディスク使用量 (DB + WAL)、Litestream のプロセスが動いているか、レプリカの最終更新時刻
-- アプリのエラーログ (`SqgraphError`、OpenAI API の 429 / 5xx)
-- LLM のコスト (`UsageTracker` の集計をログに出す)
+> If you get `421 Misdirected Request` or similar when accessing through a reverse proxy, you may be hitting the MCP SDK's Host header validation (DNS rebinding protection). Check how to configure it for the version of the `mcp` package you use.
 
 ---
 
-## 9. チェックリスト
+## 7. Transfer volume and cost
 
-- [ ] 実行環境で 1 章のチェックスクリプトが通る (SQLite 3.38 以上、拡張ロード可)
-- [ ] 書き込みインスタンスが常に 1 つ (オートスケールなし / デプロイで新旧が重ならない / Cloudflare は固定名の DO)
-- [ ] DB ファイルがローカルディスク上にある (EFS / NFS / FUSE 上ではない)
-- [ ] Litestream または定期スナップショットでバックアップしており、復元を試したことがある
-- [ ] 読み取り側に配るのは `VACUUM INTO` で作ったスナップショット
-- [ ] DB が大きくなる前提なら書き込み側は永続ディスク。Fargate / Lambda を使うなら S3 のゲートウェイ型 VPC エンドポイントがあり、NAT を通っていない (7 章)
-- [ ] MCP サーバー / ビューワーの前段に認証がある。`0.0.0.0` で認証なしに公開していない
-- [ ] `--group-id` / `--allowed-channels` / `--read-only` を用途に合わせて設定した
-- [ ] `OPENAI_API_KEY` や R2 / S3 の認証情報をシークレット管理 (Secrets Manager / `wrangler secret`) で渡しており、イメージやリポジトリに含めていない
+When the DB gets large, the concern is "won't I pay to transfer the whole DB on every start?" In short:
 
-## 参考
+- **A full transfer happens only on setups where the disk disappears** (Fargate / Cloudflare Containers / Lambda). With a persistent disk (EBS), a full transfer happens only when recovering from a failure
+- **Downloads from S3 within the same region are free of transfer charges.** Costs balloon only when going through a NAT Gateway, across regions, or over the internet
+- In many cases, **startup time** becomes a problem before cost does
 
-- [Litestream](https://litestream.io/) (設定: [Configuration File](https://litestream.io/reference/config/)、[S3 互換サービス](https://litestream.io/guides/s3-compatible/))
-- [SQLite: WAL モード](https://www.sqlite.org/wal.html) (ネットワークファイルシステムでの制約)
+### Transfer by setup
+
+| Setup | Full download on every start | Regular transfer |
+|---|---|---|
+| EC2 + EBS / ECS on EC2 + EBS | **No** (`-if-db-not-exists` restores only when the disk is empty) | Litestream change deltas (WAL) + periodic full snapshot uploads |
+| ECS on Fargate | **Yes** (every task start, deploy, restart) | Same as above |
+| Cloudflare Containers | **Yes** (every wake from sleep, every redeploy) | Same as above |
+| Lambda (reader) | **Yes** (every execution-environment cold start, every snapshot update) | None |
+| N readers in pattern B | Each of the N downloads the full DB on every snapshot update | Update frequency × number of readers × DB size |
+
+Uploads to S3 / R2 (ingress) are free; you pay only request and storage fees.
+
+### Cost by path (approximate)
+
+AWS figures are approximate for US East (N. Virginia); Tokyo is somewhat higher. Check each provider's pricing page for current rates.
+
+| Path | Price | One transfer of a 5 GB DB |
+|---|---|---|
+| S3 → EC2 / Fargate / Lambda in the same region | No transfer charge (request fees only) | About $0 |
+| The above **through a NAT Gateway** | Processing fee about $0.045/GB | About $0.23 |
+| S3 → another region | About $0.02/GB | About $0.10 |
+| S3 → internet (internal PC / Cloudflare, etc.) | About $0.09/GB | About $0.45 |
+| **R2** → anywhere | Free egress (read request fees only) | About $0 |
+
+Examples of costs ballooning:
+
+- Restarting Fargate 10 times a day through a NAT: 5 GB × 10 × $0.045 ≈ **$2.3/day**
+- Distributing an hourly snapshot to 10 readers over the internet: 5 GB × 10 × 24 × $0.09 ≈ **$108/day**
+
+An easily overlooked **storage cost**: keeping 30 days of daily snapshots is 5 GB × 30 = 150 GB, about $3.5/month on S3 Standard and about $2.3/month on R2. Use lifecycle rules to delete old ones.
+
+### Startup time
+
+Downloads within the same region run at roughly several hundred MB per second. 1 GB takes a few seconds; 10 GB takes tens of seconds to over a minute, slowing startup (Lambda cold start, Containers waking from sleep, Fargate deploys). A Litestream restore applies deltas to a snapshot, so it takes slightly longer than a plain download.
+
+### DB size estimates
+
+Most of the space is vectors (1536 dimensions × 4 bytes = about 6 KB per vector).
+
+- Measured: in the `chatlog_vector` format (one vector per message), 711 messages take about 8 MB (about 11 KB per message)
+- Estimated: `sqgraph.memory` produces 1–2 facts (each with a vector) per message, so about 10–15 KB per message
+- 100,000 messages come to about 1–1.5 GB. At the scale of an internal Discord, it takes a long time to reach several GB
+
+### Countermeasures (most effective first)
+
+1. **Put the writer on a persistent disk** (EC2 + EBS / ECS on EC2 + EBS). A full transfer then happens only after a failure. If you expect the DB to grow large, make this your default
+2. **Avoid the NAT.** Creating an S3 gateway VPC endpoint (free) keeps Fargate / Lambda traffic to S3 off the NAT
+3. **Distribute through R2.** When readers are outside the region or on the internet, transfer cost drops to 0
+4. **Reduce the number of downloads**
+   - Have Lambda download only when `LATEST` changes (the example in 4.4 does this). Reduce cold starts with provisioned concurrency
+   - Lower the snapshot update frequency to the freshness readers actually need
+   - For Cloudflare Containers, lengthen `sleepAfter`
+5. **Make the DB itself smaller.** `text-embedding-3-small` lets you reduce the number of dimensions (1536 → 512 shrinks vectors to about 1/3, at a small cost in search accuracy). For DBs with many deletions or updates, run `VACUUM` to reclaim free space
+6. **A future option**: Litestream v0.5 has a VFS extension that reads only the needed pages from a replica on S3 without downloading the whole thing. However, sqgraph currently cannot open a DB with that VFS specified, so using it would require code changes
+
+## 8. Operations
+
+### Backup and restore
+
+- **Litestream**: you can restore to any point in time from the replica. Restore under a different name with `litestream restore -config /etc/litestream.yml -o /tmp/restored.db /data/memory.db`, check the contents, then swap it in.
+- **Periodic snapshots**: take the `VACUUM INTO` snapshot from 3.4 daily or so, and delete old ones with S3 / R2 lifecycle rules. This is insurance on a separate path from Litestream.
+- **Restore drills**: a few times a year, restore in a separate environment and confirm that `GraphDB(path, read_only=True).stats()` and `Memory(...).stats()` return what you expect.
+
+### Upgrading sqgraph
+
+- The DB schema version (`_meta.schema_version`) is upgraded automatically **when the DB is opened for writing** (for example, v2 → v3 adds the relationship-index metadata column). When opened read-only, it is read without migrating.
+- In patterns B / C, upgrade **the writer first**, then the readers.
+- The `sqgraph.memory` storage format does not migrate old DBs where facts were stored as nodes (opening one stops with an error). When an update changes the format, rebuild the DB.
+
+### Performance and capacity guidelines
+
+- After a large ingestion or after building indexes, run `db.analyze()` to refresh the query planner statistics (`close()` also does this automatically).
+- The vector index is a full scan via `vec0`. It is practical up to a few hundred thousand vectors; beyond that, consider moving only vector search to an external service (OpenSearch / Vectorize, etc.).
+- `sqgraph.memory` ingestion calls the LLM 2–4 times per item and processes them serially. For a bot with heavy ingestion, queue the items and process them in order with a single worker (for the roughly $0.004-per-message estimate, see [the cost estimates in memory.md](memory.md#cost-estimates-gpt-54-mini-text-embedding-3-small)).
+
+### Monitoring
+
+- Disk usage (DB + WAL), whether the Litestream process is running, and the replica's last update time
+- Application error logs (`SqgraphError`, OpenAI API 429 / 5xx)
+- LLM cost (log the `UsageTracker` totals)
+
+---
+
+## 9. Checklist
+
+- [ ] The check script from section 1 passes in the runtime (SQLite 3.38 or later, extension loading available)
+- [ ] There is always exactly one writer instance (no autoscaling / old and new never overlap during deploys / a fixed-name DO on Cloudflare)
+- [ ] The DB file is on a local disk (not on EFS / NFS / FUSE)
+- [ ] Backups run via Litestream or periodic snapshots, and you have tried a restore
+- [ ] What you distribute to readers is a snapshot made with `VACUUM INTO`
+- [ ] If the DB is expected to grow large, the writer is on a persistent disk. If you use Fargate / Lambda, an S3 gateway VPC endpoint exists and traffic does not go through the NAT (section 7)
+- [ ] There is authentication in front of the MCP server / viewer. Nothing is exposed on `0.0.0.0` without authentication
+- [ ] `--group-id` / `--allowed-channels` / `--read-only` are set to fit the use case
+- [ ] `OPENAI_API_KEY` and R2 / S3 credentials are passed through secret management (Secrets Manager / `wrangler secret`) and are not included in the image or repository
+
+## References
+
+- [Litestream](https://litestream.io/) (configuration: [Configuration File](https://litestream.io/reference/config/), [S3-compatible services](https://litestream.io/guides/s3-compatible/))
+- [SQLite: Write-Ahead Logging](https://www.sqlite.org/wal.html) (limitations on network file systems)
 - [Cloudflare Containers](https://developers.cloudflare.com/containers/) / [Durable Object Container API](https://developers.cloudflare.com/containers/api/durable-object-container/)
-- [Cloudflare Access のサービストークン](https://developers.cloudflare.com/cloudflare-one/identity/service-tokens/)
-- [Amazon ECS のデプロイ設定 (minimumHealthyPercent / maximumPercent)](https://docs.aws.amazon.com/AmazonECS/latest/developerguide/service_definition_parameters.html)
+- [Cloudflare Access service tokens](https://developers.cloudflare.com/cloudflare-one/identity/service-tokens/)
+- [Amazon ECS deployment configuration (minimumHealthyPercent / maximumPercent)](https://docs.aws.amazon.com/AmazonECS/latest/developerguide/service_definition_parameters.html)
