@@ -19,6 +19,7 @@ from sqgraph.memory.core import (
     MIN_SIMILARITY_NO_MODEL,
     MIN_SIMILARITY_UNKNOWN_MODEL,
     NO_HITS_HINT,
+    NO_MATCH_TEXT,
     PREPARE_MIN_RELATED,
     default_min_similarity,
 )
@@ -263,7 +264,7 @@ def test_answer_uses_the_gate():
     mem = personal_memory()
     llm = mem.llm
     ans = mem.answer("ユーザーの年収はいくら？", group_id=G)
-    assert ans.hits == [] and "見つかりません" in ans.text and llm.count("answer") == 0
+    assert ans.hits == [] and ans.text == NO_MATCH_TEXT and llm.count("answer") == 0
     ans = mem.answer("猫について", group_id=G)
     assert [h.fact for h in ans.hits] == ["ユーザーは猫を飼っている"] and llm.count("answer") == 1
     assert mem.answer("猫について", group_id=G, min_similarity=0.99).hits  # explicit per-call threshold

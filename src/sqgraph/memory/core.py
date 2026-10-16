@@ -106,6 +106,9 @@ MIN_SIMILARITY_UNKNOWN_MODEL = 0.30  # an embedder with an unrecognised model na
 MIN_SIMILARITY_NO_MODEL = 0.25  # embedders that do not name a model (FakeEmbedder: hashed character trigrams)
 EXPAND_SLACK = 0.05  # facts reached through the graph (weakly) need only ``min_similarity - EXPAND_SLACK``
 RELATIVE_MARGIN = 0.08  # vector-only candidates must be within this of the best candidate's similarity
+
+NO_MATCH_TEXT = "No matching memories found."  # ``Answer.text`` when nothing matched (the LLM is not called)
+_UNSET: Any = object()  # sentinel: "argument not given" (None is a real value for ``answer(language=...)``)
 # prepare_episode (agent extraction) is more permissive than search: a missed fact may be a missed contradiction
 PREPARE_ENTITY_SLACK = 0.05  # candidate entities (vector match): min_similarity - this
 PREPARE_FACT_SLACK = 0.10  # related facts: min_similarity - this ...
@@ -433,6 +436,10 @@ class Memory:
         ``expand_slack`` lowers that bar for facts reached through the entity graph; ``relative_margin`` drops
         vector-only candidates that are further than this below the best candidate.
 
+    answer_language:
+        Language of :meth:`answer`, as a language name such as ``"English"`` (default) or ``"Japanese"``.
+        ``None`` = the language of the question. :meth:`answer` can override it per call with ``language=``.
+
     A database opened here has ``PRAGMA secure_delete=ON``: forgotten data is overwritten, not left in free pages.
     """
 
@@ -453,7 +460,9 @@ class Memory:
         min_similarity: float | None = None,
         expand_slack: float = EXPAND_SLACK,
         relative_margin: float = RELATIVE_MARGIN,
+        answer_language: str | None = prompts.DEFAULT_ANSWER_LANGUAGE,
     ) -> None:
+        self.answer_language = answer_language
         self._allow_embedder_change = allow_embedder_change
         self.min_similarity = self._check_similarity(min_similarity)
         self.expand_slack = float(expand_slack)
@@ -2715,8 +2724,14 @@ class Memory:
         center_entity: str | None = None,
         limit: int = 20,
         min_similarity: float | None = None,
+        language: str | None = _UNSET,
     ) -> Answer:
-        """Retrieve facts for ``question`` and let the LLM answer in Japanese, citing sources and validity.
+        """Retrieve facts for ``question`` and let the LLM answer, citing sources and validity.
+
+        The answer is written in ``language`` (a language name such as ``"English"`` or ``"Japanese"``;
+        ``None`` = the language of the question), default :attr:`answer_language` (English). When nothing
+        matches, the LLM is not called and ``text`` is the fixed English :data:`NO_MATCH_TEXT`; callers that
+        want another language can check ``not answer.hits`` and substitute their own text.
 
         Retrieval includes ended facts (history) and, when ``as_of`` is not given, planned facts that have
         not started yet; each is labelled with its ``status`` so the model can tell them apart.
@@ -2736,7 +2751,7 @@ class Memory:
             min_similarity=min_similarity,
         )
         if not hits:
-            return Answer(question, "該当する記憶が見つかりませんでした。", [], [], self._local(self._as_of(as_of)) if as_of else None)
+            return Answer(question, NO_MATCH_TEXT, [], [], self._local(self._as_of(as_of)) if as_of else None)
         payload = {
             "now": local_with_weekday(self._now(), self.tz),
             "as_of": self._local(self._as_of(as_of)) if as_of is not None else None,
@@ -2761,8 +2776,9 @@ class Memory:
             ],
         }
         self._llm_calls += 1
+        lang = self.answer_language if language is _UNSET else language
         text = llm.complete_text(
-            prompts.ANSWER_SYSTEM, json.dumps(payload, ensure_ascii=False, separators=(",", ":")), task="answer"
+            prompts.answer_system(lang), json.dumps(payload, ensure_ascii=False, separators=(",", ":")), task="answer"
         )
         views = [self._entity_view(e, allowed, group) for e in ents[:4]]
         return Answer(question, text, hits, views, payload["as_of"])

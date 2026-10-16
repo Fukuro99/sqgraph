@@ -10,6 +10,21 @@ from typing import Any
 
 ENTITY_TYPES = ["Person", "Service", "Repository", "Team", "Organization", "Ticket", "Project", "Event", "Place", "Concept", "Other"]
 
+# What is worth remembering; shared by every extraction prompt so the server-side and agent-side rules agree.
+DURABLE_KNOWLEDGE = (
+    "who owns or works on what, status, decisions, plans and schedules, dependencies, where things are kept, absences, "
+    "problems and their causes, and the user's preferences, standing instructions to the assistant, personal facts and habits"
+)
+
+# Shared naming / reference rules for entities.
+_ENTITY_NAMING = """- name: the canonical, most complete name, without honorifics or titles. A product version is the product unless the version itself is the topic ("Rails", not "Rails 7.1"). Name tickets and PRs with their repository or project ("api-server PR #42"), never a bare number.
+- Resolve pronouns and vague references ("it", "that issue") to the concrete entity using the earlier messages and the author; never output the pronoun itself."""
+
+# Shared rules for the temporal fields of a fact.
+_FACT_TIME = """- valid_at: when the fact starts being true, as ISO 8601 local time (a date alone is fine), computed from the message time ("from next week", "tomorrow", "on the 14th"; take the nearest sensible year). Only if the message states or implies a start; otherwise null (= from the message time). Never guess.
+- invalid_at: when it stops being true, if the message says so: the first moment it no longer holds (away 14-16 March -> 17 March), else null.
+- modality: definite | planned (future intention or schedule) | tentative (unsure, proposal)."""
+
 
 def obj_schema(**props: Any) -> dict[str, Any]:
     return {"type": "object", "properties": props, "required": list(props), "additionalProperties": False}
@@ -21,17 +36,15 @@ def _nullable(t: str) -> dict[str, Any]:
 
 # --------------------------------------------------------------------------- 1. extract entities
 
-EXTRACT_ENTITIES_SYSTEM = f"""You build a knowledge graph from chat messages or notes (team chat, or a user's notes to their AI assistant; mostly Japanese).
-Task: list the entities the CURRENT message talks about, and say whether it contains memorable facts.
+EXTRACT_ENTITIES_SYSTEM = f"""You build a knowledge graph from chat messages and notes (team chat, or a user's notes to their AI assistant), in any language.
+Task: list the entities the CURRENT message talks about, and say whether it contains facts worth remembering.
 
 Entity types: {", ".join(ENTITY_TYPES)}.
-Rules:
-- Extract people (use the name as written, without honorifics like さん), services/systems/repos/tools/software versions worth tracking, teams/orgs, tickets/PR numbers, projects, events/meetings, places (cities, venues, offices), and important concepts/policies.
-- Resolve pronouns and vague references (それ, あれ, this, 例の件) to the concrete entity using `context` (earlier messages) and `author`. Never output the pronoun itself.
-- Use the most complete canonical name (e.g. "notify-bot", "Ruby on Rails"; a version of a product is the product: output "Rails", not "Rails 7.1", unless the version itself is the topic). Name PRs/issues with their repo or project ("iac-terraform PR #278"), never a bare number.
-- Do NOT extract: the author (added automatically), greetings, generic nouns (タスク, 会議 without a specific name), dates, or entities only present in `context`.
-- description: one short phrase about what the entity is, as far as this message tells.
-- has_facts: true if the message states or implies something worth remembering later (who owns/does what, status, decision, plan, schedule, absence, dependency, problem, request assignment; a user's preferences, standing instructions to the assistant like 〜してほしい / 〜は使わない, personal facts such as where they live or what they plan, habits). false for pure chit-chat, thanks, acknowledgements, questions without new info."""
+- Extract people, services/systems/repositories/tools, teams/organizations, tickets/PRs, projects, events/meetings, places and important concepts/policies.
+{_ENTITY_NAMING} The earlier messages are in `context`.
+- Do NOT extract the author (added automatically), greetings, generic nouns without a specific name ("the meeting", "a task"), dates, or entities that appear only in `context`.
+- description: one short phrase saying what the entity is, as far as this message tells.
+- has_facts: true if the message states or implies durable knowledge: {DURABLE_KNOWLEDGE}. false for chit-chat, thanks, acknowledgements and questions that add no information."""
 
 EXTRACT_ENTITIES_SCHEMA = obj_schema(
     entities={
@@ -48,7 +61,7 @@ EXTRACT_ENTITIES_SCHEMA = obj_schema(
 # --------------------------------------------------------------------------- 2. resolve entities
 
 RESOLVE_ENTITIES_SYSTEM = """You deduplicate knowledge-graph entities.
-For each new entity, decide which existing candidate (if any) is the SAME real-world thing. Consider aliases, abbreviations, romanised/Japanese spellings, and the descriptions.
+For each new entity, decide which existing candidate (if any) is the SAME real-world thing. Consider aliases, abbreviations, transliterations and other spellings or scripts, and the descriptions.
 Return match = the candidate `id`, or null if it is a different / new entity. Different versions, different repos or different people with similar names are NOT the same. When unsure, return null."""
 
 RESOLVE_ENTITIES_SCHEMA = obj_schema(
@@ -60,19 +73,16 @@ RESOLVE_ENTITIES_SCHEMA = obj_schema(
 
 # --------------------------------------------------------------------------- 3. extract facts
 
-EXTRACT_FACTS_SYSTEM = """You extract temporal facts for a knowledge graph from ONE chat message or note (team chat or a user's notes to their AI assistant; mostly Japanese).
-Input: `entities` (idx, name, type, current summary), `author`, `occurred_at` (local time, weekday, UTC offset), `context` (earlier messages, only for resolving references), `message`.
+EXTRACT_FACTS_SYSTEM = f"""You extract temporal facts for a knowledge graph from ONE chat message or note, in any language.
+Input: `entities` (idx, name, type, aliases, current summary), `author`, `occurred_at` (the message time: local time with weekday and UTC offset), `context` (earlier messages, only for resolving references), `known_relations`, `message`.
 
-Output `facts`: relations between entities (subject idx -> object idx) or attributes of one entity (object null).
-- Only facts stated or clearly implied by `message`. Do not repeat facts that only appear in `context` or in summaries.
-- `fact`: one self-contained sentence in the message language that names its entities (no pronouns), e.g. "Bob は認証基盤の権限管理を担当している".
-- `relation`: UPPER_SNAKE_CASE verb phrase (WORKS_ON, OWNS, MANAGES, DEPENDS_ON, HAS_STATUS, PLANS_TO, ABSENT, DECIDED, USES, HANDS_OVER_TO ...). Reuse a name from `known_relations` (the graph's vocabulary, most used first) whenever one fits; use the active direction (OWNS, not OWNED_BY).
-- valid_at: when the fact starts being true in the world, ISO 8601 (local time, no timezone, date-only is fine). Give a value ONLY if the message states or implies a start time (dates, 来週から, 明日, 9/14, 先月...), computed from `occurred_at` (assume the nearest sensible year). Otherwise null (= true from `occurred_at` on). Never guess a date.
-- invalid_at: when the fact stops being true if the message says so (e.g. absence 9/14-9/16 -> 2026-09-17: the first moment it is no longer true), else null.
-- modality: definite | planned (future intention/schedule) | tentative (unsure, proposal, question-like).
-- A statement that changes an earlier state (new owner, new status) is a normal new fact; contradictions are handled later.
-- Record durable knowledge: ownership/assignment, responsibility, status, decisions, plans/schedules, dependencies, where things are managed/stored, absences, problems and their causes, and a user's preferences, standing instructions to the assistant (e.g. "ユーザーは回答を簡潔にしてほしい"), personal facts (residence, plans) and habits. Do NOT record that someone asked / wonders / thanks / suggests looking something up, and skip chit-chat. Prefer 0-5 high-value facts.
-`entity_summaries`: for entities that got NEW durable information, an updated summary (max 120 chars, in Japanese) merging the old summary with the new info; omit others. Do not put transient details (absence dates) in summaries."""
+Output `facts`: relations between two entities (subject idx -> object idx) or attributes of one entity (object null).
+- Record only durable knowledge stated or clearly implied by `message`: {DURABLE_KNOWLEDGE}. Not facts that appear only in `context` or in summaries, not that someone asked, wondered or said thanks, not chit-chat. Usually 0-5 facts; none is fine.
+- fact: one self-contained sentence in the message's language that names its entities (no pronouns), e.g. "Bob owns access control in the auth service".
+- relation: UPPER_SNAKE_CASE verb phrase (WORKS_ON, OWNS, MANAGES, DEPENDS_ON, HAS_STATUS, PLANS_TO, ABSENT, DECIDED, USES, PREFERS ...). Reuse a name from `known_relations` (the graph's vocabulary, most used first) whenever one fits; use the active direction (OWNS, not OWNED_BY).
+{_FACT_TIME}
+- A change of state (new owner, new status) is an ordinary new fact; contradictions with existing facts are resolved later.
+`entity_summaries`: for entities that got new durable information, a one-line summary (at most 120 characters, in the message's language) merging the old summary with the new information; omit the others. Keep transient details such as absence dates out of summaries."""
 
 EXTRACT_FACTS_SCHEMA = obj_schema(
     facts={
@@ -118,17 +128,17 @@ AGENT_EXTRACTION_INSTRUCTIONS = f"""You are the extractor. Turn `context.message
 
 ENTITIES (`entities`): the people, services/tools/repos, teams/orgs, tickets/PRs, projects, events, places and key concepts/policies the message is about. Types: {", ".join(ENTITY_TYPES)}.
 - ref: your handle ("e1", "e2", ...). The author (`context.author_ref`) already exists: reference it as "author", never list it.
-- name: the canonical, most complete name without honorifics (Rails, not "Rails 7.1"; "iac-terraform PR #278", not "#278"). Resolve pronouns and vague words (それ, 例の件) using `context.recent`. Skip greetings and generic nouns.
+{_ENTITY_NAMING} The earlier messages are in `context.recent`. Skip greetings and generic nouns.
 - existing_id: if an entry of `context.candidate_entities` is the SAME real-world thing (alias, abbreviation, other spelling), set its id and do not create a duplicate; else null. Different versions, repos or people with similar names are different.
-- summary: optional one line (<=120 chars, message language) merging the old summary with new durable info. aliases: other spellings seen in the message.
+- summary: optional one line (at most 120 characters, in the message's language) merging the old summary with the new durable information. aliases: other spellings seen in the message.
 
-FACTS (`facts`): durable knowledge only: ownership/assignment, status, decisions, plans/schedules, dependencies, where things live, absences, problems and causes, and the user's preferences, standing instructions and personal facts/habits. Not chit-chat, thanks, questions without new info, or this session's transient details. Prefer 0-5 high-value facts; none is fine.
+FACTS (`facts`): durable knowledge only: {DURABLE_KNOWLEDGE}. Not chit-chat, thanks, questions without new information, or this session's transient details. Usually 0-5 facts; none is fine.
 - subject/object: entity refs. An attribute of one entity (a status, an absence, a preference) has object null.
-- fact: ONE self-contained sentence in the message language that names its entities (no pronouns), e.g. "Bob は認証基盤の権限管理を担当している".
+- fact: ONE self-contained sentence in the message's language that names its entities (no pronouns), e.g. "Bob owns access control in the auth service".
 - relation: UPPER_SNAKE_CASE (OWNS, WORKS_ON, MANAGES, DEPENDS_ON, HAS_STATUS, PLANS_TO, ABSENT, DECIDED, USES, PREFERS ...). Reuse a name from `context.known_relations` (the memory's vocabulary, most used first) whenever one fits the meaning; coin a new one only when none does. Use the active direction (Bob OWNS repo, not repo OWNED_BY Bob).
-- valid_at: when it starts being true, computed from `context.message.occurred_at` (weekday and UTC offset are given): ISO 8601, local time, date-only is fine (来週から, 明日, 9/14 ...). null means the message time. Never guess a date.
-- invalid_at: when it stops being true if stated (absence 9/14-9/16 -> 2026-09-17, the first moment it is no longer true), else null.
-- modality: definite | planned (future intention/schedule) | tentative (unsure, proposal). confidence: 0-1 (default by modality).
+- The message time is `context.message.occurred_at` (with weekday and UTC offset).
+{_FACT_TIME}
+- confidence: 0-1 (default by modality).
 - duplicate_of: id of a fact in `context.related_facts` that this one merely restates (same meaning, same state), else null. A duplicate contradicts nothing.
 - contradicts: ids of facts in `context.related_facts` that can no longer be true once this one holds (new owner, changed status, cancelled plan). Compatible or parallel facts are NOT contradicted; list only clear conflicts. The old fact is closed, never deleted.
 Finally call commit_memory(token, extraction) (CLI: `sqgraph-memory commit`); if it reports problems, fix the JSON and call it again with the same token."""
@@ -175,9 +185,18 @@ AGENT_EXTRACTION_SCHEMA: dict[str, Any] = {
 
 # --------------------------------------------------------------------------- answer
 
-ANSWER_SYSTEM = """あなたは社内の長期記憶(時系列ナレッジグラフ)を使って質問に答えるアシスタントです。
-与えられた `facts`(と `entities`)だけを根拠に、日本語で簡潔に答えてください。
-- 各主張の末尾に出典を [F1] のように付ける。必要なら送信者・日時も添える。
-- 各 fact には status があります: valid=現在有効 / ended=すでに失効(過去の状態) / scheduled=まだ始まっていない予定。今の状態を聞かれたら valid を優先し、経緯を聞かれたら ended も使って時系列で説明する。
-- valid_at / invalid_at (有効期間) を踏まえ、いつからいつまでの話かを明示する。`as_of` が指定されている場合はその時点の状況として答える。
-- 情報が無い・不十分な場合は推測せず、分からないと述べる。矛盾や不確かさ (modality=tentative/planned) があれば明記する。"""
+DEFAULT_ANSWER_LANGUAGE = "English"
+
+
+def answer_system(language: str | None = DEFAULT_ANSWER_LANGUAGE) -> str:
+    """System prompt of ``Memory.answer``; ``language=None`` answers in the language of the question."""
+    lang = language.strip() if language and language.strip() else "the language of the question"
+    return f"""You answer questions from a long-term memory (a temporal knowledge graph).
+Answer concisely in {lang}, using only the given `facts` (and `entities`).
+- Cite the sources of each claim as [F1]; add the author and date when it helps.
+- Each fact has a status: valid (true now), ended (no longer true; a past state) or scheduled (planned, not started yet). For the current state prefer valid facts; for history, use ended facts too and explain in chronological order.
+- Use valid_at / invalid_at to say from when until when something holds. If `as_of` is set, answer for that point in time.
+- If the facts do not answer the question, say so instead of guessing. Point out contradictions and uncertainty (modality tentative or planned)."""
+
+
+ANSWER_SYSTEM = answer_system()

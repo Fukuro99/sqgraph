@@ -30,7 +30,7 @@ Add when the user states something worth knowing in future sessions:
 How to write it:
 
 - One fact-dense, self-contained sentence per add, in the user's language. Resolve pronouns ("it", "that repo") into
-  names. Include dates for time-bound things ("2026-10-05 から Osaka に引っ越す予定").
+  names. Include dates for time-bound things ("plans to move to Osaka on 2026-10-05").
 - State changes as they are ("Taro now owns the billing service") so older facts get superseded automatically.
 - Do NOT store chit-chat, transient task details (current file, stack trace, todo of this session), things already
   in the repository, or guesses you made. When unsure whether it is lasting, ask the user.
@@ -49,7 +49,7 @@ How to write it:
 {"entities": [{"ref": "e1", "name": "pnpm", "type": "Service", "existing_id": null,
                "summary": "JS package manager the user prefers"}],
  "facts": [{"subject": "author", "object": "e1", "relation": "PREFERS",
-            "fact": "ユーザーは npm ではなく pnpm を使ってほしい", "valid_at": null, "invalid_at": null,
+            "fact": "The user wants pnpm used instead of npm", "valid_at": null, "invalid_at": null,
             "modality": "definite", "confidence": 0.95, "duplicate_of": null, "contradicts": []}]}
 ```
 
@@ -59,17 +59,17 @@ How to write it:
 - Same thing as a `candidate_entities` entry (alias, other spelling)? Set `existing_id` to its id instead of creating a duplicate.
 - A `related_facts` entry that is no longer true because of this note (new owner, changed preference, cancelled plan)?
   Put its id in `contradicts`; it is closed, not deleted. One that this note merely restates: `duplicate_of`.
-- `valid_at` / `invalid_at`: ISO dates computed from the note's time ("来週から", "9/14-9/16"); null = the note's time.
+- `valid_at` / `invalid_at`: ISO dates computed from the note's time ("from next week", "14-16 September"); null = the note's time.
 - Do not invent facts that are not in the content. Nothing worth keeping is fine: `{}` stores just the note.
 - If `commit_memory` reports problems with the JSON, fix them and call it again with the same token.
 
 ## Correcting and tidying (keeps history)
 
-- Something stopped being true and nothing replaces it ("pnpm はもう使ってない", a plan was dropped):
+- Something stopped being true and nothing replaces it ("I no longer use pnpm", a plan was dropped):
   `invalidate_fact(fact_id, reason=...)`. When a new fact replaces it, add the new one with `contradicts` instead.
 - The same thing is stored twice under different names (`search_entities` / `get_entity` show both):
   `merge_entities(keep, merge, dry_run=True)`, show the user, then run it without `dry_run`.
-- When the user asks to tidy / review the memory ("記憶を整理して"): `review_memory()` lists duplicate candidates,
+- When the user asks to tidy / review the memory ("tidy up my memory"): `review_memory()` lists duplicate candidates,
   relation names to unify and plans whose date passed. Propose the changes, apply only the ones the user agrees to
   (`merge_entities`, `rename_relation(old, new, swap?)`, `invalidate_fact`).
 - "What's coming up?" / at the start of planning: `get_upcoming(days=7)` lists facts that start or end soon.
@@ -84,8 +84,8 @@ after they confirm. Forgetting is permanent (the text is also removed from the d
 Prefer the MCP tools when the `sqgraph-memory` MCP server is connected:
 
 - `search_memory(query, as_of?, include_invalid?, center_entity?, min_similarity?)` -- facts with validity, status,
-  sources and their `similarity` to the query. Only facts that look relevant come back: an empty result means the memory
-  has nothing on that; retry with other keywords / names, or a lower `min_similarity`, before concluding that
+  sources and their `similarity` to the query. Only facts that look relevant come back: an empty result usually means the
+  memory has nothing on that; retry with other keywords / names, or a lower `min_similarity`, before concluding so.
 - `get_entity(name_or_id)` -- full timeline of one person/project/thing; `search_entities(query)` to resolve a name
 - `get_episodes(entity?, query?)` -- the original stored notes
 - `add_memory(content, source="<your agent name>", author="user")` then `commit_memory(token, extraction)` -- see
@@ -101,7 +101,7 @@ Otherwise use the CLI (JSON on stdout; `--compact` for one line):
 ```bash
 sqgraph-memory search "preferred package manager" [--history] [--as-of 2026-07-01] [--center Taro]
 sqgraph-memory entity "Taro"
-sqgraph-memory add --source <agent-name> "ユーザーは Python のパッケージ管理に uv を使う"   # prints token + context
+sqgraph-memory add --source <agent-name> "The user uses uv for Python package management"   # prints token + context
 sqgraph-memory commit --token <token> < extraction.json      # or pipe {"token": ..., "extraction": {...}} on stdin
 sqgraph-memory forget --fact-id <id> --dry-run     # also: --episode-id ID, --entity NAME, --since/--until
 sqgraph-memory forget --fact-id <id>              # after the user confirmed
@@ -118,5 +118,5 @@ If neither works, run `sqgraph-memory doctor` and tell the user what it reports.
 - Check `status` and `valid_at` / `invalid_at`. Prefer `valid` facts; `ended` facts are history; `scheduled` facts
   have not started yet. When facts conflict, the newer one wins, and say so if it matters.
 - Memories can be incomplete or wrong. If a memory affects something important, confirm it with the user.
-- Reply in the user's language. Mention that you used memory when it explains a choice ("前に uv が好みと伺ったので...").
+- Reply in the user's language. Mention that you used memory when it explains a choice ("You mentioned preferring uv, so...").
 - If search returns nothing, say so and ask; do not invent memories.

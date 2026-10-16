@@ -65,9 +65,11 @@ mem.search_entities("bob", channels=["backend"])            # [{id, name, type, 
 mem.get_entity("bob", channels=["backend"])                 # profile + fact timeline (including invalidated facts)
 mem.get_episodes(entity="Rails", channels=["backend"], limit=10)
 ans = mem.answer("How far along is the Rails migration?", group_id="my-guild", channels=["backend"])
-print(ans.text)                                                # answer in Japanese, with [F1] citations and validity periods
+print(ans.text)                                                # answer in English (default), with [F1] citations and validity periods
 print(tracker.summary("run"))
 ```
+
+`answer` replies in English by default. Pass `Memory(..., answer_language="Japanese")` (any language name) to change the default, or `mem.answer(..., language="Japanese")` for one call; `None` answers in the language of the question. When nothing matches, the LLM is not called and `ans.text` is the fixed English `No matching memories found.` (check `not ans.hits` to show your own text in another language).
 
 Ingesting one episode normally takes 2 to 4 LLM calls: (1) entity extraction (recent messages from the same channel are passed as context to resolve references such as "it"; messages with nothing worth remembering stop here), (2) resolution against existing entities (exact and alias matches need no LLM; only ambiguous names are judged, with vector / full-text / exact-match candidates batched into a single call), (3) fact extraction plus entity summary update, (4) duplicate / contradiction detection (only when related valid facts already exist). Embeddings take 1 to 2 batched calls per episode, and the DB write is a single transaction. Ingestion is serialized by an internal lock (a bot is expected to put messages on a queue).
 
@@ -198,7 +200,7 @@ When extraction is left to an agent or an LLM, the same thing can be registered 
 
 ## Discord bot integration (overview)
 
-In `on_message`, do `queue.put((message.content, channel.name, author.display_name, message.created_at, message.id))`, and have a worker call `mem.add_episode(..., source="discord", source_ref=str(message.id))` one message at a time (using the message ID as `source_ref` means re-submitting does not create duplicates). In an `/ask` slash command, determine the channels the asker can view from Discord permissions (`channel.permissions_for(member).view_channel`), pass that list as `channels=`, and call `mem.answer(question, group_id=str(guild.id), channels=allowed)`.
+In `on_message`, do `queue.put((message.content, channel.name, author.display_name, message.created_at, message.id))`, and have a worker call `mem.add_episode(..., source="discord", source_ref=str(message.id))` one message at a time (using the message ID as `source_ref` means re-submitting does not create duplicates). In an `/ask` slash command, determine the channels the asker can view from Discord permissions (`channel.permissions_for(member).view_channel`), pass that list as `channels=`, and call `mem.answer(question, group_id=str(guild.id), channels=allowed)` (for a non-English server, create the `Memory` with `answer_language="Japanese"` or similar, or pass `language=None` to follow each question's language).
 
 ## Cost estimates (gpt-5.4-mini, text-embedding-3-small)
 

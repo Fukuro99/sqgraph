@@ -2,8 +2,8 @@
 
 >>> from sqgraph.memory import Memory, OpenAILLM, OpenAIEmbedder
 >>> mem = Memory("memory.db", OpenAILLM(), OpenAIEmbedder(), default_group_id="my-guild")
->>> mem.add_episode("Bob が認証基盤を担当します", channel="backend", author="alice")
->>> mem.search("認証基盤の担当は?", channels=["backend"])
+>>> mem.add_episode("Bob owns the auth service", channel="backend", author="alice")
+>>> mem.search("Who owns the auth service?", channels=["backend"])
 
 The core :mod:`sqgraph` package stays LLM-free; models are plugged in through the
 :class:`LLMProvider` / :class:`Embedder` protocols (OpenAI implementations and deterministic fakes

@@ -6,6 +6,7 @@ import pytest
 
 from sqgraph import GraphDB
 from sqgraph.memory import FakeEmbedder, FakeLLM, Memory, clean_display_name, person_forms
+from sqgraph.memory.core import NO_MATCH_TEXT
 from sqgraph.memory.util import fts_or_query, norm_key, parse_time, query_terms, to_iso
 
 G = "guild"
@@ -308,7 +309,60 @@ def test_answer_builds_context_and_calls_llm():
     assert set(statuses.values()) == {"valid", "ended"}
     assert all(f["id"].startswith("F") and f["sources"] for f in payload["facts"])
     none = mem.answer("Rails の OWNER は?", group_id=G, channels=[])
-    assert none.hits == [] and "見つかりません" in none.text
+    assert none.hits == [] and none.text == NO_MATCH_TEXT == "No matching memories found."
+
+
+class _PromptLLM(FakeLLM):
+    """FakeLLM that also records the system prompt of every text completion."""
+
+    def __init__(self):
+        super().__init__()
+        self.systems: list[str] = []
+
+    def complete_text(self, system, user, *, task=""):
+        self.systems.append(system)
+        return super().complete_text(system, user, task=task)
+
+
+def _answer_memory(**kw):
+    llm = _PromptLLM()
+    mem = Memory(":memory:", llm, FakeEmbedder(), default_group_id=G, **kw)
+    _ownership(mem)
+    return mem, llm
+
+
+def test_answer_language_defaults_to_english():
+    mem, llm = _answer_memory()
+    assert mem.answer("Rails の OWNER は?", group_id=G, channels=["backend"]).hits
+    assert "in English" in llm.systems[-1]
+
+
+def test_answer_language_from_the_constructor_and_per_call():
+    mem, llm = _answer_memory(answer_language="Japanese")
+    assert mem.answer("Rails の OWNER は?", group_id=G, channels=["backend"]).hits
+    assert "in Japanese" in llm.systems[-1] and "English" not in llm.systems[-1]
+    mem.answer("Rails の OWNER は?", group_id=G, channels=["backend"], language="French")
+    assert "in French" in llm.systems[-1]
+    mem.answer("Rails の OWNER は?", group_id=G, channels=["backend"], language=None)  # explicit None: the question's
+    assert "the language of the question" in llm.systems[-1]
+    mem.answer("Rails の OWNER は?", group_id=G, channels=["backend"])  # the constructor value applies again
+    assert "in Japanese" in llm.systems[-1]
+
+
+def test_answer_language_none_in_the_constructor_follows_the_question():
+    mem, llm = _answer_memory(answer_language=None)
+    mem.answer("Rails の OWNER は?", group_id=G, channels=["backend"])
+    assert "the language of the question" in llm.systems[-1]
+    mem.answer("Rails の OWNER は?", group_id=G, channels=["backend"], language="English")
+    assert "in English" in llm.systems[-1]
+
+
+def test_answer_without_hits_does_not_call_the_llm():
+    mem, llm = _answer_memory(answer_language="Japanese")
+    n = len(llm.systems)
+    none = mem.answer("Rails の OWNER は?", group_id=G, channels=[])
+    assert none.text == NO_MATCH_TEXT and not none.hits  # English regardless of the answer language
+    assert len(llm.systems) == n and llm.count("answer") == 0
 
 
 # --------------------------------------------------------------------------- channel ACL
