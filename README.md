@@ -20,7 +20,7 @@ pip install -e ".[dev]"     # テスト用 (pytest)
 
 要件: Python 3.10 以上、SQLite 3.38 以上 (JSON の `->` 演算子を使用)、拡張ロード可能な `sqlite3` モジュール。
 
-ローカルのエージェント用の個人メモリとして使うだけなら `uv tool install "sqgraph[mcp]"` から (「個人メモリとして使う」を参照)。
+ローカルのエージェント用の個人メモリとして使うだけなら `uv tool install "sqgraph[mcp] @ git+https://github.com/Fukuro99/sqgraph"` から (「個人メモリとして使う」を参照)。
 
 ## クイックスタート (Python API)
 
@@ -419,8 +419,7 @@ claude mcp add sqgraph-memory-backend -- python -m sqgraph.memory.mcp --db /path
 **抽出は呼び出したエージェント自身が行います (既定の `extractor: "agent"`)**: 記憶するとき、エージェントは `add_memory` (CLI は `add`) で `instructions` と `context` (既存の候補エンティティ・関連する有効ファクト) を受け取り、自分で `extraction` JSON を作って `commit_memory` (CLI は `commit`) で保存します。**OpenAI キーは不要**で、サーバー側に LLM はありません (埋め込みだけ LAN のサーバーなどに任せられます)。bot のように 1 回の呼び出しで OpenAI に抽出させたいときは `--extractor openai` を使います。
 
 ```bash
-uv tool install "sqgraph[mcp]"      # または pipx install "sqgraph[mcp]"
-# GitHub から: uv tool install "sqgraph[mcp] @ git+https://github.com/<owner>/sqgraph"
+uv tool install "sqgraph[mcp] @ git+https://github.com/Fukuro99/sqgraph"      # または pipx install "sqgraph[mcp] @ git+https://github.com/Fukuro99/sqgraph"
 
 sqgraph-memory init                 # ~/.sqgraph-memory を作成 (抽出はエージェント: OpenAI キーは聞かれない)
 sqgraph-memory init --embed-base-url http://192.168.1.20:1234/v1 --embed-model <モデル名>   # 埋め込みを LAN のサーバーで (下記)
@@ -442,7 +441,7 @@ sqgraph-memory doctor [--online]    # 環境・DB・登録状況の診断 (失�
 | Cursor | `~/.cursor/mcp.json` の `mcpServers` | `~/.cursor/skills/sqgraph-memory/SKILL.md` |
 | Claude Desktop | `claude_desktop_config.json` の `mcpServers` (Windows `%APPDATA%\Claude`、macOS `~/Library/Application Support/Claude`、Linux `~/.config/Claude`) | なし |
 
-`--agents claude-code,codex,opencode,cursor,claude-desktop|all` で対象を指定し (既定は検出できたもの)、`--command "uvx --from 'sqgraph[mcp]' sqgraph-memory mcp"` で起動コマンドを丸ごと差し替え、`--no-skill` で Skill を入れません。登録後はエージェントを再起動してください。Skill (`SKILL.md`) は、いつ検索し、いつ覚えさせ、いつ忘れるか (明示的に頼まれたときだけ、`dry_run` で確認してから) をエージェントに教えます。
+`--agents claude-code,codex,opencode,cursor,claude-desktop|all` で対象を指定し (既定は検出できたもの)、`--command "uvx --from 'sqgraph[mcp] @ git+https://github.com/Fukuro99/sqgraph' sqgraph-memory mcp"` で起動コマンドを丸ごと差し替え、`--no-skill` で Skill を入れません。登録後はエージェントを再起動してください。Skill (`SKILL.md`) は、いつ検索し、いつ覚えさせ、いつ忘れるか (明示的に頼まれたときだけ、`dry_run` で確認してから) をエージェントに教えます。
 
 **フック (Claude Code / Codex / OpenCode)** (`setup` が登録。`--hooks session-start,user-prompt` で選択、`--no-hooks` で触らない、`--uninstall` で削除。自分以外のフックはそのまま残します): エージェントが検索しようと思わなくても、関係のある記憶が会話に入ります。
 
@@ -584,3 +583,7 @@ AWS (EC2 / ECS Fargate / Lambda) や Cloudflare (Containers / Tunnel + Access / 
 ```bash
 python -m pytest -q
 ```
+
+## ライセンス
+
+[MIT](LICENSE)

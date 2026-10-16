@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=61"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -8,7 +8,29 @@ version = "0.2.0"
 description = "Embedded property graph database on SQLite + sqlite-vec with an openCypher subset, for GraphRAG"
 readme = "README.md"
 requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Fukuro99" }]
+keywords = ["graph database", "sqlite", "sqlite-vec", "cypher", "opencypher", "graphrag", "knowledge graph", "mcp", "agent memory"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Database :: Database Engines/Servers",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
 dependencies = ["sqlite-vec>=0.1.6", "lark>=1.0"]
+
+[project.urls]
+Homepage = "https://github.com/Fukuro99/sqgraph"
+Repository = "https://github.com/Fukuro99/sqgraph"
+Issues = "https://github.com/Fukuro99/sqgraph/issues"
 
 [project.scripts]
 sqgraph-memory = "sqgraph.memory.cli:main"

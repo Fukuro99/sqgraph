@@ -67,7 +67,7 @@ from .providers import (
     probe_dimensions,
 )
 
-EXTRAS_HINT = 'pip install "sqgraph[mcp]"   (or: uv tool install "sqgraph[mcp]")'
+EXTRAS_HINT = 'uv tool install "sqgraph[mcp] @ git+https://github.com/Fukuro99/sqgraph"   (or: pip install "sqgraph[mcp] @ git+https://github.com/Fukuro99/sqgraph")'
 
 
 class CliError(Exception):
@@ -1343,7 +1343,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("setup", parents=[common], help="register the MCP server and install the Skill for local agents")
     p.add_argument("--agents", help="comma-separated: claude-code,codex,opencode,cursor,claude-desktop or all (default: detected)")
-    p.add_argument("--command", help='full launch command (e.g. "uvx --from sqgraph[mcp] sqgraph-memory mcp")')
+    p.add_argument("--command", help="full launch command (e.g. uvx --from 'sqgraph[mcp] @ git+https://github.com/Fukuro99/sqgraph' sqgraph-memory mcp)")
     p.add_argument("--no-skill", action="store_true", help="do not install SKILL.md")
     p.add_argument("--hooks", metavar="LIST", help="hooks to install (Claude Code / Codex hooks, the OpenCode plugin): session-start,user-prompt | all (default) | none")
     p.add_argument("--no-hooks", action="store_true", help="same as --hooks none (existing hooks are left as they are)")

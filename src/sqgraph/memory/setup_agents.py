@@ -131,7 +131,7 @@ def resolve_launch_command(
     if looks_ephemeral(probe) or looks_ephemeral(executable or sys.executable):
         warnings.append(
             "this looks like a temporary uvx/uv cache environment; the registered path may disappear. "
-            'Install permanently with: uv tool install "sqgraph[mcp]"  and run `sqgraph-memory setup` again.'
+            'Install permanently with: uv tool install "sqgraph[mcp] @ git+https://github.com/Fukuro99/sqgraph"  and run `sqgraph-memory setup` again.'
         )
     return cmd, warnings
 
