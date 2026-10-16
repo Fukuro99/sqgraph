@@ -49,7 +49,7 @@ def test_cursor_merge_preserves_others_backup_idempotent_uninstall(tmp_path):
     assert r1["action"] == "registered" and r1["backup"]
     data = json.loads(cfg.read_text(encoding="utf-8"))
     assert data["extra"] == 1 and data["mcpServers"]["other"] == original["mcpServers"]["other"]
-    assert data["mcpServers"]["sqgraph-memory"] == {"command": "/opt/bin/sqgraph-memory", "args": ["mcp"]}
+    assert data["mcpServers"]["sqgraph-memory"] == {"command": "/opt/bin/sqgraph-memory", "args": ["mcp", "--agent", "cursor"]}
     assert json.loads(Path(r1["backup"]).read_text(encoding="utf-8")) == original  # backup = pre-modification state
 
     before = cfg.read_text(encoding="utf-8")
@@ -75,7 +75,7 @@ def test_cursor_creates_missing_config_and_invalid_json_untouched(tmp_path):
     r = report(run_setup_for(tmp_path, ["cursor"]), "cursor")
     assert r["action"] == "registered" and "backup" in r and r["backup"] is None
     cfg = tmp_path / ".cursor" / "mcp.json"
-    assert json.loads(cfg.read_text(encoding="utf-8"))["mcpServers"]["sqgraph-memory"]["args"] == ["mcp"]
+    assert json.loads(cfg.read_text(encoding="utf-8"))["mcpServers"]["sqgraph-memory"]["args"] == ["mcp", "--agent", "cursor"]
 
     cfg.write_text("{ not json", encoding="utf-8")
     r = report(run_setup_for(tmp_path, ["cursor"]), "cursor")
@@ -142,16 +142,16 @@ def test_codex_toml_add_remove_preserves_everything_else(tmp_path):
     text = cfg.read_text(encoding="utf-8")
     assert text.startswith(CODEX_TOML)  # existing content untouched, ours appended
     assert "[mcp_servers.sqgraph-memory]" in text
-    assert "command = '/opt/bin/sqgraph-memory'" in text and "args = ['mcp']" in text
+    assert "command = '/opt/bin/sqgraph-memory'" in text and "args = ['mcp', '--agent', 'codex']" in text
 
-    assert sa.codex_current(text) == {"command": "/opt/bin/sqgraph-memory", "args": ["mcp"], "env": {}}
+    assert sa.codex_current(text) == {"command": "/opt/bin/sqgraph-memory", "args": ["mcp", "--agent", "codex"], "env": {}}
     try:
         import tomllib
     except ImportError:  # Python 3.10
         pass
     else:
         parsed = tomllib.loads(text)
-        assert parsed["mcp_servers"]["sqgraph-memory"]["args"] == ["mcp"]
+        assert parsed["mcp_servers"]["sqgraph-memory"]["args"] == ["mcp", "--agent", "codex"]
         assert parsed["mcp_servers"]["blender"]["env"]["BLENDER_HOST"] == "127.0.0.1"
 
     assert report(run_setup_for(tmp_path, ["codex"]), "codex")["action"] == "unchanged"
@@ -175,7 +175,7 @@ def test_codex_update_keeps_user_keys_and_subtables_removed_with_it(tmp_path):
     text = cfg.read_text(encoding="utf-8")
     assert text.count("command =") == 1 and "old" not in text and '"x"' not in text
     assert "tool_timeout_sec = 90" in text and 'K = "v"' in text and "[tail]" in text
-    assert sa.codex_current(text) == {"command": "/opt/bin/sqgraph-memory", "args": ["mcp"], "env": {"K": "v"}}
+    assert sa.codex_current(text) == {"command": "/opt/bin/sqgraph-memory", "args": ["mcp", "--agent", "codex"], "env": {"K": "v"}}
 
     removed = sa.codex_remove(text)
     assert "sqgraph-memory" not in removed and "K = " not in removed
@@ -205,11 +205,11 @@ def test_claude_code_via_runner(tmp_path):
     res = run_setup_for(tmp_path, ["claude-code"], runner=runner, which=which)
     r = report(res, "claude-code")
     assert r["action"] == "registered"
-    assert runner.calls == [["/usr/bin/claude", "mcp", "add", "--scope", "user", "sqgraph-memory", "--", *CMD]]
+    assert runner.calls == [["/usr/bin/claude", "mcp", "add", "--scope", "user", "sqgraph-memory", "--", *CMD, "--agent", "claude-code"]]
 
     # already registered with the same command (as recorded in ~/.claude.json): nothing to do
     (tmp_path / ".claude.json").write_text(
-        json.dumps({"mcpServers": {"sqgraph-memory": {"type": "stdio", "command": CMD[0], "args": ["mcp"]}}}), encoding="utf-8"
+        json.dumps({"mcpServers": {"sqgraph-memory": {"type": "stdio", "command": CMD[0], "args": ["mcp", "--agent", "claude-code"]}}}), encoding="utf-8"
     )
     runner2 = FakeRunner()
     assert report(run_setup_for(tmp_path, ["claude-code"], runner=runner2, which=which), "claude-code")["action"] == "unchanged"
@@ -220,7 +220,7 @@ def test_claude_code_via_runner(tmp_path):
     r = report(run_setup_for(tmp_path, ["claude-code"], command=["/other/sqgraph-memory", "mcp"], runner=runner3, which=which), "claude-code")
     assert r["action"] == "updated"
     assert runner3.calls[0][:6] == ["/usr/bin/claude", "mcp", "remove", "--scope", "user", "sqgraph-memory"]
-    assert runner3.calls[1][-3:] == ["/other/sqgraph-memory", "mcp", ] or runner3.calls[1][-2:] == ["/other/sqgraph-memory", "mcp"]
+    assert runner3.calls[1][-4:] == ["/other/sqgraph-memory", "mcp", "--agent", "claude-code"]
 
     runner4 = FakeRunner()
     r = report(run_setup_for(tmp_path, ["claude-code"], uninstall=True, runner=runner4, which=which), "claude-code")
@@ -231,7 +231,7 @@ def test_claude_code_via_runner(tmp_path):
 def test_claude_code_without_cli_reports_manual_command_and_failure(tmp_path):
     r = report(run_setup_for(tmp_path, ["claude-code"]), "claude-code")
     assert r["action"] == "manual"
-    assert r["manual_command"] == "claude mcp add --scope user sqgraph-memory -- /opt/bin/sqgraph-memory mcp"
+    assert r["manual_command"] == "claude mcp add --scope user sqgraph-memory -- /opt/bin/sqgraph-memory mcp --agent claude-code"
 
     bad = FakeRunner(code=1)
     r = report(run_setup_for(tmp_path, ["claude-code"], runner=bad, which=lambda n: "/usr/bin/claude"), "claude-code")
@@ -412,7 +412,7 @@ def test_env_claude_code_flags(tmp_path):
         [
             "/usr/bin/claude", "mcp", "add", "--scope", "user", "sqgraph-memory",
             "-e", "SQGRAPH_MEMORY_HOME=/data/mem", "-e", "SQGRAPH_MEMORY_GROUP=taro",
-            "--", *CMD,
+            "--", *CMD, "--agent", "claude-code",
         ]
     ]  # fmt: skip
     dry = report(run_setup_for(tmp_path, ["claude-code"], runner=FakeRunner(), which=which, env=ENV, dry_run=True), "claude-code")

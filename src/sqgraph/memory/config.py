@@ -5,8 +5,12 @@ Layout of the home directory (``$SQGRAPH_MEMORY_HOME`` or ``~/.sqgraph-memory``)
     memory.db      the SQLite database shared by every local agent
     memory.db.lock cross-process write lock (created by sqgraph.memory)
     .env           OPENAI_API_KEY=...   (mode 0600 on POSIX; optionally SQGRAPH_EMBED_API_KEY=... for a custom embedder endpoint)
-    config.json    {"group_id", "tz", "extractor", "llm_model", "embed_model", "embed_base_url", "embed_dimensions",
-                    "embed_api_key_env", "search_min_similarity", "db"}
+    config.json    {"group_id", "agent_groups", "tz", "extractor", "llm_model", "embed_model", "embed_base_url",
+                    "embed_dimensions", "embed_api_key_env", "search_min_similarity", "db"}
+
+``agent_groups`` (``{"codex": "work"}``) gives an agent its own, fully separate memory (another ``group_id`` in the same
+database file); agents without an entry use ``group_id``. Precedence, see :meth:`MemoryConfig.group_for`:
+``SQGRAPH_MEMORY_GROUP`` > ``agent_groups[agent]`` > ``group_id``.
 
 ``search_min_similarity`` is the cosine threshold of the relevance gate of ``search`` (``null`` = a default for the embedding
 model, see :func:`sqgraph.memory.core.default_min_similarity`).
@@ -23,7 +27,7 @@ from __future__ import annotations
 import json
 import os
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -40,7 +44,28 @@ DEFAULT_TZ = "Asia/Tokyo"
 KEY_NAME = "OPENAI_API_KEY"
 DEFAULT_EMBED_KEY_ENV = "SQGRAPH_EMBED_API_KEY"
 
+AGENT_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
+GROUP_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]*$")
+MAX_GROUP_LEN = 64
+DEFAULT_GROUP_ALIAS = "default"  # `--agent-group codex=default` removes the assignment
+
 _POSIX = os.name == "posix"
+
+
+def validate_agent_name(name: str) -> str:
+    """``name`` if it is a valid agent name (``[a-z0-9][a-z0-9_-]*``: the known agents and custom clients), else ``ValueError``."""
+    if not isinstance(name, str) or not AGENT_NAME_RE.match(name):
+        raise ValueError(f"invalid agent name {name!r}: use lowercase letters, digits, '-' and '_' (e.g. claude-code, codex)")
+    return name
+
+
+def validate_group_id(group: str) -> str:
+    """``group`` if it is a valid group id (``[A-Za-z0-9][A-Za-z0-9_.:-]*``, at most 64 characters), else ``ValueError``."""
+    if not isinstance(group, str) or not group or len(group) > MAX_GROUP_LEN or not GROUP_ID_RE.match(group):
+        raise ValueError(
+            f"invalid group id {group!r}: use letters, digits, '.', ':', '-' and '_' (starting with a letter or digit, up to {MAX_GROUP_LEN} characters)"
+        )
+    return group
 
 
 def default_home() -> Path:
@@ -76,12 +101,25 @@ def write_private(path: Path, text: str) -> None:
         path.write_text(text, encoding="utf-8", newline="\n")
 
 
+def _load_agent_groups(raw: Any) -> dict[str, str]:
+    """Leniently read ``agent_groups``: anything that is not a valid ``name -> group id`` pair is ignored."""
+    out: dict[str, str] = {}
+    if isinstance(raw, dict):
+        for k, v in raw.items():
+            try:
+                out[validate_agent_name(k)] = validate_group_id(v)
+            except ValueError:
+                continue
+    return out
+
+
 @dataclass
 class MemoryConfig:
     """Resolved settings of the personal memory."""
 
     home: Path
-    group_id: str = DEFAULT_GROUP
+    group_id: str = DEFAULT_GROUP  # the default (shared) group: every agent without an entry in agent_groups
+    agent_groups: dict[str, str] = field(default_factory=dict)  # agent name -> its own group (opt-in separate memory)
     tz: str = DEFAULT_TZ
     extractor: str = DEFAULT_EXTRACTOR  # "agent" = the calling agent extracts (2 steps, no key); "openai" = one-shot OpenAI LLM
     llm_model: str = DEFAULT_CHAT_MODEL
@@ -91,6 +129,7 @@ class MemoryConfig:
     embed_api_key_env: str = DEFAULT_EMBED_KEY_ENV  # env var / .env key holding an optional key for that endpoint
     search_min_similarity: float | None = None  # relevance gate of search (cosine); None = a default for embed_model
     db: str | None = None  # None = <home>/memory.db
+    group_from_env: bool = False  # group_id came from SQGRAPH_MEMORY_GROUP: it then wins over agent_groups (not persisted)
 
     # -- paths ---------------------------------------------------------------------------------
 
@@ -121,6 +160,7 @@ class MemoryConfig:
                 raise ValueError(f"cannot read {p}: {exc}") from exc
             if isinstance(data, dict):
                 cfg.group_id = str(data.get("group_id") or cfg.group_id)
+                cfg.agent_groups = _load_agent_groups(data.get("agent_groups"))
                 cfg.tz = str(data.get("tz") or cfg.tz)
                 ext = str(data.get("extractor") or "").strip().lower()
                 cfg.extractor = ext if ext in EXTRACTORS else DEFAULT_EXTRACTOR
@@ -138,6 +178,7 @@ class MemoryConfig:
         if apply_env:
             if os.environ.get(ENV_GROUP):
                 cfg.group_id = os.environ[ENV_GROUP]
+                cfg.group_from_env = True
             if os.environ.get(ENV_DB):
                 cfg.db = os.environ[ENV_DB]
             if os.environ.get(ENV_EXTRACTOR):
@@ -150,6 +191,7 @@ class MemoryConfig:
     def to_json(self) -> dict[str, Any]:
         return {
             "group_id": self.group_id,
+            "agent_groups": dict(self.agent_groups),
             "tz": self.tz,
             "extractor": self.extractor,
             "llm_model": self.llm_model,
@@ -160,6 +202,18 @@ class MemoryConfig:
             "search_min_similarity": self.search_min_similarity,
             "db": self.db,
         }
+
+    def group_for(self, agent: str | None) -> str:
+        """The group ``agent`` works in: ``SQGRAPH_MEMORY_GROUP`` (if set) > ``agent_groups[agent]`` > ``group_id``.
+
+        ``agent=None`` (e.g. a plain CLI call without ``--agent``) is the default group."""
+        if self.group_from_env or not agent:
+            return self.group_id
+        return self.agent_groups.get(agent, self.group_id)
+
+    def for_agent(self, agent: str | None) -> "MemoryConfig":
+        """A copy whose ``group_id`` is the group of ``agent``: code that only reads ``group_id`` then works in that group."""
+        return replace(self, group_id=self.group_for(agent), agent_groups=dict(self.agent_groups))
 
     @property
     def custom_embedder(self) -> bool:

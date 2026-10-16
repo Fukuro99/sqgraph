@@ -33,7 +33,7 @@ What `setup` writes. Existing config files are backed up to `.bak` and other ser
 | Cursor | `mcpServers` in `~/.cursor/mcp.json` | `~/.cursor/skills/sqgraph-memory/SKILL.md` |
 | Claude Desktop | `mcpServers` in `claude_desktop_config.json` (Windows `%APPDATA%\Claude`, macOS `~/Library/Application Support/Claude`, Linux `~/.config/Claude`) | none |
 
-`--agents claude-code,codex,opencode,cursor,claude-desktop|all` selects the targets (default: whatever is detected). `--command "uvx --from 'sqgraph[mcp] @ git+https://github.com/Fukuro99/sqgraph' sqgraph-memory mcp"` replaces the whole launch command, and `--no-skill` skips the Skill. Restart the agents after registering. The Skill (`SKILL.md`) tells the agent when to search, when to remember, and when to forget (only when explicitly asked, after checking with `dry_run`).
+`--agents claude-code,codex,opencode,cursor,claude-desktop|all` selects the targets (default: whatever is detected). `--command "uvx --from 'sqgraph[mcp] @ git+https://github.com/Fukuro99/sqgraph' sqgraph-memory mcp"` replaces the whole launch command, and `--no-skill` skips the Skill. `--group G` gives the selected agents (default: the detected ones) a memory of their own ([Separate memories per agent](#separate-memories-per-agent)); every registration passes `--agent <name>` after `mcp` (also after a `--command` override). Restart the agents after registering. The Skill (`SKILL.md`) tells the agent when to search, when to remember, and when to forget (only when explicitly asked, after checking with `dry_run`).
 
 ## Hooks
 
@@ -61,8 +61,9 @@ Output is always UTF-8 JSON. Errors go to stderr as `{"error": ...}` with a non-
 | `commit [--token T] [--extraction FILE\|-]` | Second step of `agent` mode. Stores using the `token` from `add` and the extraction JSON the agent built (via stdin or `--extraction FILE`; you may also pass `{"token": ..., "extraction": {...}}` as a single JSON on stdin). Returns counts of created / duplicate / invalidated facts, plus `warnings` |
 | `search QUERY [--limit N] [--as-of T] [--history] [--center ENTITY] [--min-similarity X]` | Search facts (including plan facts; `--history` also returns invalidated ones). `--min-similarity` temporarily overrides the relevance threshold |
 | `entity NAME` / `entities QUERY` / `episodes [--entity E] [--query Q]` / `stats` | Profile and history / name resolution / source notes / counts |
+| `groups` | The groups in the DB (episodes / entities / valid facts), the default group, and the agents working in each (agents without an assignment are listed as `(default)`). Read-only |
 | `forget (--episode ID \| --source-ref REF [--source S] \| --fact ID \| --entity NAME [--keep-episodes] \| --since/--until/--channel [--source S]) [--dry-run]` | Delete. Give exactly one kind of target (`--episode-id` / `--fact-id` / `--entity-id` are aliases) |
-| `purge --yes [--dry-run]` | Delete all memory in the configured group |
+| `purge --yes [--dry-run]` | Delete all memory in the group in use (the default group, or the one of `--agent`) |
 | `merge KEEP MERGE [--dry-run]` / `invalidate FACT_ID [--at T] [--reason R]` | Merge entities / manually invalidate a fact (history is kept either way; see [Curation](memory.md#curation-history-is-never-erased)) |
 | `relations` / `rename-relation OLD NEW [--swap] [--fact ID] [--dry-run]` | List relation names (counts, examples) / rename them |
 | `review [--limit N]` | Cleanup candidates (same as MCP `review_memory`) |
@@ -70,11 +71,13 @@ Output is always UTF-8 JSON. Errors go to stderr as `{"error": ...}` with a non-
 | `export FILE\|- [--with-embeddings] [--force]` / `import FILE\|- [--into-group G] [--dry-run]` | Write to / read from JSONL ([Export and backup](memory.md#export-and-backup)) |
 | `backup [DEST] [--keep 10]` | Snapshot of the DB file (default `~/.sqgraph-memory/backups/memory-YYYYmmdd-HHMMSS.db`; keeps the newest 10) |
 | `import-claude-memory [--limit 5] [--dry-run]` | Import Claude Code's file-based memory (`~/.claude/projects/*/memory/*.md`), one file per episode. In `agent` mode it returns the same token / context as `add` for `--limit` files at a time; the agent `commit`s them and repeats until none are left (a file with identical content is never imported twice) |
-| `hook session-start\|user-prompt` | The hook entry point (registered by `setup`; the event JSON arrives on stdin) |
-| `config [--extractor agent\|openai] [--embed-base-url URL\|openai] [--embed-model M] [--embed-dimensions N] [--llm-model M] [--group-id G] [--tz TZ] [--embed-api-key-env NAME] [--search-min-similarity X\|default] [--no-probe]` | Show (secrets are never printed) / change the config. Changing the embedding settings probes the endpoint, and if they no longer match the embeddings in the DB it tells you to run `reembed` |
+| `hook session-start\|user-prompt [--agent A]` | The hook entry point (registered by `setup`; the event JSON arrives on stdin). `--agent` (default `claude-code`) selects the agent's group |
+| `config [--extractor agent\|openai] [--embed-base-url URL\|openai] [--embed-model M] [--embed-dimensions N] [--llm-model M] [--group-id G] [--agent-group AGENT=GROUP] [--tz TZ] [--embed-api-key-env NAME] [--search-min-similarity X\|default] [--no-probe]` | Show (secrets are never printed) / change the config. `--agent-group` (repeatable) assigns an agent its own group (`AGENT=` or `AGENT=default` removes it). Changing the embedding settings probes the endpoint, and if they no longer match the embeddings in the DB it tells you to run `reembed` |
 | `reembed [--yes] [--batch-size N] [--progress]` | Rebuild the embeddings of all entities and facts with the configured embedding model (without `--yes` it only prints the plan) |
-| `mcp [--transport stdio\|streamable-http] [--read-only] [--extractor agent\|openai]` | MCP server (launched by the agent; the DB / group / extractor / models / embedding endpoint from the config file are passed automatically). For the tools, see [MCP server](memory.md#mcp-server) |
-| `setup` / `doctor [--online]` | See above. `doctor` also reports the extractor, the embedding endpoint, model and dimensions, and whether they match what the DB recorded. In `agent` mode the OpenAI key check is `skip`; `--online` makes one real call |
+| `mcp [--transport stdio\|streamable-http] [--read-only] [--extractor agent\|openai] [--agent A]` | MCP server (launched by the agent; the DB / group / extractor / models / embedding endpoint from the config file are passed automatically). For the tools, see [MCP server](memory.md#mcp-server) |
+| `setup [--agents LIST] [--group G] ...` / `doctor [--online]` | See above. `doctor` also reports the agent → group assignments, the extractor, the embedding endpoint, model and dimensions, and whether they match what the DB recorded. In `agent` mode the OpenAI key check is `skip`; `--online` makes one real call |
+
+Every command that works on memory (`add` `commit` `search` `entity` `entities` `episodes` `stats` `forget` `purge` `merge` `invalidate` `relations` `rename-relation` `review` `upcoming` `export` `import` `import-claude-memory`) also takes `--agent NAME`: it works in the group assigned to that agent, or in the default group when there is none or the option is omitted.
 
 `python -m sqgraph.memory` works the same way. The default `agent` mode never uses an OpenAI LLM, so `add` / `commit` / `search` / `entity` / `episodes` / `stats` / `forget` all work without a key. (With OpenAI embeddings, or when no embedding endpoint is available, only vector search is disabled and a `warning` is attached; with a LAN embedding server, vector search also works without a key.) An LLM key is needed only for `add` with `--extractor openai`.
 
@@ -92,7 +95,23 @@ The `token` is self-contained, so `commit` works from a different process. Runni
 
 ## Sharing one file across all agents
 
-Every agent opens `~/.sqgraph-memory/memory.db`, and writes are serialized by a cross-process file lock on `memory.db.lock` (several agents can `add` at once without corruption; waits are bounded by `lock_timeout`). Whatever one agent remembers, the others can search. The MCP server is launched with `--group-id` pinned to the config file's value.
+Every agent opens `~/.sqgraph-memory/memory.db`, and writes are serialized by a cross-process file lock on `memory.db.lock` (several agents can `add` at once without corruption; waits are bounded by `lock_timeout`). Whatever one agent remembers, the others can search. The MCP server is launched with `--group-id` pinned to the group of its agent (the config file's `group_id`, unless the agent has its own: [Separate memories per agent](#separate-memories-per-agent)).
+
+## Separate memories per agent
+
+By default every agent shares one memory (group `me`). To give an agent a memory of its own, assign it a group. Groups live in the same `memory.db` (one lock, one backup) but are fully isolated: search, entities, `forget` and `purge` never cross a group boundary, and an agent's MCP server cannot reach another group.
+
+```bash
+sqgraph-memory setup --agents codex --group work      # assign and re-register (--group default removes the assignment)
+sqgraph-memory config --agent-group codex=work        # or only edit the mapping (AGENT= / AGENT=default removes it)
+sqgraph-memory groups                                 # groups in the DB with counts, and which agents work in each
+```
+
+Restart the agent afterwards: `setup` registers every agent's MCP server and hooks with `--agent <name>`, and the server picks the agent's group at start. The group is resolved as `SQGRAPH_MEMORY_GROUP` (if set, it wins for every agent) > `agent_groups[agent]` in `config.json` > `group_id`. Agents without an assignment keep sharing `group_id`.
+
+- Existing memories stay in the default group. To copy them into a new group: `sqgraph-memory export all.jsonl`, then `sqgraph-memory import all.jsonl --into-group work`.
+- On the CLI, pass `--agent NAME` to `add` **and** `commit` (a token only commits in its own group) and to every other memory command; without it the default group is used. The Skill tells agents to do this.
+- Group ids are `[A-Za-z0-9][A-Za-z0-9_.:-]*` (up to 64 characters), agent names `[a-z0-9][a-z0-9_-]*`; `default` is reserved for removing an assignment.
 
 ## Forgetting
 
@@ -118,7 +137,8 @@ The default is `~/.sqgraph-memory/` (override with `SQGRAPH_MEMORY_HOME`). It co
 - `memory.db`
 - `.env` (`OPENAI_API_KEY=...`; only when using `extractor: "openai"` or OpenAI embeddings)
 - `config.json`:
-  - `group_id` (default `me`)
+  - `group_id` (default `me`; the group of every agent without an assignment)
+  - `agent_groups` (default `{}`; e.g. `{"codex": "work"}`, see [Separate memories per agent](#separate-memories-per-agent))
   - `tz` (default `Asia/Tokyo`)
   - `extractor` (default `agent`; `agent` / `openai`; an existing config without the field is treated as `agent`)
   - `llm_model` (for `openai` mode)

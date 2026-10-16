@@ -75,7 +75,7 @@ def test_opencode_register_beside_a_commented_jsonc(tmp_path):
     assert (d / "opencode.jsonc").read_text(encoding="utf-8") == jsonc  # never rewritten
     cfg = json.loads((d / "opencode.json").read_text(encoding="utf-8"))
     assert cfg["mcp"]["sqgraph-memory"] == {
-        "type": "local", "command": CMD, "enabled": True, "timeout": 30000, "environment": {"SQGRAPH_MEMORY_HOME": "/h"}
+        "type": "local", "command": [*CMD, "--agent", "opencode"], "enabled": True, "timeout": 30000, "environment": {"SQGRAPH_MEMORY_HOME": "/h"}
     }
     assert (tmp_path / ".agents" / "skills" / "sqgraph-memory" / "SKILL.md").is_file()
     plugin = (d / "plugins" / "sqgraph-memory.js").read_text(encoding="utf-8")
@@ -114,7 +114,7 @@ def test_opencode_entry_kept_in_jsonc_or_commented_json_is_manual(tmp_path):
     d = oc_dir(tmp_path)
     (d / "opencode.jsonc").write_text('{\n // mine\n "mcp": {"sqgraph-memory": {"type": "local", "command": ["old", "mcp"]}}\n}', encoding="utf-8")
     rep = agent(run_setup_for(tmp_path, ["opencode"]), "opencode")
-    assert rep["action"] == "manual" and "opencode.jsonc" in rep["note"] and rep["manual_entry"]["sqgraph-memory"]["command"] == CMD
+    assert rep["action"] == "manual" and "opencode.jsonc" in rep["note"] and rep["manual_entry"]["sqgraph-memory"]["command"] == [*CMD, "--agent", "opencode"]
     assert not (d / "opencode.json").exists()
     (d / "opencode.jsonc").unlink()
     (d / "opencode.json").write_text('{\n // comment\n "model": "x"\n}', encoding="utf-8")

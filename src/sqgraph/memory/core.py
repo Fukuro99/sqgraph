@@ -3709,6 +3709,21 @@ class Memory:
 
     # -- misc ----------------------------------------------------------------------------------------
 
+    def group_stats(self) -> dict[str, dict[str, int]]:
+        """Per group id present in the database: ``{"episodes", "entities", "facts_valid"}`` (read-only, one query per kind)."""
+        out: dict[str, dict[str, int]] = {}
+
+        def put(g: Any, key: str, n: int) -> None:
+            if isinstance(g, str):
+                out.setdefault(g, {"episodes": 0, "entities": 0, "facts_valid": 0})[key] += n
+
+        for lb, key in (("Episode", "episodes"), ("Entity", "entities")):
+            for r in self.db.query(f"MATCH (n:{lb}) RETURN n.group_id AS g, count(n) AS c"):
+                put(r["g"], key, r["c"])
+        for r in self.db.query("MATCH ()-[f:FACT]->() WHERE f.invalid_at IS NULL RETURN f.group_id AS g, count(f) AS c"):
+            put(r["g"], "facts_valid", r["c"])
+        return out
+
     def stats(self, group_id: str | None = None) -> dict[str, Any]:
         """Node counts by label, fact counts (``FACT`` edges) and edge counts by type (optionally for one group)."""
         g = {"g": group_id} if group_id else {}

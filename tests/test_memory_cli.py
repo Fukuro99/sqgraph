@@ -290,7 +290,7 @@ def test_setup_and_uninstall_via_cli(capsys, home, tmp_path, monkeypatch):
     mcp = json.loads((fake_home / ".cursor" / "mcp.json").read_text(encoding="utf-8"))
     # SQGRAPH_MEMORY_HOME is set (by the fixture): it is forwarded so agents use the same home
     forwarded = {"SQGRAPH_MEMORY_HOME": os.path.abspath(str(home))}
-    assert mcp["mcpServers"]["sqgraph-memory"] == {"command": "my-launcher", "args": ["mcp"], "env": forwarded}
+    assert mcp["mcpServers"]["sqgraph-memory"] == {"command": "my-launcher", "args": ["mcp", "--agent", "cursor"], "env": forwarded}
     assert out["env"] == forwarded and all(a["env"] == forwarded for a in out["agents"])
     assert "SQGRAPH_MEMORY_HOME = " in (fake_home / ".codex" / "config.toml").read_text(encoding="utf-8")
     assert (fake_home / ".codex" / "config.toml").is_file()

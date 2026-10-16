@@ -33,7 +33,7 @@ sqgraph-memory doctor [--online]    # 環境・DB・登録状況の診断 (失�
 | Cursor | `~/.cursor/mcp.json` の `mcpServers` | `~/.cursor/skills/sqgraph-memory/SKILL.md` |
 | Claude Desktop | `claude_desktop_config.json` の `mcpServers` (Windows `%APPDATA%\Claude`、macOS `~/Library/Application Support/Claude`、Linux `~/.config/Claude`) | なし |
 
-`--agents claude-code,codex,opencode,cursor,claude-desktop|all` で対象を指定し (既定は検出できたもの)、`--command "uvx --from 'sqgraph[mcp] @ git+https://github.com/Fukuro99/sqgraph' sqgraph-memory mcp"` で起動コマンドを丸ごと差し替え、`--no-skill` で Skill を入れません。登録後はエージェントを再起動してください。Skill (`SKILL.md`) は、いつ検索し、いつ覚えさせ、いつ忘れるか (明示的に頼まれたときだけ、`dry_run` で確認してから) をエージェントに教えます。
+`--agents claude-code,codex,opencode,cursor,claude-desktop|all` で対象を指定し (既定は検出できたもの)、`--command "uvx --from 'sqgraph[mcp] @ git+https://github.com/Fukuro99/sqgraph' sqgraph-memory mcp"` で起動コマンドを丸ごと差し替え、`--no-skill` で Skill を入れません。`--group G` で、選んだエージェント (既定は検出できたもの) に専用の記憶を割り当てます ([エージェントごとに記憶を分ける](#エージェントごとに記憶を分ける))。登録は常に `mcp` の後ろに `--agent <名前>` を付けます (`--command` で差し替えた場合もその後ろ)。登録後はエージェントを再起動してください。Skill (`SKILL.md`) は、いつ検索し、いつ覚えさせ、いつ忘れるか (明示的に頼まれたときだけ、`dry_run` で確認してから) をエージェントに教えます。
 
 ## フック
 
@@ -61,8 +61,9 @@ Claude Code / Codex / OpenCode 用のフックです (`setup` が登録。`--hoo
 | `commit [--token T] [--extraction FILE\|-]` | `agent` モードの 2 段階目。`add` の `token` と、エージェントが作った extraction JSON (stdin か `--extraction FILE`。`{"token": ..., "extraction": {...}}` を 1 つの JSON で stdin に渡してもよい) で保存し、作成 / 重複 / 失効の件数と `warnings` を返す |
 | `search QUERY [--limit N] [--as-of T] [--history] [--center ENTITY] [--min-similarity X]` | ファクト検索 (予定のファクトも含む。`--history` で失効分も)。関連性のしきい値は `--min-similarity` で一時的に変えられる |
 | `entity NAME` / `entities QUERY` / `episodes [--entity E] [--query Q]` / `stats` | プロファイルと履歴 / 名前解決 / 元のメモ / 件数 |
+| `groups` | DB 内の group (エピソード / エンティティ / 有効なファクトの件数)、既定の group、各 group で動くエージェント (割り当てのないエージェントは `(default)`)。読み取り専用 |
 | `forget (--episode ID \| --source-ref REF [--source S] \| --fact ID \| --entity NAME [--keep-episodes] \| --since/--until/--channel [--source S]) [--dry-run]` | 削除 (対象の種類はちょうど 1 つ。`--episode-id` / `--fact-id` / `--entity-id` は別名) |
-| `purge --yes [--dry-run]` | 設定中の group の全記憶を削除 |
+| `purge --yes [--dry-run]` | 使用中の group (既定の group、または `--agent` の group) の全記憶を削除 |
 | `merge KEEP MERGE [--dry-run]` / `invalidate FACT_ID [--at T] [--reason R]` | エンティティの統合 / ファクトの手動失効 (どちらも履歴は残る。[記憶の整理](memory.md#記憶の整理-履歴は消さない)) |
 | `relations` / `rename-relation OLD NEW [--swap] [--fact ID] [--dry-run]` | 関係名の一覧 (件数・例文) / 付け替え |
 | `review [--limit N]` | 整理の候補 (MCP の `review_memory` と同じ) |
@@ -70,11 +71,13 @@ Claude Code / Codex / OpenCode 用のフックです (`setup` が登録。`--hoo
 | `export FILE\|- [--with-embeddings] [--force]` / `import FILE\|- [--into-group G] [--dry-run]` | JSONL への書き出し / 読み込み ([エクスポートとバックアップ](memory.md#エクスポートとバックアップ)) |
 | `backup [DEST] [--keep 10]` | DB ファイルのスナップショット (既定 `~/.sqgraph-memory/backups/memory-YYYYmmdd-HHMMSS.db`、新しい 10 個を残す) |
 | `import-claude-memory [--limit 5] [--dry-run]` | Claude Code のファイル型メモリ (`~/.claude/projects/*/memory/*.md`) を 1 ファイル 1 エピソードとして取り込む。`agent` モードでは `--limit` 件ずつ `add` と同じ token / context を返すので、エージェントが `commit` し、0 件になるまで繰り返す (内容が同じファイルは 2 度取り込まない) |
-| `hook session-start\|user-prompt` | Claude Code のフック本体 (`setup` が登録。標準入力にイベントの JSON) |
-| `config [--extractor agent\|openai] [--embed-base-url URL\|openai] [--embed-model M] [--embed-dimensions N] [--llm-model M] [--group-id G] [--tz TZ] [--embed-api-key-env NAME] [--search-min-similarity X\|default] [--no-probe]` | 設定を表示 (秘密は出しません) / 変更。埋め込みの設定を変えるとエンドポイントを確認し、DB の埋め込みと合わないときは `reembed` を促します |
+| `hook session-start\|user-prompt [--agent A]` | フック本体 (`setup` が登録。標準入力にイベントの JSON)。`--agent` (既定 `claude-code`) でそのエージェントの group を選ぶ |
+| `config [--extractor agent\|openai] [--embed-base-url URL\|openai] [--embed-model M] [--embed-dimensions N] [--llm-model M] [--group-id G] [--agent-group AGENT=GROUP] [--tz TZ] [--embed-api-key-env NAME] [--search-min-similarity X\|default] [--no-probe]` | 設定を表示 (秘密は出しません) / 変更。`--agent-group` (複数可) でエージェント専用の group を割り当て (`AGENT=` か `AGENT=default` で外す)。埋め込みの設定を変えるとエンドポイントを確認し、DB の埋め込みと合わないときは `reembed` を促します |
 | `reembed [--yes] [--batch-size N] [--progress]` | すべてのエンティティとファクトの埋め込みを、設定中の埋め込みモデルで作り直す (`--yes` なしは計画の表示だけ) |
-| `mcp [--transport stdio\|streamable-http] [--read-only] [--extractor agent\|openai]` | MCP サーバー (エージェントが起動する。設定ファイルの DB / group / extractor / モデル / 埋め込みエンドポイントを自動で渡す。ツール一覧は [MCP サーバー](memory.md#mcp-サーバー)) |
-| `setup` / `doctor [--online]` | 上記 (`doctor` は extractor、埋め込みの接続先・モデル・次元と、DB に記録された埋め込みとの一致も報告。`agent` モードでは OpenAI キーの確認は `skip`。`--online` で実際に 1 回呼びます) |
+| `mcp [--transport stdio\|streamable-http] [--read-only] [--extractor agent\|openai] [--agent A]` | MCP サーバー (エージェントが起動する。設定ファイルの DB / group / extractor / モデル / 埋め込みエンドポイントを自動で渡す。ツール一覧は [MCP サーバー](memory.md#mcp-サーバー)) |
+| `setup [--agents LIST] [--group G] ...` / `doctor [--online]` | 上記 (`doctor` はエージェント → group の割り当て、extractor、埋め込みの接続先・モデル・次元と、DB に記録された埋め込みとの一致も報告。`agent` モードでは OpenAI キーの確認は `skip`。`--online` で実際に 1 回呼びます) |
+
+記憶を扱うコマンド (`add` `commit` `search` `entity` `entities` `episodes` `stats` `forget` `purge` `merge` `invalidate` `relations` `rename-relation` `review` `upcoming` `export` `import` `import-claude-memory`) は `--agent NAME` も受け付け、そのエージェントに割り当てた group で動きます (割り当てがない、または省略したときは既定の group)。
 
 `python -m sqgraph.memory` でも同じです。既定の `agent` モードでは OpenAI の LLM を一切使わないので、キーなしで `add` / `commit` / `search` / `entity` / `episodes` / `stats` / `forget` がすべて動きます (OpenAI の埋め込みを使う場合と、埋め込みエンドポイントが無い場合は、ベクトル検索だけが無効になり `warning` が付きます。LAN の埋め込みサーバーなら キーなしでベクトル検索も動きます)。LLM のキーが要るのは `--extractor openai` の `add` だけです。
 
@@ -92,7 +95,23 @@ sqgraph-memory commit --token "$(jq -r .token prep.json)" --extraction extractio
 
 ## 1 ファイルを全エージェントで共有
 
-全員が `~/.sqgraph-memory/memory.db` を開き、書き込みは `memory.db.lock` のクロスプロセスのファイルロックで直列化されます (複数のエージェントが同時に `add` しても壊れず、待ち時間は `lock_timeout` まで)。あるエージェントが覚えたことは他のエージェントからも検索できます。MCP サーバーは `--group-id` を設定ファイルの値に固定して起動します。
+全員が `~/.sqgraph-memory/memory.db` を開き、書き込みは `memory.db.lock` のクロスプロセスのファイルロックで直列化されます (複数のエージェントが同時に `add` しても壊れず、待ち時間は `lock_timeout` まで)。あるエージェントが覚えたことは他のエージェントからも検索できます。MCP サーバーは `--group-id` をそのエージェントの group (設定ファイルの `group_id`。専用の割り当てがあればそちら: [エージェントごとに記憶を分ける](#エージェントごとに記憶を分ける)) に固定して起動します。
+
+## エージェントごとに記憶を分ける
+
+既定では全エージェントが 1 つの記憶 (group `me`) を共有します。あるエージェントだけの記憶にしたいときは、そのエージェントに group を割り当てます。group は同じ `memory.db` の中にあり (ロックもバックアップも 1 つ)、完全に分離されます: 検索・エンティティ・`forget`・`purge` は group をまたがず、エージェントの MCP サーバーから別の group には届きません。
+
+```bash
+sqgraph-memory setup --agents codex --group work      # 割り当てて登録し直す (--group default で割り当てを外す)
+sqgraph-memory config --agent-group codex=work        # 割り当てだけ書き換える (AGENT= / AGENT=default で外す)
+sqgraph-memory groups                                 # DB 内の group と件数、どのエージェントがどの group か
+```
+
+その後エージェントを再起動してください。`setup` は各エージェントの MCP サーバーとフックを `--agent <名前>` 付きで登録し、サーバーは起動時にそのエージェントの group を選びます。group は `SQGRAPH_MEMORY_GROUP` (設定されていれば全エージェントでこれが優先) > `config.json` の `agent_groups[エージェント]` > `group_id` の順で決まります。割り当てのないエージェントは引き続き `group_id` を共有します。
+
+- 既存の記憶は既定の group に残ります。新しい group にコピーするには `sqgraph-memory export all.jsonl` のあと `sqgraph-memory import all.jsonl --into-group work`。
+- CLI では `--agent NAME` を `add` と `commit` の両方に (token は同じ group でしか commit できません)、ほかの記憶コマンドにも付けます。付けないと既定の group です。Skill がエージェントにそう指示します。
+- group ID は `[A-Za-z0-9][A-Za-z0-9_.:-]*` (64 文字まで)、エージェント名は `[a-z0-9][a-z0-9_-]*`。`default` は割り当てを外すための予約語です。
 
 ## 忘れる
 
@@ -106,7 +125,7 @@ RRF の順位だけでは、小さな記憶だと無関係な質問にも全フ�
 
 ## データの場所と権限
 
-既定は `~/.sqgraph-memory/` (`SQGRAPH_MEMORY_HOME` で変更)。中身は `memory.db`、`.env` (`OPENAI_API_KEY=...`。`extractor: "openai"` か OpenAI の埋め込みを使うときだけ)、`config.json` (`group_id` 既定 `me`、`tz` 既定 `Asia/Tokyo`、`extractor` 既定 `agent` (`agent` / `openai`。フィールドの無い既存の設定も `agent` として扱う)、`llm_model` (`openai` モード用)、`embed_model`、`embed_base_url` 既定 null = OpenAI API、`embed_dimensions` 既定 null = OpenAI なら 1536 / カスタムなら自動検出して保存、`embed_api_key_env` 既定 `SQGRAPH_EMBED_API_KEY`、`search_min_similarity` 既定 null = 埋め込みモデルごとの既定値 ([検索の関連性ゲート](#検索の関連性ゲート))、`db`) です。POSIX ではディレクトリを 0700、ファイルを 0600 で作ります (Windows ではユーザープロファイルの ACL に任せます)。`SQGRAPH_MEMORY_DB` / `SQGRAPH_MEMORY_GROUP` / `SQGRAPH_MEMORY_EXTRACTOR` で DB・group・extractor を上書きできます。`setup` 実行時にこれら (と `SQGRAPH_MEMORY_HOME`) が設定されていれば、パスは絶対パスにして各エージェントの登録 (`env`) に引き継ぎます (`--dry-run` の出力にも表示)。API キーの値は出力にもログにも出しません。エージェントは MCP サーバーをシェルの環境変数なしで起動するため、キーは `.env` から読みます。
+既定は `~/.sqgraph-memory/` (`SQGRAPH_MEMORY_HOME` で変更)。中身は `memory.db`、`.env` (`OPENAI_API_KEY=...`。`extractor: "openai"` か OpenAI の埋め込みを使うときだけ)、`config.json` (`group_id` 既定 `me` (割り当てのない全エージェントの group)、`agent_groups` 既定 `{}` (例 `{"codex": "work"}`、[エージェントごとに記憶を分ける](#エージェントごとに記憶を分ける))、`tz` 既定 `Asia/Tokyo`、`extractor` 既定 `agent` (`agent` / `openai`。フィールドの無い既存の設定も `agent` として扱う)、`llm_model` (`openai` モード用)、`embed_model`、`embed_base_url` 既定 null = OpenAI API、`embed_dimensions` 既定 null = OpenAI なら 1536 / カスタムなら自動検出して保存、`embed_api_key_env` 既定 `SQGRAPH_EMBED_API_KEY`、`search_min_similarity` 既定 null = 埋め込みモデルごとの既定値 ([検索の関連性ゲート](#検索の関連性ゲート))、`db`) です。POSIX ではディレクトリを 0700、ファイルを 0600 で作ります (Windows ではユーザープロファイルの ACL に任せます)。`SQGRAPH_MEMORY_DB` / `SQGRAPH_MEMORY_GROUP` / `SQGRAPH_MEMORY_EXTRACTOR` で DB・group・extractor を上書きできます。`setup` 実行時にこれら (と `SQGRAPH_MEMORY_HOME`) が設定されていれば、パスは絶対パスにして各エージェントの登録 (`env`) に引き継ぎます (`--dry-run` の出力にも表示)。API キーの値は出力にもログにも出しません。エージェントは MCP サーバーをシェルの環境変数なしで起動するため、キーは `.env` から読みます。
 
 ## 埋め込みを LAN 内のサーバーで動かす
 

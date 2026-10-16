@@ -154,7 +154,7 @@ def test_setup_installs_and_uninstalls_claude_code_hooks(tmp_path):
     assert rep["action"] == "installed" and rep["events"] == ["session-start", "user-prompt"]
     settings = json.loads((home / ".claude" / "settings.json").read_text(encoding="utf-8"))
     assert settings["theme"] == "dark"
-    assert settings["hooks"]["SessionStart"][0]["hooks"][0]["command"] == "/bin/sqgraph-memory hook session-start"
+    assert settings["hooks"]["SessionStart"][0]["hooks"][0]["command"] == "/bin/sqgraph-memory hook session-start --agent claude-code"
     assert setup_agents.run_setup(["claude-code"], **kw)["agents"][0]["hooks"]["action"] == "unchanged"
     status = setup_agents.agents_status(home=home, command=kw["command"], which=kw["which"], platform="linux")
     assert next(s for s in status if s["agent"] == "claude-code")["hooks"] == ["session-start", "user-prompt"]

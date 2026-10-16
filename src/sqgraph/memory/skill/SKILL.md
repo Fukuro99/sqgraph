@@ -96,13 +96,15 @@ Prefer the MCP tools when the `sqgraph-memory` MCP server is connected:
   (aliases `entity_id`, `name`), `source_ref`, or a `since` / `until` / `channel` range. Ids come from search results
   (`id` of a fact, `episodes[].id`)
 
-Otherwise use the CLI (JSON on stdout; `--compact` for one line):
+Otherwise use the CLI (JSON on stdout; `--compact` for one line). Pass `--agent <your agent name>` (`claude-code`,
+`codex`, `opencode`, `cursor`, ...) to EVERY command, including `commit`: it selects the memory assigned to you (the
+MCP server already does this); without it you would use the default memory.
 
 ```bash
-sqgraph-memory search "preferred package manager" [--history] [--as-of 2026-07-01] [--center Taro]
+sqgraph-memory search "preferred package manager" --agent <agent-name> [--history] [--as-of 2026-07-01] [--center Taro]
 sqgraph-memory entity "Taro"
-sqgraph-memory add --source <agent-name> "The user uses uv for Python package management"   # prints token + context
-sqgraph-memory commit --token <token> < extraction.json      # or pipe {"token": ..., "extraction": {...}} on stdin
+sqgraph-memory add --source <agent-name> --agent <agent-name> "The user uses uv for Python package management"   # prints token + context
+sqgraph-memory commit --token <token> --agent <agent-name> < extraction.json      # or pipe {"token": ..., "extraction": {...}} on stdin
 sqgraph-memory forget --fact-id <id> --dry-run     # also: --episode-id ID, --entity NAME, --since/--until
 sqgraph-memory forget --fact-id <id>              # after the user confirmed
 sqgraph-memory invalidate <fact-id> --reason "..."  # no longer true (kept as history)

@@ -5,6 +5,21 @@ import pytest
 from sqgraph import GraphDB
 
 
+@pytest.fixture(autouse=True)
+def _isolate_user_dirs(tmp_path_factory, monkeypatch):
+    """Point every per-user location at a throw-away directory, so no test can touch the real agent configs
+    (~/.claude, ~/.codex, %APPDATA%\\Claude, ~/.config/opencode, ...) or the real ~/.sqgraph-memory."""
+    fake = tmp_path_factory.mktemp("user")
+    for var in ("HOME", "USERPROFILE"):
+        monkeypatch.setenv(var, str(fake))
+    monkeypatch.setenv("APPDATA", str(fake / "AppData" / "Roaming"))
+    monkeypatch.setenv("LOCALAPPDATA", str(fake / "AppData" / "Local"))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(fake / ".config"))
+    monkeypatch.setenv("SQGRAPH_MEMORY_HOME", str(fake / ".sqgraph-memory"))
+    for var in ("SQGRAPH_MEMORY_DB", "SQGRAPH_MEMORY_GROUP", "SQGRAPH_MEMORY_EXTRACTOR"):
+        monkeypatch.delenv(var, raising=False)
+
+
 @pytest.fixture
 def db():
     d = GraphDB(":memory:")

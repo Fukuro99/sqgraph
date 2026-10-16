@@ -18,11 +18,12 @@ All output is JSON on stdout (UTF-8); errors are ``{"error": ...}`` on stderr wi
     sqgraph-memory export FILE|- [--with-embeddings] | import FILE|- [--into-group G] [--dry-run] | backup [DEST] [--keep 10]
     sqgraph-memory hook session-start|user-prompt [--agent A]   (agent hooks, registered by `setup`)
     sqgraph-memory import-claude-memory [--limit 5] [--dry-run]
-    sqgraph-memory mcp [--transport stdio|streamable-http] [--read-only] [--extractor agent|openai]
-    sqgraph-memory setup [--agents ...] [--uninstall] | doctor [--online]
+    sqgraph-memory mcp [--transport stdio|streamable-http] [--read-only] [--extractor agent|openai] [--agent A]
+    sqgraph-memory setup [--agents ...] [--group G] [--uninstall] | doctor [--online]
+    sqgraph-memory groups | config --agent-group AGENT=GROUP     (separate memories per agent; every memory command takes --agent A)
 
 The home directory (``$SQGRAPH_MEMORY_HOME`` or ``~/.sqgraph-memory``) holds ``memory.db`` -- one SQLite file shared
-by every agent on the machine -- plus ``.env`` and ``config.json``. See :mod:`sqgraph.memory.config`.
+by every agent on the machine (optionally split into groups per agent, see ``agent_groups``) -- plus ``.env`` and ``config.json``. See :mod:`sqgraph.memory.config`.
 Who extracts the entities / facts of a note is the ``extractor`` setting: ``agent`` (default) means the calling agent
 itself: ``add`` prints the instructions and context, the agent answers with an extraction and ``commit`` stores it
 (no OpenAI key needed); ``openai`` makes ``add`` call an OpenAI LLM in one step. The embeddings can come from any
@@ -45,7 +46,15 @@ from pathlib import Path
 from typing import Any, Iterator, NoReturn, Sequence
 
 from . import setup_agents
-from .config import EXTRACTORS, KEY_NAME, MemoryConfig, ensure_private_dir
+from .config import (
+    DEFAULT_GROUP_ALIAS,
+    EXTRACTORS,
+    KEY_NAME,
+    MemoryConfig,
+    ensure_private_dir,
+    validate_agent_name,
+    validate_group_id,
+)
 from .core import (
     FACT_INDEX,
     META_EMBED_DIMS,
@@ -287,6 +296,22 @@ def _apply_settings(cfg: MemoryConfig, args: argparse.Namespace) -> list[str]:
 
     if args.group_id:
         put("group_id", args.group_id)
+    if getattr(args, "agent_group", None):
+        groups = dict(cfg.agent_groups)
+        for spec in args.agent_group:
+            agent, sep, group = spec.partition("=")
+            if not sep:
+                raise CliError(f"--agent-group expects AGENT=GROUP (or AGENT=default to remove it), got {spec!r}", 2)
+            try:
+                agent = validate_agent_name(agent.strip())
+                group = group.strip()
+                if group in ("", DEFAULT_GROUP_ALIAS):
+                    groups.pop(agent, None)
+                else:
+                    groups[agent] = validate_group_id(group)
+            except ValueError as exc:
+                raise CliError(f"--agent-group {spec!r}: {exc}", 2) from exc
+        put("agent_groups", groups)
     if args.tz:
         try:
             from .util import resolve_tz
@@ -469,6 +494,7 @@ def cmd_config(args: argparse.Namespace, cfg: MemoryConfig) -> dict[str, Any]:
         "config": str(eff.config_path),
         "db": str(eff.db_path),
         "group_id": eff.group_id,
+        "agent_groups": eff.agent_groups,
         "tz": eff.tz,
         "extractor": eff.extractor,
         "llm_model": eff.llm_model,
@@ -620,7 +646,11 @@ def cmd_commit(args: argparse.Namespace, cfg: MemoryConfig) -> dict[str, Any]:
     except ValueError as exc:
         raise CliError(str(exc), 2) from exc
     if tok["group_id"] != cfg.group_id:
-        raise CliError(f"the token belongs to group {tok['group_id']!r}, but the configured group is {cfg.group_id!r}", 2)
+        raise CliError(
+            f"the token belongs to group {tok['group_id']!r}, but this command works in group {cfg.group_id!r}: "
+            "pass the same --agent as to the `add` that printed the token",
+            2,
+        )
     with open_memory(cfg, need_embedder=True) as (mem, warnings):
         try:
             res = mem.commit_episode(token, extraction)
@@ -685,6 +715,33 @@ def cmd_stats(args: argparse.Namespace, cfg: MemoryConfig) -> dict[str, Any]:
         out["db_bytes"] = cfg.db_path.stat().st_size
     if schema is not None:
         out["schema_version"] = schema
+    return out
+
+
+DEFAULT_MARK = "(default)"  # in `groups`: the agents without an assignment
+
+
+def cmd_groups(args: argparse.Namespace, cfg: MemoryConfig) -> dict[str, Any]:
+    """The groups of the database (with counts) and the agents working in each. Read-only."""
+    counts: dict[str, dict[str, int]] = {}
+    if cfg.db_path.is_file():
+        with Memory(cfg.db_path, read_only=True, default_group_id=cfg.group_id) as mem:
+            counts = mem.group_stats()
+    # who works where: SQGRAPH_MEMORY_GROUP overrides every assignment
+    agents: dict[str, list[str]] = {cfg.group_id: [DEFAULT_MARK]}
+    for agent in sorted(cfg.agent_groups):
+        agents.setdefault(cfg.group_for(agent), []).append(agent)
+    names = sorted(set(counts) | set(agents), key=lambda g: (g != cfg.group_id, g))
+    zero = {"episodes": 0, "entities": 0, "facts_valid": 0}
+    out: dict[str, Any] = {
+        "db": str(cfg.db_path),
+        "default_group": cfg.group_id,
+        "groups": [
+            {"group_id": g, **counts.get(g, zero), "agents": agents.get(g, []), "default": g == cfg.group_id} for g in names
+        ],
+    }
+    if cfg.group_from_env:
+        out["note"] = "SQGRAPH_MEMORY_GROUP is set: it overrides agent_groups, every agent works in the default group"
     return out
 
 
@@ -967,7 +1024,7 @@ def mcp_argv(cfg: MemoryConfig, args: argparse.Namespace) -> list[str]:
     """Arguments for :func:`sqgraph.memory.mcp.main`, filled from the config."""
     argv = [
         "--db", str(cfg.db_path),
-        "--group-id", cfg.group_id,
+        "--group-id", cfg.group_for(getattr(args, "agent", None)),
         "--env-file", str(cfg.env_path),
         "--tz", cfg.tz,
         "--extractor", getattr(args, "extractor", None) or cfg.extractor,
@@ -1000,12 +1057,48 @@ def cmd_mcp(args: argparse.Namespace, cfg: MemoryConfig) -> None:
     return None
 
 
+def _assign_group(args: argparse.Namespace, cfg: MemoryConfig, agents: list[str] | None) -> dict[str, Any]:
+    """``setup --group G``: record ``agent_groups[agent] = G`` (``default`` removes it) for ``agents`` (``None`` = the detected ones)."""
+    raw = args.group.strip()
+    removing = raw == DEFAULT_GROUP_ALIAS
+    try:
+        group = None if removing else validate_group_id(raw)
+    except ValueError as exc:
+        raise CliError(f"--group: {exc}", 2) from exc
+    names = agents if agents is not None else setup_agents.detected_agents(home=user_home(), which=lambda n: shutil.which(n))
+    stored = MemoryConfig.load(cfg.home, apply_env=False)
+    before = dict(stored.agent_groups)
+    for name in names:
+        if group is None:
+            stored.agent_groups.pop(name, None)
+        else:
+            stored.agent_groups[name] = group
+    changed = stored.agent_groups != before
+    if changed and not args.dry_run:
+        stored.save()
+    if not changed:
+        action = "unchanged"
+    elif args.dry_run:
+        action = "would-remove" if group is None else "would-assign"
+    else:
+        action = "removed" if group is None else "assigned"
+    out: dict[str, Any] = {"group": DEFAULT_GROUP_ALIAS if group is None else group, "agents": names, "action": action, "agent_groups": stored.agent_groups}
+    if not names:
+        out["note"] = "no agent detected: pass --agents claude-code,codex,opencode,cursor,claude-desktop"
+    if cfg.group_from_env:
+        out["warning"] = "SQGRAPH_MEMORY_GROUP is set in this environment; it overrides agent_groups for every agent that sees it"
+    return out
+
+
 def cmd_setup(args: argparse.Namespace, cfg: MemoryConfig) -> dict[str, Any]:
     try:
         agents = setup_agents.parse_agents(args.agents)
         command, warnings = setup_agents.resolve_launch_command(args.command, which=lambda n: shutil.which(n))
     except ValueError as exc:
         raise CliError(str(exc), 2) from exc
+    if args.group is not None and args.uninstall:
+        raise CliError("--group cannot be combined with --uninstall (uninstall leaves agent_groups as it is)", 2)
+    assignment = _assign_group(args, cfg, agents) if args.group is not None else None
     spec = "none" if args.no_hooks else (args.hooks or "all")
     hooks = [h.strip() for h in spec.split(",") if h.strip()]
     if hooks == ["all"]:
@@ -1028,6 +1121,8 @@ def cmd_setup(args: argparse.Namespace, cfg: MemoryConfig) -> dict[str, Any]:
         env=None if args.uninstall else setup_agents.forwarded_env(),
         hooks=hooks,
     )
+    if assignment is not None:
+        out["group_assignment"] = assignment
     if not args.uninstall and cfg.extractor == "openai" and not cfg.has_api_key():
         out["note_init"] = "no API key configured yet: run `sqgraph-memory init` (agents launch the server without your shell environment)"
     elif not args.uninstall and not cfg.custom_embedder and not cfg.has_api_key():
@@ -1100,6 +1195,14 @@ def run_doctor(cfg: MemoryConfig, *, online: bool = False) -> dict[str, Any]:
                    emb_detail if known else emb_detail + ": dimensions not probed yet, run `sqgraph-memory config --embed-base-url ...`"))  # fmt: skip
     else:
         add(_check("embedder", "ok" if cfg.has_api_key() else "warn", emb_detail if cfg.has_api_key() else f"{emb_detail}: {KEY_NAME} missing, vector search disabled"))  # fmt: skip
+
+    if cfg.group_from_env:
+        add(_check("agent groups", "ok", f"all agents work in group {cfg.group_id!r} (SQGRAPH_MEMORY_GROUP overrides agent_groups)"))
+    elif cfg.agent_groups:
+        mapped = ", ".join(f"{a} -> {g}" for a, g in sorted(cfg.agent_groups.items()))
+        add(_check("agent groups", "ok", f"{mapped}; every other agent uses the default group {cfg.group_id!r}"))
+    else:
+        add(_check("agent groups", "ok", f"no assignments: every agent shares group {cfg.group_id!r}"))
 
     if cfg.db_path.is_file():
         try:
@@ -1175,6 +1278,8 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("--compact", action="store_true", help="one-line JSON instead of indented")
+    scoped = argparse.ArgumentParser(add_help=False, parents=[common])  # commands that work on one memory group
+    scoped.add_argument("--agent", metavar="NAME", help="the agent you are (claude-code, codex, opencode, cursor, ...): use the memory group assigned to it (default: the default group, see `groups`)")  # fmt: skip
     sub = ap.add_subparsers(dest="command", metavar="COMMAND", required=True, parser_class=_Parser)
 
     def embed_options(p: argparse.ArgumentParser) -> None:
@@ -1198,6 +1303,7 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("config", parents=[common], help="show the settings (no secrets) or change them")
     p.add_argument("--group-id")
     p.add_argument("--tz")
+    p.add_argument("--agent-group", action="append", metavar="AGENT=GROUP", help="give AGENT its own memory group (repeatable; AGENT= or AGENT=default removes the assignment)")  # fmt: skip
     extractor_option(p)
     p.add_argument("--llm-model", metavar="NAME", help="chat model used by `add` with --extractor openai")
     p.add_argument("--search-min-similarity", metavar="X|default", help="relevance gate of search: minimum cosine similarity (-1..1) for a fact to count as related; 'default' = per embedding model")  # fmt: skip
@@ -1210,7 +1316,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--progress", action="store_true", help="print JSON progress lines on stderr")
     p.set_defaults(fn=cmd_reembed)
 
-    p = sub.add_parser("add", parents=[common], help="remember something (agent mode: prints the context to extract from, then run `commit`; openai mode: LLM extraction)")  # fmt: skip
+    p = sub.add_parser("add", parents=[scoped], help="remember something (agent mode: prints the context to extract from, then run `commit`; openai mode: LLM extraction)")  # fmt: skip
     p.add_argument("text", metavar="TEXT", help="the text to remember; '-' reads stdin")
     p.add_argument("--source", default="cli", help="who is writing: claude-code / codex / cursor / cli ...")
     p.add_argument("--author", default="user")
@@ -1219,12 +1325,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--source-ref", help="idempotency key: the same (source, source-ref) is stored once")
     p.set_defaults(fn=cmd_add)
 
-    p = sub.add_parser("commit", parents=[common], help="store the extraction of an `add` (agent mode): --token T, extraction JSON on stdin or --extraction FILE")  # fmt: skip
+    p = sub.add_parser("commit", parents=[scoped], help="store the extraction of an `add` (agent mode): --token T, extraction JSON on stdin or --extraction FILE")  # fmt: skip
     p.add_argument("--token", help='the token printed by `add` (may instead be inside the stdin JSON: {"token": ..., "extraction": ...})')
     p.add_argument("--extraction", metavar="FILE|-", help="file with the extraction JSON; '-' or omitted: stdin")
     p.set_defaults(fn=cmd_commit)
 
-    p = sub.add_parser("search", parents=[common], help="search facts (hybrid semantic + keyword + graph)")
+    p = sub.add_parser("search", parents=[scoped], help="search facts (hybrid semantic + keyword + graph)")
     p.add_argument("query", metavar="QUERY")
     p.add_argument("--limit", type=int, default=10)
     p.add_argument("--as-of", help="answer as of this date/time")
@@ -1233,26 +1339,29 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--min-similarity", metavar="X", help="minimum cosine similarity (-1..1) for a semantic match (default: per embedding model, see `config`); lower it to see weaker matches")  # fmt: skip
     p.set_defaults(fn=cmd_search)
 
-    p = sub.add_parser("entity", parents=[common], help="one entity's profile and full fact timeline")
+    p = sub.add_parser("entity", parents=[scoped], help="one entity's profile and full fact timeline")
     p.add_argument("name", metavar="NAME", help="entity name, alias or id")
     p.add_argument("--as-of")
     p.set_defaults(fn=cmd_entity)
 
-    p = sub.add_parser("entities", parents=[common], help="find entities by name / alias / description")
+    p = sub.add_parser("entities", parents=[scoped], help="find entities by name / alias / description")
     p.add_argument("query", metavar="QUERY")
     p.add_argument("--limit", type=int, default=10)
     p.set_defaults(fn=cmd_entities)
 
-    p = sub.add_parser("episodes", parents=[common], help="list raw stored notes (newest first)")
+    p = sub.add_parser("episodes", parents=[scoped], help="list raw stored notes (newest first)")
     p.add_argument("--entity")
     p.add_argument("--query")
     p.add_argument("--limit", type=int, default=20)
     p.set_defaults(fn=cmd_episodes)
 
-    p = sub.add_parser("stats", parents=[common], help="counts and database info")
+    p = sub.add_parser("stats", parents=[scoped], help="counts and database info")
     p.set_defaults(fn=cmd_stats)
 
-    p = sub.add_parser("forget", parents=[common], help="delete memories (exactly one target kind)")
+    p = sub.add_parser("groups", parents=[common], help="the memory groups in the database (episodes / entities / facts) and the agents assigned to each")  # fmt: skip
+    p.set_defaults(fn=cmd_groups)
+
+    p = sub.add_parser("forget", parents=[scoped], help="delete memories (exactly one target kind)")
     p.add_argument("--episode", "--episode-id", dest="episode", metavar="ID", help="one stored note (--episode-id is an alias)")
     p.add_argument("--source-ref", metavar="REF")
     p.add_argument("--source", help="with --source-ref, or alone / with a range to forget everything from that source")
@@ -1265,22 +1374,22 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--dry-run", action="store_true", help="show what would be removed without deleting")
     p.set_defaults(fn=cmd_forget)
 
-    p = sub.add_parser("merge", parents=[common], help="merge entity MERGE into KEEP (the same real-world thing); history is kept")
+    p = sub.add_parser("merge", parents=[scoped], help="merge entity MERGE into KEEP (the same real-world thing); history is kept")
     p.add_argument("keep", metavar="KEEP", help="entity id or exact name / alias that remains")
     p.add_argument("merge", metavar="MERGE", help="entity id or exact name / alias folded into KEEP")
     p.add_argument("--dry-run", action="store_true")
     p.set_defaults(fn=cmd_merge)
 
-    p = sub.add_parser("invalidate", parents=[common], help="mark a fact as no longer true (kept in the history)")
+    p = sub.add_parser("invalidate", parents=[scoped], help="mark a fact as no longer true (kept in the history)")
     p.add_argument("fact_id", metavar="FACT_ID")
     p.add_argument("--at", help="when it stopped being true (ISO 8601; default now)")
     p.add_argument("--reason", help="why (stored with the fact)")
     p.set_defaults(fn=cmd_invalidate)
 
-    p = sub.add_parser("relations", parents=[common], help="the relation vocabulary with counts and an example each")
+    p = sub.add_parser("relations", parents=[scoped], help="the relation vocabulary with counts and an example each")
     p.set_defaults(fn=cmd_relations)
 
-    p = sub.add_parser("rename-relation", parents=[common], help="rename a relation on its facts (--swap also turns them around)")
+    p = sub.add_parser("rename-relation", parents=[scoped], help="rename a relation on its facts (--swap also turns them around)")
     p.add_argument("old", metavar="OLD")
     p.add_argument("new", metavar="NEW")
     p.add_argument("--swap", action="store_true", help="also swap subject and object")
@@ -1288,22 +1397,22 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--dry-run", action="store_true")
     p.set_defaults(fn=cmd_rename_relation)
 
-    p = sub.add_parser("review", parents=[common], help="housekeeping report: duplicate entities, relation suggestions, stale plans")
+    p = sub.add_parser("review", parents=[scoped], help="housekeeping report: duplicate entities, relation suggestions, stale plans")
     p.add_argument("--limit", type=int, default=20)
     p.set_defaults(fn=cmd_review)
 
-    p = sub.add_parser("upcoming", parents=[common], help="facts starting or ending soon (plans, absences, deadlines)")
+    p = sub.add_parser("upcoming", parents=[scoped], help="facts starting or ending soon (plans, absences, deadlines)")
     p.add_argument("--days", type=float, default=7)
     p.add_argument("--past-days", type=float, default=0, help="also include the last N days")
     p.set_defaults(fn=cmd_upcoming)
 
-    p = sub.add_parser("export", parents=[common], help="write the group's memory as JSONL (portable, human-readable)")
+    p = sub.add_parser("export", parents=[scoped], help="write the group's memory as JSONL (portable, human-readable)")
     p.add_argument("file", metavar="FILE", help="output file; '-' writes the JSONL to stdout")
     p.add_argument("--with-embeddings", action="store_true", help="include the vectors (reused on import with the same model)")
     p.add_argument("--force", action="store_true", help="overwrite FILE")
     p.set_defaults(fn=cmd_export)
 
-    p = sub.add_parser("import", parents=[common], help="load a JSONL export (records already present are skipped)")
+    p = sub.add_parser("import", parents=[scoped], help="load a JSONL export (records already present are skipped)")
     p.add_argument("file", metavar="FILE", help="an export file; '-' reads stdin")
     p.add_argument("--into-group", metavar="G", help="target group (default: the configured group)")
     p.add_argument("--dry-run", action="store_true")
@@ -1317,18 +1426,18 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("hook", help="agent hook (event JSON on stdin; Claude Code / Codex / the OpenCode plugin): session-start | user-prompt")
     p.add_argument("event", choices=["session-start", "user-prompt"])
-    p.add_argument("--agent", default="claude-code", help="the client running the hook (claude-code, codex, opencode)")
+    p.add_argument("--agent", default="claude-code", help="the client running the hook (claude-code, codex, opencode); its assigned memory group is used")  # fmt: skip
     p.add_argument("--env", action="append", metavar="KEY=VALUE", help="set an SQGRAPH_MEMORY_* variable first (repeatable)")
     p.set_defaults(fn=cmd_hook, raw=True)
 
-    p = sub.add_parser("import-claude-memory", parents=[common], help="import Claude Code's file memory (~/.claude/projects/*/memory/*.md), a few files per run")  # fmt: skip
+    p = sub.add_parser("import-claude-memory", parents=[scoped], help="import Claude Code's file memory (~/.claude/projects/*/memory/*.md), a few files per run")  # fmt: skip
     p.add_argument("--root", metavar="DIR", help="projects directory (default: ~/.claude/projects)")
     p.add_argument("--limit", type=int, default=5, help="files prepared per run (agent mode) / stored (openai mode)")
     p.add_argument("--channel", default="personal")
     p.add_argument("--dry-run", action="store_true", help="only list the files not imported yet")
     p.set_defaults(fn=cmd_import_claude_memory)
 
-    p = sub.add_parser("purge", parents=[common], help="delete ALL memories of the configured group")
+    p = sub.add_parser("purge", parents=[scoped], help="delete ALL memories of the configured group")
     p.add_argument("--yes", action="store_true", help="required to actually purge")
     p.add_argument("--dry-run", action="store_true")
     p.set_defaults(fn=cmd_purge)
@@ -1338,6 +1447,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--host", default="127.0.0.1")
     p.add_argument("--port", type=int, default=8000)
     p.add_argument("--read-only", action="store_true")
+    p.add_argument("--agent", metavar="NAME", help="the agent this server is for: it serves the memory group assigned to that agent (default: the default group)")  # fmt: skip
     extractor_option(p)
     p.set_defaults(fn=cmd_mcp, raw=True)
 
@@ -1347,6 +1457,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-skill", action="store_true", help="do not install SKILL.md")
     p.add_argument("--hooks", metavar="LIST", help="hooks to install (Claude Code / Codex hooks, the OpenCode plugin): session-start,user-prompt | all (default) | none")
     p.add_argument("--no-hooks", action="store_true", help="same as --hooks none (existing hooks are left as they are)")
+    p.add_argument("--group", metavar="G", help="give the agents (--agents, default: the detected ones) their own memory group G; 'default' removes their assignment")  # fmt: skip
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--uninstall", action="store_true", help="remove the registration and the Skill")
     p.set_defaults(fn=cmd_setup)
@@ -1367,6 +1478,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 raise CliError(f"--env expects SQGRAPH_MEMORY_*=VALUE, got {kv!r}", 2)
             os.environ[key] = value
         cfg = MemoryConfig.load()
+        if hasattr(args, "agent"):  # a command that works on memory: use the group of the agent (--agent; None = default group)
+            cfg = cfg.for_agent(args.agent)
         result = args.fn(args, cfg)
         if getattr(args, "raw", False) or result is None:  # the command wrote its own output (mcp, export -)
             return 0

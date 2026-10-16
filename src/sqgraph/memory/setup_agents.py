@@ -225,6 +225,12 @@ class Target:
     def __init__(self, ctx: Context) -> None:
         self.ctx = ctx
 
+    @property
+    def command(self) -> list[str]:
+        """The MCP launch command registered for this agent: the shared command plus ``--agent <name>`` (the server then
+        works in the memory group assigned to this agent, see ``agent_groups`` in :mod:`sqgraph.memory.config`)."""
+        return [*self.ctx.command, "--agent", self.name]
+
     # to override
     def detected(self) -> bool:
         raise NotImplementedError
@@ -251,8 +257,8 @@ class Target:
             return False
         have = cur.get("env") or {}
         return (
-            cur.get("command") == self.ctx.command[0]
-            and list(cur.get("args") or []) == self.ctx.command[1:]
+            cur.get("command") == self.command[0]
+            and list(cur.get("args") or []) == self.command[1:]
             and all(have.get(k) == v for k, v in self.ctx.env.items())
         )
 
@@ -355,8 +361,8 @@ class JsonTarget(Target):
             report["action"] = "unchanged"
             return
         entry = dict(cur) if isinstance(cur, dict) else {}  # keep user additions (env, ...)
-        entry["command"] = self.ctx.command[0]
-        entry["args"] = self.ctx.command[1:]
+        entry["command"] = self.command[0]
+        entry["args"] = self.command[1:]
         if self.ctx.env:  # merge with user-added env; ours win for our keys
             entry["env"] = {**(entry.get("env") if isinstance(entry.get("env"), dict) else {}), **self.ctx.env}
         servers[SERVER_NAME] = entry
@@ -504,7 +510,7 @@ class ClaudeCodeTarget(CommandHooks, Target):
     def _add_argv(self, claude: str) -> list[str]:
         env_args = [x for k, v in self.ctx.env.items() for x in ("-e", f"{k}={v}")]
         # the name goes before -e (it takes a variadic list); `--` ends the options
-        return [claude, "mcp", "add", "--scope", "user", SERVER_NAME, *env_args, "--", *self.ctx.command]
+        return [claude, "mcp", "add", "--scope", "user", SERVER_NAME, *env_args, "--", *self.command]
 
     def _register(self, report: dict[str, Any]) -> None:
         cur = self.current()
@@ -551,9 +557,12 @@ class ClaudeCodeTarget(CommandHooks, Target):
 
 
 def hook_argv(command: list[str], event: str, env: dict[str, str] | None = None, agent: str | None = None) -> list[str]:
-    """The server launch command with ``hook <event> [--agent A] [--env K=V ...]`` instead of ``mcp``."""
+    """The server launch command with ``hook <event> [--agent A] [--env K=V ...]`` instead of ``mcp``.
+
+    ``--agent`` is always written when ``agent`` is given (the hook's own default, claude-code, only serves registrations
+    made before ``--agent`` was written for every agent)."""
     base = command[:-1] if command and command[-1] == "mcp" else list(command)
-    tail = ["--agent", agent] if agent and agent != "claude-code" else []
+    tail = ["--agent", agent] if agent else []
     return [*base, "hook", event, *tail, *[x for k, v in (env or {}).items() for x in ("--env", f"{k}={v}")]]
 
 
@@ -824,7 +833,7 @@ class CodexTarget(CommandHooks, Target):
         if cur is not None and self._matches(cur):
             report["action"] = "unchanged"
             return
-        new = codex_add(text, self.ctx.command, self.ctx.env)
+        new = codex_add(text, self.command, self.ctx.env)
         report["action"] = "would-register" if self.ctx.dry_run else ("updated" if cur is not None else "registered")
         if not self.ctx.dry_run:
             report["backup"] = _backup(self.config_path())
@@ -918,7 +927,7 @@ class OpenCodeTarget(Target):
         return self.config_dir() / "plugins" / OPENCODE_PLUGIN
 
     def _entry(self) -> dict[str, Any]:
-        entry: dict[str, Any] = {"type": "local", "command": list(self.ctx.command), "enabled": True, "timeout": STARTUP_TIMEOUT_SEC * 1000}
+        entry: dict[str, Any] = {"type": "local", "command": self.command, "enabled": True, "timeout": STARTUP_TIMEOUT_SEC * 1000}
         if self.ctx.env:
             entry["environment"] = dict(self.ctx.env)
         return entry
@@ -1123,6 +1132,12 @@ def run_setup(
     if agents is None and not targets:
         out["note"] = "no supported agent detected; pass --agents claude-code,codex,opencode,cursor,claude-desktop"
     return out
+
+
+def detected_agents(*, home: Path, which: Callable[[str], str | None] = shutil.which, platform: str | None = None, appdata: Path | None = None) -> list[str]:
+    """Names of the supported agents found on this machine."""
+    ctx = Context(home=home, command=[], which=which, platform=platform or sys.platform, appdata=appdata)
+    return [t.name for t in make_targets(ctx, None, detected_only=True)]
 
 
 def agents_status(
